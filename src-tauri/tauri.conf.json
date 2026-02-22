@@ -1,0 +1,24 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Wispr Local",
+  "version": "0.1.0",
+  "identifier": "com.wispr-local.app",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "Wispr Local",
+        "width": 380,
+        "height": 460,
+        "resizable": true,
+        "visible": false
+      }
+    ]
+  }
+}

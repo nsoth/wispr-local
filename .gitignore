@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+src-tauri/target/
+
+# Whisper models (large binary files — download separately)
+src-tauri/models/
+*.bin
+
+# User settings (may contain API keys)
+settings.json
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Python (icon generation)
+__pycache__/
+*.pyc
+
+# Logs
+*.log
