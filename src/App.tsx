@@ -11,10 +11,8 @@ interface SoundSettings {
 }
 
 interface AiSettings {
-  provider: "none" | "local" | "openai" | "claude";
+  provider: "none" | "openai" | "claude";
   api_key: string;
-  local_model: string;
-  local_endpoint: string;
   openai_model: string;
   claude_model: string;
   prompt: string;
@@ -36,8 +34,6 @@ function App() {
   const [aiSettings, setAiSettings] = useState<AiSettings>({
     provider: "none",
     api_key: "",
-    local_model: "llama3.2",
-    local_endpoint: "http://localhost:11434",
     openai_model: "gpt-4o-mini",
     claude_model: "claude-sonnet-4-20250514",
     prompt: "",
@@ -400,40 +396,10 @@ function App() {
                 }
               >
                 <option value="none">None (raw text)</option>
-                <option value="local">Local (Ollama)</option>
                 <option value="openai">OpenAI</option>
                 <option value="claude">Claude</option>
               </select>
             </div>
-
-            {aiSettings.provider === "local" && (
-              <>
-                <div className="setting-row">
-                  <span className="setting-label">Endpoint</span>
-                  <input
-                    className="setting-input"
-                    type="text"
-                    value={aiSettings.local_endpoint}
-                    onChange={(e) =>
-                      updateAiSettings({ local_endpoint: e.target.value })
-                    }
-                    placeholder="http://localhost:11434"
-                  />
-                </div>
-                <div className="setting-row">
-                  <span className="setting-label">Model</span>
-                  <input
-                    className="setting-input"
-                    type="text"
-                    value={aiSettings.local_model}
-                    onChange={(e) =>
-                      updateAiSettings({ local_model: e.target.value })
-                    }
-                    placeholder="llama3.2"
-                  />
-                </div>
-              </>
-            )}
 
             {aiSettings.provider === "openai" && (
               <>

@@ -14,8 +14,6 @@ Format it into well-structured text:\n\
 pub enum AiProvider {
     #[serde(rename = "none")]
     None,
-    #[serde(rename = "local")]
-    Local,
     #[serde(rename = "openai")]
     OpenAi,
     #[serde(rename = "claude")]
@@ -34,10 +32,6 @@ pub struct AiSettings {
     pub provider: AiProvider,
     #[serde(default)]
     pub api_key: String,
-    #[serde(default = "default_local_model")]
-    pub local_model: String,
-    #[serde(default = "default_local_endpoint")]
-    pub local_endpoint: String,
     #[serde(default = "default_openai_model")]
     pub openai_model: String,
     #[serde(default = "default_claude_model")]
@@ -46,12 +40,6 @@ pub struct AiSettings {
     pub prompt: String,
 }
 
-fn default_local_model() -> String {
-    "llama3.2".to_string()
-}
-fn default_local_endpoint() -> String {
-    "http://localhost:11434".to_string()
-}
 fn default_openai_model() -> String {
     "gpt-4o-mini".to_string()
 }
@@ -67,8 +55,6 @@ impl Default for AiSettings {
         Self {
             provider: AiProvider::None,
             api_key: String::new(),
-            local_model: default_local_model(),
-            local_endpoint: default_local_endpoint(),
             openai_model: default_openai_model(),
             claude_model: default_claude_model(),
             prompt: default_prompt(),
@@ -83,13 +69,9 @@ pub async fn format_text(text: &str, settings: &AiSettings) -> String {
         return text.to_string();
     }
 
-    log::info!(
-        "AI formatting with {:?} provider...",
-        settings.provider
-    );
+    log::info!("AI formatting with {:?} provider ({} chars)", settings.provider, text.len());
 
     let result = match settings.provider {
-        AiProvider::Local => format_with_ollama(text, settings).await,
         AiProvider::OpenAi => format_with_openai(text, settings).await,
         AiProvider::Claude => format_with_claude(text, settings).await,
         AiProvider::None => return text.to_string(),
@@ -105,45 +87,6 @@ pub async fn format_text(text: &str, settings: &AiSettings) -> String {
             text.to_string()
         }
     }
-}
-
-/// Ollama uses OpenAI-compatible API at /v1/chat/completions
-async fn format_with_ollama(text: &str, settings: &AiSettings) -> Result<String, String> {
-    let endpoint = format!("{}/v1/chat/completions", settings.local_endpoint.trim_end_matches('/'));
-    let body = serde_json::json!({
-        "model": settings.local_model,
-        "messages": [
-            { "role": "system", "content": settings.prompt },
-            { "role": "user", "content": text }
-        ],
-        "temperature": 0.1,
-        "stream": false
-    });
-
-    let client = Client::new();
-    let resp = client
-        .post(&endpoint)
-        .json(&body)
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
-        .await
-        .map_err(|e| format!("Ollama request failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Ollama error {}: {}", status, body));
-    }
-
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse Ollama response: {}", e))?;
-
-    json["choices"][0]["message"]["content"]
-        .as_str()
-        .map(|s| s.trim().to_string())
-        .ok_or_else(|| "No content in Ollama response".to_string())
 }
 
 /// OpenAI Chat Completions API

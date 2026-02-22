@@ -238,7 +238,7 @@ pub fn set_ai_settings(
     config: State<'_, AppConfig>,
 ) -> Result<(), String> {
     let mut s = settings.lock().map_err(|e| e.to_string())?;
-    log::info!("AI settings updated: provider={:?}, local_model={}", ai.provider, ai.local_model);
+    log::info!("AI settings updated: provider={:?}", ai.provider);
     s.ai = ai;
     s.save(&config.data_dir)?;
     Ok(())
