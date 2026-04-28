@@ -13,10 +13,25 @@
     "withGlobalTauri": true,
     "windows": [
       {
+        "label": "main",
         "title": "Wispr Local",
         "width": 380,
         "height": 460,
         "resizable": true,
+        "visible": false
+      },
+      {
+        "label": "overlay",
+        "url": "index.html#overlay",
+        "width": 280,
+        "height": 52,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "focus": false,
+        "shadow": false,
         "visible": false
       }
     ]

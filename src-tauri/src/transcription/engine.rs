@@ -38,9 +38,16 @@ impl WhisperEngine {
             .map_err(|e| format!("Failed to create Whisper state: {}", e))?;
 
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-        params.set_language(None); // auto-detect language
-        // Bias model toward Russian and English only (suppresses Polish/Czech/etc.)
-        params.set_initial_prompt("Текст на русском или английском языке. Text in Russian or English.");
+        // Pin to Russian. The medium model handles English code-switching
+        // (technical terms, mixed phrases) inside a Russian utterance fine.
+        // History: we previously used `set_language(None)` + a bilingual
+        // `initial_prompt`. That had two bugs — initial_prompt does NOT
+        // influence Whisper's language detector (so Ukrainian/Polish still
+        // leaked), and on silent/low-signal segments the decoder echoed the
+        // initial_prompt back as a hallucinated transcription
+        // ("Text in Russian or English." repeated).
+        params.set_language(Some("ru"));
+        params.set_suppress_blank(true);
         params.set_n_threads(8);
         params.set_print_special(false);
         params.set_print_progress(false);

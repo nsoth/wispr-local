@@ -1,5 +1,5 @@
 use std::sync::Mutex;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
 
 use crate::audio::buffer::AudioBuffer;
@@ -13,6 +13,7 @@ use crate::transcription::engine::WhisperEngine;
 
 #[tauri::command]
 pub async fn start_recording(
+    app: AppHandle,
     state: State<'_, Mutex<AppState>>,
     capture: State<'_, Mutex<AudioCapture>>,
     buffer: State<'_, AudioBuffer>,
@@ -27,7 +28,7 @@ pub async fn start_recording(
     }
 
     let mut cap = capture.lock().map_err(|e| e.to_string())?;
-    let sample_rate = cap.start()?;
+    let sample_rate = cap.start(Some(app))?;
 
     {
         let mut app_state = state.lock().map_err(|e| e.to_string())?;
@@ -241,6 +242,56 @@ pub fn set_ai_settings(
     log::info!("AI settings updated: provider={:?}", ai.provider);
     s.ai = ai;
     s.save(&config.data_dir)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_show_overlay(settings: State<'_, Mutex<Settings>>) -> Result<bool, String> {
+    let s = settings.lock().map_err(|e| e.to_string())?;
+    Ok(s.show_overlay)
+}
+
+#[tauri::command]
+pub fn set_show_overlay(
+    app: AppHandle,
+    show: bool,
+    settings: State<'_, Mutex<Settings>>,
+    config: State<'_, AppConfig>,
+) -> Result<(), String> {
+    {
+        let mut s = settings.lock().map_err(|e| e.to_string())?;
+        s.show_overlay = show;
+        s.save(&config.data_dir)?;
+    }
+
+    // If turning off, hide overlay immediately. Do not force-show on toggle
+    // on — it appears naturally when recording starts.
+    if !show {
+        if let Some(w) = app.get_webview_window("overlay") {
+            let _ = w.hide();
+        }
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_autostart(settings: State<'_, Mutex<Settings>>) -> Result<bool, String> {
+    let s = settings.lock().map_err(|e| e.to_string())?;
+    Ok(s.run_on_startup)
+}
+
+#[tauri::command]
+pub fn set_autostart(
+    enabled: bool,
+    settings: State<'_, Mutex<Settings>>,
+    config: State<'_, AppConfig>,
+) -> Result<(), String> {
+    crate::autostart::set_autostart_registry(enabled)?;
+    let mut s = settings.lock().map_err(|e| e.to_string())?;
+    s.run_on_startup = enabled;
+    s.save(&config.data_dir)?;
+    log::info!("Autostart set to: {}", enabled);
     Ok(())
 }
 

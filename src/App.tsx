@@ -31,6 +31,8 @@ function App() {
   const [stopSound, setStopSound] = useState("");
   const [soundVolume, setSoundVolume] = useState(0.5);
   const [showSettings, setShowSettings] = useState(false);
+  const [autostart, setAutostart] = useState(false);
+  const [showOverlay, setShowOverlay] = useState(true);
   const [aiSettings, setAiSettings] = useState<AiSettings>({
     provider: "none",
     api_key: "",
@@ -53,6 +55,8 @@ function App() {
       setSoundVolume(s.sound_volume);
     });
     invoke<AiSettings>("get_ai_settings").then((ai) => setAiSettings(ai));
+    invoke<boolean>("get_autostart").then((v) => setAutostart(v));
+    invoke<boolean>("get_show_overlay").then((v) => setShowOverlay(v));
 
     const unlisten1 = listen<string>("status-changed", (event) => {
       setStatus(event.payload);
@@ -316,6 +320,40 @@ function App() {
         </>
       ) : (
         <div className="settings-section">
+          <div className="settings-group">
+            <div className="settings-group-title">General</div>
+            <div className="setting-row">
+              <span className="setting-label">Start with Windows</span>
+              <label className="toggle-switch">
+                <input
+                  type="checkbox"
+                  checked={autostart}
+                  onChange={(e) => {
+                    const enabled = e.target.checked;
+                    setAutostart(enabled);
+                    invoke("set_autostart", { enabled });
+                  }}
+                />
+                <span className="toggle-slider"></span>
+              </label>
+            </div>
+            <div className="setting-row">
+              <span className="setting-label">Show floating recording bar</span>
+              <label className="toggle-switch">
+                <input
+                  type="checkbox"
+                  checked={showOverlay}
+                  onChange={(e) => {
+                    const show = e.target.checked;
+                    setShowOverlay(show);
+                    invoke("set_show_overlay", { show });
+                  }}
+                />
+                <span className="toggle-slider"></span>
+              </label>
+            </div>
+          </div>
+
           <div className="settings-group">
             <div className="settings-group-title">Sounds</div>
 

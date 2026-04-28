@@ -13,10 +13,18 @@ pub struct Settings {
     pub sound_volume: f32,
     #[serde(default)]
     pub ai: AiSettings,
+    #[serde(default)]
+    pub run_on_startup: bool,
+    #[serde(default = "default_show_overlay")]
+    pub show_overlay: bool,
 }
 
 fn default_volume() -> f32 {
     0.5
+}
+
+fn default_show_overlay() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -27,6 +35,8 @@ impl Default for Settings {
             stop_sound: String::new(),
             sound_volume: default_volume(),
             ai: AiSettings::default(),
+            run_on_startup: false,
+            show_overlay: true,
         }
     }
 }

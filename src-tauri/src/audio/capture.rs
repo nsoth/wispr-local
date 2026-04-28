@@ -1,5 +1,7 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream, StreamConfig};
+use std::time::{Duration, Instant};
+use tauri::{AppHandle, Emitter};
 
 use super::buffer::AudioBuffer;
 
@@ -29,7 +31,7 @@ impl AudioCapture {
         }
     }
 
-    pub fn start(&mut self) -> Result<u32, String> {
+    pub fn start(&mut self, app: Option<AppHandle>) -> Result<u32, String> {
         let host = cpal::default_host();
         let device = host
             .default_input_device()
@@ -45,37 +47,64 @@ impl AudioCapture {
         let channels = config.channels as usize;
         let native_rate = self.device_sample_rate;
 
-        let buffer = self.buffer.clone();
+        // Throttle level events to ~20Hz — enough for smooth waveform, cheap.
+        const LEVEL_INTERVAL: Duration = Duration::from_millis(50);
 
         let stream = match sample_format {
-            SampleFormat::F32 => device
-                .build_input_stream(
-                    &config,
-                    move |data: &[f32], _info: &cpal::InputCallbackInfo| {
-                        let mono = to_mono(data, channels);
-                        let resampled = resample(&mono, native_rate, 16000);
-                        let amplified = apply_gain(&resampled, MIC_GAIN);
-                        buffer.push_samples(&amplified);
-                    },
-                    |err| log::error!("Audio stream error: {}", err),
-                    None,
-                )
-                .map_err(|e| format!("Failed to build f32 input stream: {}", e))?,
-            SampleFormat::I16 => device
-                .build_input_stream(
-                    &config,
-                    move |data: &[i16], _info: &cpal::InputCallbackInfo| {
-                        let float_data: Vec<f32> =
-                            data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
-                        let mono = to_mono(&float_data, channels);
-                        let resampled = resample(&mono, native_rate, 16000);
-                        let amplified = apply_gain(&resampled, MIC_GAIN);
-                        buffer.push_samples(&amplified);
-                    },
-                    |err| log::error!("Audio stream error: {}", err),
-                    None,
-                )
-                .map_err(|e| format!("Failed to build i16 input stream: {}", e))?,
+            SampleFormat::F32 => {
+                let buffer = self.buffer.clone();
+                let app_cb = app.clone();
+                let mut last_emit = Instant::now() - LEVEL_INTERVAL;
+                device
+                    .build_input_stream(
+                        &config,
+                        move |data: &[f32], _info: &cpal::InputCallbackInfo| {
+                            let mono = to_mono(data, channels);
+                            let resampled = resample(&mono, native_rate, 16000);
+                            let amplified = apply_gain(&resampled, MIC_GAIN);
+                            buffer.push_samples(&amplified);
+
+                            if let Some(ref h) = app_cb {
+                                let now = Instant::now();
+                                if now.duration_since(last_emit) >= LEVEL_INTERVAL {
+                                    last_emit = now;
+                                    let _ = h.emit("audio-level", rms(&amplified));
+                                }
+                            }
+                        },
+                        |err| log::error!("Audio stream error: {}", err),
+                        None,
+                    )
+                    .map_err(|e| format!("Failed to build f32 input stream: {}", e))?
+            }
+            SampleFormat::I16 => {
+                let buffer = self.buffer.clone();
+                let app_cb = app.clone();
+                let mut last_emit = Instant::now() - LEVEL_INTERVAL;
+                device
+                    .build_input_stream(
+                        &config,
+                        move |data: &[i16], _info: &cpal::InputCallbackInfo| {
+                            let float_data: Vec<f32> =
+                                data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
+                            let mono = to_mono(&float_data, channels);
+                            let resampled = resample(&mono, native_rate, 16000);
+                            let amplified = apply_gain(&resampled, MIC_GAIN);
+                            buffer.push_samples(&amplified);
+
+                            if let Some(ref h) = app_cb {
+                                let now = Instant::now();
+                                if now.duration_since(last_emit) >= LEVEL_INTERVAL {
+                                    last_emit = now;
+                                    let _ = h.emit("audio-level", rms(&amplified));
+                                }
+                            }
+                        },
+                        |err| log::error!("Audio stream error: {}", err),
+                        None,
+                    )
+                    .map_err(|e| format!("Failed to build i16 input stream: {}", e))?
+            }
             _ => return Err(format!("Unsupported sample format: {:?}", sample_format)),
         };
 
@@ -112,6 +141,15 @@ fn to_mono(data: &[f32], channels: usize) -> Vec<f32> {
 /// Apply gain and clamp to [-1.0, 1.0] to avoid clipping.
 fn apply_gain(data: &[f32], gain: f32) -> Vec<f32> {
     data.iter().map(|&s| (s * gain).clamp(-1.0, 1.0)).collect()
+}
+
+/// Root-mean-square amplitude in [0, 1] — used to drive the UI waveform.
+fn rms(data: &[f32]) -> f32 {
+    if data.is_empty() {
+        return 0.0;
+    }
+    let sum_sq: f32 = data.iter().map(|&s| s * s).sum();
+    (sum_sq / data.len() as f32).sqrt()
 }
 
 /// Simple linear interpolation resampler (e.g., 48000 -> 16000 Hz).

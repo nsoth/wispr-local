@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod autostart;
 pub mod commands;
 pub mod config;
 pub mod formatting;
@@ -16,10 +17,24 @@ use config::AppConfig;
 use settings::Settings;
 use state::{AppState, AppStatus};
 use system::sounds::SoundPlayer;
+use system::tray::TrayAnimator;
 use transcription::engine::WhisperEngine;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // When launched via autostart, detach from the parent console so no
+    // terminal window lingers on the desktop. In release builds the binary
+    // already uses windows_subsystem = "windows", so this is a no-op there;
+    // it matters for debug builds started from the Run registry key.
+    #[cfg(windows)]
+    {
+        if std::env::args().any(|a| a == "--hidden") {
+            unsafe {
+                windows_sys::Win32::System::Console::FreeConsole();
+            }
+        }
+    }
+
     env_logger::init();
 
     tauri::Builder::default()
@@ -78,6 +93,12 @@ pub fn run() {
             let user_settings = Settings::load(&config.data_dir);
             log::info!("Loaded hotkey setting: {}", user_settings.hotkey);
 
+            // Sync autostart state with saved settings
+            if user_settings.run_on_startup {
+                let _ = autostart::set_autostart_registry(true);
+                log::info!("Autostart enabled");
+            }
+
             // Initialize sound player (persistent output stream) with settings
             let sound_player = SoundPlayer::new(
                 user_settings.start_sound.clone(),
@@ -94,8 +115,15 @@ pub fn run() {
             app.manage(sound_player);
             app.manage(Mutex::new(user_settings.clone()));
 
-            // Setup system tray
+            // Setup system tray (also manages TrayAnimator state).
             system::tray::setup_tray(app.handle())?;
+
+            // Position the overlay window just above the Windows taskbar and
+            // ensure it respects the current show_overlay setting.
+            position_overlay_window(app.handle());
+            if let Some(overlay) = app.get_webview_window("overlay") {
+                let _ = overlay.hide();
+            }
 
             // Register global hotkey from settings
             {
@@ -167,9 +195,60 @@ pub fn run() {
             commands::test_sound,
             commands::get_ai_settings,
             commands::set_ai_settings,
+            commands::get_autostart,
+            commands::set_autostart,
+            commands::get_show_overlay,
+            commands::set_show_overlay,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+fn position_overlay_window(app: &tauri::AppHandle) {
+    let Some(overlay) = app.get_webview_window("overlay") else {
+        return;
+    };
+    let Ok(Some(monitor)) = overlay.primary_monitor() else {
+        return;
+    };
+
+    let monitor_size = monitor.size();
+    let monitor_pos = monitor.position();
+
+    let win_size = overlay.outer_size().unwrap_or(tauri::PhysicalSize {
+        width: 280,
+        height: 52,
+    });
+
+    // Center horizontally, park above the taskbar. 64px leaves room for the
+    // default Windows taskbar (48px) plus a small gap so the overlay doesn't
+    // feel glued to it.
+    const BOTTOM_MARGIN: i32 = 64;
+    let x = monitor_pos.x + (monitor_size.width as i32 - win_size.width as i32) / 2;
+    let y = monitor_pos.y + monitor_size.height as i32 - win_size.height as i32 - BOTTOM_MARGIN;
+
+    let _ = overlay.set_position(tauri::PhysicalPosition { x, y });
+}
+
+fn show_overlay_if_enabled(app: &tauri::AppHandle) {
+    let show = {
+        let settings = app.state::<Mutex<Settings>>();
+        let guard = settings.lock().unwrap();
+        guard.show_overlay
+    };
+    if !show {
+        return;
+    }
+    if let Some(overlay) = app.get_webview_window("overlay") {
+        position_overlay_window(app);
+        let _ = overlay.show();
+    }
+}
+
+fn hide_overlay(app: &tauri::AppHandle) {
+    if let Some(overlay) = app.get_webview_window("overlay") {
+        let _ = overlay.hide();
+    }
 }
 
 fn start_recording_flow(app: &tauri::AppHandle) {
@@ -190,13 +269,19 @@ fn start_recording_flow(app: &tauri::AppHandle) {
     let _ = app.emit("status-changed", "Recording");
     app.state::<SoundPlayer>().play_start();
 
+    // Kick off tray animation and reveal overlay (if user hasn't disabled it).
+    app.state::<TrayAnimator>().start();
+    show_overlay_if_enabled(app);
+
     let mut cap = capture.lock().unwrap();
-    match cap.start() {
+    match cap.start(Some(app.clone())) {
         Ok(rate) => log::info!("Recording started at {} Hz", rate),
         Err(e) => {
             log::error!("Failed to start recording: {}", e);
             state.lock().unwrap().status = AppStatus::Error(e);
             let _ = app.emit("status-changed", "Error");
+            app.state::<TrayAnimator>().stop();
+            hide_overlay(app);
             return;
         }
     }
@@ -348,6 +433,11 @@ async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
         capture.lock().unwrap().stop();
     }
     app.state::<SoundPlayer>().play_stop();
+
+    // End the recording indicator as soon as the mic is released; transcription
+    // runs afterwards and doesn't need the red pulse.
+    app.state::<TrayAnimator>().stop();
+    hide_overlay(app);
 
     {
         state.lock().unwrap().status = AppStatus::Transcribing;
