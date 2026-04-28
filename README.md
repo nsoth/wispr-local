@@ -1,18 +1,28 @@
 # Wispr Local
 
-Local, privacy-first voice-to-text dictation tool. Hold a hotkey, speak, and text appears wherever your cursor is. Powered by [Whisper.cpp](https://github.com/ggerganov/whisper.cpp) with optional AI formatting via Ollama, OpenAI, or Claude.
+Local, privacy-first voice-to-text dictation tool. Hold a hotkey, speak, and text appears wherever your cursor is. Powered by [Whisper.cpp](https://github.com/ggerganov/whisper.cpp) with optional AI formatting via OpenAI or Claude.
 
 ## Features
 
 - **Hold-to-dictate** global hotkey (customizable, default: `Ctrl+Shift+Space`)
-- **Local Whisper.cpp** transcription — no internet required
+- **Local Whisper.cpp** transcription — no internet required for the core dictation loop
 - **CUDA GPU acceleration** for fast transcription
 - **Real-time streaming preview** while recording
-- **AI text formatting** (paragraphs, punctuation, bullet lists) via Ollama / OpenAI / Claude
+- **AI text formatting** (paragraphs, punctuation, bullet lists) via OpenAI or Claude (optional)
 - **Automatic filler word removal** (English + Russian)
-- **Custom start/stop recording sounds**
-- **System tray app** — stays out of your way
+- **Recording overlay** — small always-on-top indicator above the taskbar (toggleable)
+- **Animated tray icon** pulses while recording
+- **Run on startup** — optional Windows autostart
+- **Custom start/stop recording sounds** with volume control
 - Built with **Tauri v2** (Rust + React)
+
+## Language support
+
+Whisper transcription is pinned to **Russian** (`language = "ru"`) by default. The medium model handles English code-switching inside a Russian utterance well — technical terms and mixed phrases come through correctly.
+
+Why pinned and not auto-detect: Whisper's language detector mis-classifies Russian as Ukrainian / Belarusian / Polish 5–10% of the time on short utterances or with English code-switching. Auto-detect also makes Whisper vulnerable to a known initial-prompt echo hallucination on silent / low-signal segments. Pinning the language sidesteps both issues.
+
+If you primarily speak a different language, change `set_language(Some("ru"))` in [`src-tauri/src/transcription/engine.rs`](src-tauri/src/transcription/engine.rs) to your language code (e.g. `"en"`, `"es"`).
 
 ## Requirements
 
@@ -85,11 +95,15 @@ npm run tauri dev
 
 Click **Settings** in the app window to configure:
 
+- **Hotkey** — rebind the hold-to-dictate global shortcut
 - **Sounds** — custom start/stop recording sounds, volume control
+- **Overlay** — show / hide the small recording indicator above the taskbar
+- **Run on startup** — launch the app automatically when Windows starts
 - **AI Formatting** — enable AI-powered text formatting:
-  - **Local (Ollama)** — runs on your machine, requires [Ollama](https://ollama.com/)
   - **OpenAI** — uses GPT models, requires API key
   - **Claude** — uses Anthropic models, requires API key
+
+  When AI formatting is off (default), transcribed text is pasted as-is after filler-word cleanup.
 
 ## Building for production
 
@@ -104,15 +118,17 @@ This creates an installer in `src-tauri/target/release/bundle/`.
 ```
 wispr-local/
 ├── src/                          # React frontend
-│   ├── App.tsx                   # Main UI
-│   └── styles/global.css         # Styles
+│   ├── App.tsx                   # Main window UI (settings)
+│   ├── Overlay.tsx               # Compact recording indicator
+│   └── styles/                   # global.css, overlay.css
 ├── src-tauri/                    # Rust backend
 │   └── src/
-│       ├── lib.rs                # App setup, recording/transcription flow
+│       ├── lib.rs                # App setup, recording / transcription flow
 │       ├── audio/                # Mic capture (cpal), resampling, buffer
-│       ├── transcription/        # Whisper engine wrapper
-│       ├── formatting.rs         # AI formatting (Ollama/OpenAI/Claude)
-│       ├── system/               # Text injection, tray, sounds
+│       ├── transcription/        # Whisper engine wrapper (pinned to "ru")
+│       ├── formatting.rs         # AI formatting (OpenAI / Claude)
+│       ├── system/               # Text injection, tray + animator, sounds
+│       ├── autostart.rs          # Windows Run-key autostart
 │       ├── settings.rs           # Persistent user settings
 │       └── commands.rs           # Tauri IPC commands
 ```
