@@ -95,7 +95,11 @@ body,
 }
 
 .overlay-canvas {
-  flex: 1 1 auto;
+  /* flex-basis 0 + min-width 0: a canvas has an intrinsic width of 300px and
+     refuses to shrink below it under `flex: 1 1 auto`, which pushed the pin
+     button past the right edge of the 312px window. */
+  flex: 1 1 0;
+  min-width: 0;
   height: 100%;
   display: block;
 }
