@@ -21,7 +21,8 @@ interface AiSettings {
 function App() {
   const [status, setStatus] = useState("Idle");
   const [notice, setNotice] = useState("");
-  const [lastTranscription, setLastTranscription] = useState("");
+  const [history, setHistory] = useState<string[]>([]);
+  const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
   const [streamingPreview, setStreamingPreview] = useState("");
   const [modelLoaded, setModelLoaded] = useState(false);
   const [modelsDir, setModelsDir] = useState("");
@@ -46,10 +47,7 @@ function App() {
     invoke("is_model_loaded").then((loaded) => setModelLoaded(loaded as boolean));
     invoke("get_models_dir").then((dir) => setModelsDir(dir as string));
     invoke("get_hotkey").then((hk) => setHotkey(hk as string));
-    invoke("get_last_transcription").then((t) => {
-      const text = t as string;
-      if (text) setLastTranscription(text);
-    });
+    invoke<string[]>("get_history").then((h) => setHistory(h));
     invoke<SoundSettings>("get_sound_settings").then((s) => {
       setStartSound(s.start_sound);
       setStopSound(s.stop_sound);
@@ -66,8 +64,8 @@ function App() {
       }
     });
 
-    const unlisten2 = listen<string>("transcription-complete", (event) => {
-      setLastTranscription(event.payload);
+    const unlisten2 = listen<string[]>("history-changed", (event) => {
+      setHistory(event.payload);
     });
 
     const unlisten3 = listen<string>("streaming-preview", (event) => {
@@ -219,6 +217,15 @@ function App() {
     return parts[parts.length - 1];
   };
 
+  const copyHistoryItem = (text: string, index: number) => {
+    invoke("copy_text", { text })
+      .then(() => {
+        setCopiedIndex(index);
+        setTimeout(() => setCopiedIndex(null), 1500);
+      })
+      .catch((e) => console.error("copy failed:", e));
+  };
+
   const hotkeyParts = hotkey.split("+");
   const isRecording = status === "Recording";
   const isTranscribing = status === "Transcribing";
@@ -326,10 +333,25 @@ function App() {
             </div>
           </div>
 
-          {lastTranscription && (
+          {history.length > 0 && (
             <div className="transcript-card">
-              <div className="transcript-label">Last transcription</div>
-              <div className="transcript-text">{lastTranscription}</div>
+              <div className="transcript-label">History</div>
+              <div className="history-list">
+                {history.map((item, i) => (
+                  <div className="history-item" key={`${i}-${item.slice(0, 24)}`}>
+                    <div className="history-text" title={item}>
+                      {item}
+                    </div>
+                    <button
+                      className={`history-copy-btn${copiedIndex === i ? " copied" : ""}`}
+                      onClick={() => copyHistoryItem(item, i)}
+                      title="Copy to clipboard"
+                    >
+                      {copiedIndex === i ? "Copied" : "Copy"}
+                    </button>
+                  </div>
+                ))}
+              </div>
             </div>
           )}
         </>

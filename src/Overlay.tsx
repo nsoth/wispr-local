@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import "./styles/overlay.css";
 
 const BAR_COUNT = 28;
@@ -10,10 +11,17 @@ export default function Overlay() {
   const levelsRef = useRef<number[]>(new Array(BAR_COUNT).fill(0));
   const rafRef = useRef<number | null>(null);
   const [isRecording, setIsRecording] = useState(false);
+  const [isLocked, setIsLocked] = useState(false);
 
   useEffect(() => {
     const unStatus = listen<string>("status-changed", (e) => {
-      setIsRecording(e.payload === "Recording");
+      const recording = e.payload === "Recording";
+      setIsRecording(recording);
+      if (!recording) setIsLocked(false);
+    });
+
+    const unLock = listen<boolean>("lock-changed", (e) => {
+      setIsLocked(e.payload);
     });
 
     const unLevel = listen<number>("audio-level", (e) => {
@@ -27,6 +35,7 @@ export default function Overlay() {
 
     return () => {
       unStatus.then((fn) => fn());
+      unLock.then((fn) => fn());
       unLevel.then((fn) => fn());
     };
   }, []);
@@ -77,10 +86,53 @@ export default function Overlay() {
     };
   }, [isRecording]);
 
+  const handlePinClick = () => {
+    invoke("toggle_recording_lock").catch((e) =>
+      console.error("toggle_recording_lock failed:", e),
+    );
+  };
+
   return (
-    <div className={`overlay-pill${isRecording ? " recording" : ""}`}>
+    <div
+      className={`overlay-pill${isRecording ? " recording" : ""}${
+        isLocked ? " locked" : ""
+      }`}
+    >
       <div className="overlay-dot" />
       <canvas ref={canvasRef} className="overlay-canvas" />
+      {isRecording && (
+        <button
+          className="overlay-pin"
+          onClick={handlePinClick}
+          title={
+            isLocked
+              ? "Stop recording"
+              : "Pin recording (keep going without holding the hotkey)"
+          }
+        >
+          {isLocked ? (
+            // Stop icon
+            <svg width="12" height="12" viewBox="0 0 12 12">
+              <rect x="2" y="2" width="8" height="8" rx="1.5" fill="currentColor" />
+            </svg>
+          ) : (
+            // Pin icon
+            <svg
+              width="13"
+              height="13"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M12 17v5" />
+              <path d="M9 3h6l-1 7 3 3H7l3-3-1-7z" />
+            </svg>
+          )}
+        </button>
+      )}
     </div>
   );
 }

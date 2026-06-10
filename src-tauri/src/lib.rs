@@ -43,14 +43,34 @@ pub fn run() {
                 .with_handler(|app, shortcut, event| {
                     use tauri_plugin_global_shortcut::ShortcutState;
                     log::info!("Hotkey event: {:?} state={:?}", shortcut, event.state);
+
+                    let (recording, locked) = {
+                        let state = app.state::<Mutex<AppState>>();
+                        let s = state.lock().unwrap();
+                        (s.status == AppStatus::Recording, s.recording_locked)
+                    };
+
                     match event.state {
                         ShortcutState::Pressed => {
-                            log::info!("Hotkey PRESSED - starting recording");
-                            let _ = app.emit("hotkey-start-recording", ());
+                            if recording && locked {
+                                // Pinned recording: a fresh press stops it.
+                                log::info!("Hotkey PRESSED - stopping pinned recording");
+                                let _ = app.emit("hotkey-stop-recording", ());
+                            } else if !recording {
+                                log::info!("Hotkey PRESSED - starting recording");
+                                let _ = app.emit("hotkey-start-recording", ());
+                            }
+                            // recording && !locked: key-repeat while holding — ignore.
                         }
                         ShortcutState::Released => {
-                            log::info!("Hotkey RELEASED - stopping recording");
-                            let _ = app.emit("hotkey-stop-recording", ());
+                            if locked {
+                                // Pinned via the overlay button: keep recording
+                                // after the key is released.
+                                log::info!("Hotkey RELEASED - recording pinned, ignoring");
+                            } else {
+                                log::info!("Hotkey RELEASED - stopping recording");
+                                let _ = app.emit("hotkey-stop-recording", ());
+                            }
                         }
                     }
                 })
@@ -76,6 +96,7 @@ pub fn run() {
             // leave the app without transcription.
             let mut engine = WhisperEngine::new();
             let mut initial_state = AppState::default();
+            initial_state.history = state::load_history(&config.data_dir);
 
             let mut candidates = vec![user_settings.model_file.clone()];
             for fallback in [settings::default_model_file(), "ggml-medium.bin".to_string()] {
@@ -136,6 +157,10 @@ pub fn run() {
             position_overlay_window(app.handle());
             if let Some(overlay) = app.get_webview_window("overlay") {
                 let _ = overlay.hide();
+                // WS_EX_NOACTIVATE: the pin button must be clickable without
+                // stealing focus from the app the user is dictating into —
+                // otherwise the eventual paste would land in the wrong window.
+                let _ = overlay.set_focusable(false);
             }
 
             // Register global hotkey from settings
@@ -200,6 +225,9 @@ pub fn run() {
             commands::get_status,
             commands::is_model_loaded,
             commands::get_last_transcription,
+            commands::toggle_recording_lock,
+            commands::get_history,
+            commands::copy_text,
             commands::get_models_dir,
             commands::get_hotkey,
             commands::set_hotkey,
@@ -229,7 +257,7 @@ fn position_overlay_window(app: &tauri::AppHandle) {
     let monitor_pos = monitor.position();
 
     let win_size = overlay.outer_size().unwrap_or(tauri::PhysicalSize {
-        width: 280,
+        width: 312,
         height: 52,
     });
 
@@ -277,9 +305,11 @@ fn start_recording_flow(app: &tauri::AppHandle) {
         }
         buffer.clear();
         s.status = AppStatus::Recording;
+        s.recording_locked = false;
     }
 
     let _ = app.emit("status-changed", "Recording");
+    let _ = app.emit("lock-changed", false);
     app.state::<SoundPlayer>().play_start();
 
     // Kick off tray animation and reveal overlay (if user hasn't disabled it).
@@ -447,11 +477,13 @@ async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
 
     // Only stop if we're actually recording
     {
-        let s = state.lock().unwrap();
+        let mut s = state.lock().unwrap();
         if s.status != AppStatus::Recording {
             return;
         }
+        s.recording_locked = false;
     }
+    let _ = app.emit("lock-changed", false);
 
     // Stop capture
     {
@@ -543,11 +575,15 @@ async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
         Err(e) => log::error!("Text injection failed: {}", e),
     }
 
-    {
+    let history = {
         let mut s = state.lock().unwrap();
         s.last_transcription = text.clone();
+        s.push_history(&text);
         s.status = AppStatus::Idle;
-    }
+        s.history.clone()
+    };
+    state::save_history(&app.state::<AppConfig>().data_dir, &history);
     let _ = app.emit("status-changed", "Idle");
+    let _ = app.emit("history-changed", &history);
     let _ = app.emit("transcription-complete", text);
 }

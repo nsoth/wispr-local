@@ -127,6 +127,61 @@ pub fn get_last_transcription(state: State<'_, Mutex<AppState>>) -> Result<Strin
     Ok(app_state.last_transcription.clone())
 }
 
+/// Pin (lock) the active recording so the hotkey can be released, or stop a
+/// pinned recording. Called from the overlay's pin/stop button.
+/// Returns the new lock state.
+#[tauri::command]
+pub fn toggle_recording_lock(
+    app: AppHandle,
+    state: State<'_, Mutex<AppState>>,
+) -> Result<bool, String> {
+    use tauri::Emitter;
+
+    let action = {
+        let mut s = state.lock().map_err(|e| e.to_string())?;
+        if s.status != AppStatus::Recording {
+            return Ok(false);
+        }
+        if s.recording_locked {
+            // Second click: stop the pinned recording.
+            "stop"
+        } else {
+            s.recording_locked = true;
+            "lock"
+        }
+    };
+
+    match action {
+        "lock" => {
+            log::info!("Recording pinned via overlay button");
+            let _ = app.emit("lock-changed", true);
+            Ok(true)
+        }
+        _ => {
+            log::info!("Pinned recording stopped via overlay button");
+            let _ = app.emit("hotkey-stop-recording", ());
+            Ok(false)
+        }
+    }
+}
+
+#[tauri::command]
+pub fn get_history(state: State<'_, Mutex<AppState>>) -> Result<Vec<String>, String> {
+    let app_state = state.lock().map_err(|e| e.to_string())?;
+    Ok(app_state.history.clone())
+}
+
+/// Copy arbitrary text to the system clipboard (used by the history list).
+#[tauri::command]
+pub fn copy_text(text: String) -> Result<(), String> {
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|e| format!("Failed to open clipboard: {}", e))?;
+    clipboard
+        .set_text(&text)
+        .map_err(|e| format!("Failed to set clipboard text: {}", e))?;
+    Ok(())
+}
+
 #[tauri::command]
 pub fn get_models_dir(config: State<'_, crate::config::AppConfig>) -> Result<String, String> {
     Ok(config.models_dir.to_string_lossy().to_string())
