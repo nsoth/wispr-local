@@ -161,6 +161,11 @@ pub fn run() {
                 // stealing focus from the app the user is dictating into —
                 // otherwise the eventual paste would land in the wrong window.
                 let _ = overlay.set_focusable(false);
+                // Clip the window itself to a pill shape at the OS level.
+                // WebView2 transparency proved unreliable here (square backdrop
+                // behind the rounded CSS pill), so instead the window is opaque
+                // and simply has no pixels outside the rounded region.
+                apply_pill_region(&overlay);
             }
 
             // Register global hotkey from settings
@@ -244,6 +249,29 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+/// Clip the overlay window to a rounded pill (corner radius = height/2) via
+/// SetWindowRgn, so nothing outside the pill exists at the compositor level.
+/// The region uses physical pixels, so this works at any DPI scale.
+#[cfg(windows)]
+fn apply_pill_region(overlay: &tauri::WebviewWindow) {
+    let (Ok(hwnd), Ok(size)) = (overlay.hwnd(), overlay.outer_size()) else {
+        log::warn!("Could not get overlay hwnd/size for pill region");
+        return;
+    };
+    unsafe {
+        use windows_sys::Win32::Graphics::Gdi::{CreateRoundRectRgn, SetWindowRgn};
+        let w = size.width as i32;
+        let h = size.height as i32;
+        // Ellipse w/h = window height -> fully rounded ends, matching the
+        // CSS border-radius: 999px pill. The region takes ownership of rgn.
+        let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, h, h);
+        SetWindowRgn(hwnd.0 as _, rgn, 1);
+    }
+}
+
+#[cfg(not(windows))]
+fn apply_pill_region(_overlay: &tauri::WebviewWindow) {}
 
 fn position_overlay_window(app: &tauri::AppHandle) {
     let Some(overlay) = app.get_webview_window("overlay") else {
