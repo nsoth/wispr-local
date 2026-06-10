@@ -44,7 +44,8 @@ fn default_openai_model() -> String {
     "gpt-4o-mini".to_string()
 }
 fn default_claude_model() -> String {
-    "claude-sonnet-4-20250514".to_string()
+    // Haiku 4.5: fast and cheap — plenty for punctuation/formatting work.
+    "claude-haiku-4-5-20251001".to_string()
 }
 fn default_prompt() -> String {
     DEFAULT_PROMPT.to_string()

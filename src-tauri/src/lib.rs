@@ -67,31 +67,44 @@ pub fn run() {
             let buffer = AudioBuffer::new();
             let capture = AudioCapture::new(buffer.clone());
 
-            // Initialize Whisper engine and try loading model
-            let mut engine = WhisperEngine::new();
-            let model_filename = "ggml-medium.bin";
-            let model_path = config.model_path(model_filename);
+            // Load settings (needed below for model selection)
+            let user_settings = Settings::load(&config.data_dir);
+            log::info!("Loaded hotkey setting: {}", user_settings.hotkey);
 
+            // Initialize Whisper engine. Try the configured model first, then
+            // fall back to older models so an incomplete download doesn't
+            // leave the app without transcription.
+            let mut engine = WhisperEngine::new();
             let mut initial_state = AppState::default();
 
-            if model_path.exists() {
+            let mut candidates = vec![user_settings.model_file.clone()];
+            for fallback in [settings::default_model_file(), "ggml-medium.bin".to_string()] {
+                if !candidates.contains(&fallback) {
+                    candidates.push(fallback);
+                }
+            }
+
+            for model_filename in &candidates {
+                let model_path = config.model_path(model_filename);
+                if !model_path.exists() {
+                    log::warn!("Model not found at {:?}", model_path);
+                    continue;
+                }
                 match engine.load_model(&model_path) {
                     Ok(_) => {
                         log::info!("Model loaded from {:?}", model_path);
                         initial_state.model_loaded = true;
+                        break;
                     }
-                    Err(e) => log::error!("Failed to load model: {}", e),
+                    Err(e) => log::error!("Failed to load model {}: {}", model_filename, e),
                 }
-            } else {
-                log::warn!(
-                    "Model not found at {:?}. Download it to enable transcription.",
-                    model_path
+            }
+            if !initial_state.model_loaded {
+                log::error!(
+                    "No usable Whisper model found in {:?}. Download one to enable transcription.",
+                    config.models_dir
                 );
             }
-
-            // Load settings
-            let user_settings = Settings::load(&config.data_dir);
-            log::info!("Loaded hotkey setting: {}", user_settings.hotkey);
 
             // Sync autostart state with saved settings
             if user_settings.run_on_startup {
@@ -359,58 +372,70 @@ async fn streaming_preview_loop(app: tauri::AppHandle) {
     }
 }
 
-/// Remove common filler words from transcription (Russian + English)
+/// Remove filler interjections from transcription (Russian + English).
+/// Only pure interjections that carry no meaning in any context — semantic
+/// words ("ну", "значит", "like", "so", "well") stay, because stripping them
+/// blindly corrupts real sentences ("I like this" → "I this"). Contextual
+/// filler cleanup is the AI formatting step's job.
 fn remove_fillers(text: &str) -> String {
-    // Regex-free approach: split by words, filter fillers, rejoin
-    let fillers_ru = [
-        "ну", "эм", "э", "ээ", "эээ", "ам", "хм", "ммм", "мм",
-        "типа", "короче", "как бы", "это самое", "в общем", "так сказать",
-        "слушай", "значит", "ну вот",
-    ];
-    let fillers_en = [
-        "um", "uh", "uh", "uhh", "umm", "hmm", "er", "ah", "like",
-        "you know", "i mean", "so", "well", "basically",
+    const FILLERS: &[&str] = &[
+        // Russian
+        "э", "ээ", "эээ", "эм", "ээм", "эмм", "ам", "хм", "мм", "ммм",
+        // English
+        "um", "umm", "uh", "uhh", "hmm", "er", "erm", "ah", "mhm",
     ];
 
-    let mut result = text.to_string();
-
-    // Remove multi-word fillers first (longer patterns first)
-    for filler in fillers_ru.iter().chain(fillers_en.iter()) {
-        if filler.contains(' ') {
-            // Case-insensitive removal of multi-word fillers
-            let lower = result.to_lowercase();
-            let filler_lower = filler.to_lowercase();
-            while let Some(pos) = lower.find(&filler_lower) {
-                // Remove filler and any trailing comma/space
-                let end = pos + filler.len();
-                let end = if result[end..].starts_with(", ") {
-                    end + 2
-                } else if result[end..].starts_with(' ') {
-                    end + 1
-                } else {
-                    end
-                };
-                result = format!("{}{}", &result[..pos], &result[end..]);
-                break; // re-check from start since indices changed
-            }
-        }
-    }
-
-    // Remove single-word fillers
-    let words: Vec<&str> = result.split_whitespace().collect();
-    let cleaned: Vec<&str> = words
-        .into_iter()
+    let cleaned: Vec<&str> = text
+        .split_whitespace()
         .filter(|w| {
             let lower = w.to_lowercase();
-            let stripped = lower.trim_matches(|c: char| c == ',' || c == '.' || c == '!' || c == '?');
-            !fillers_ru.contains(&stripped)
-                && !fillers_en.contains(&stripped)
+            let stripped = lower
+                .trim_matches(|c: char| matches!(c, ',' | '.' | '!' | '?' | '…' | '-' | '—'));
+            !FILLERS.contains(&stripped)
         })
         .collect();
 
-    let result = cleaned.join(" ");
-    // Clean up double spaces and trim
-    result.trim().to_string()
+    cleaned.join(" ").trim().to_string()
+}
+
+#[cfg(test)]
+mod filler_tests {
+    use super::remove_fillers;
+
+    #[test]
+    fn removes_interjections() {
+        assert_eq!(remove_fillers("Эм, привет, э, как дела?"), "привет, как дела?");
+        assert_eq!(remove_fillers("Um, hello there, uh, okay"), "hello there, okay");
+    }
+
+    #[test]
+    fn keeps_semantic_words() {
+        assert_eq!(remove_fillers("I like this approach"), "I like this approach");
+        assert_eq!(remove_fillers("Ну, это значит, что всё хорошо"), "Ну, это значит, что всё хорошо");
+        assert_eq!(remove_fillers("So, well, basically it works"), "So, well, basically it works");
+    }
+
+    #[test]
+    fn handles_empty_and_filler_only() {
+        assert_eq!(remove_fillers("эм... ээ"), "");
+        assert_eq!(remove_fillers(""), "");
+    }
+}
+
+/// Tell the user why nothing was pasted instead of failing silently.
+/// Emits an event for the UI and shows a system toast (the main window is
+/// usually hidden in the tray during dictation).
+fn notify_no_result(app: &tauri::AppHandle, reason: &str, message: &str) {
+    log::warn!("No transcription result: {}", reason);
+    let _ = app.emit("transcription-empty", reason);
+
+    use tauri_plugin_notification::NotificationExt;
+    let _ = app
+        .notification()
+        .builder()
+        .title("Wispr Local")
+        .body(message)
+        .show();
 }
 
 async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
@@ -445,10 +470,13 @@ async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
     let _ = app.emit("status-changed", "Transcribing");
 
     let samples = buffer.take_samples();
-    if samples.is_empty() {
+    // Under ~0.5s is an accidental hotkey tap — not enough audio for even one
+    // word, and short buffers are prime hallucination bait for Whisper.
+    const MIN_SAMPLES: usize = 8000; // 0.5s at 16kHz
+    if samples.len() < MIN_SAMPLES {
         state.lock().unwrap().status = AppStatus::Idle;
         let _ = app.emit("status-changed", "Idle");
-        log::warn!("No audio recorded");
+        notify_no_result(app, "too-short", "Recording too short — nothing captured");
         return;
     }
 
@@ -465,15 +493,16 @@ async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
                 log::error!("Transcription failed: {}", e);
                 state.lock().unwrap().status = AppStatus::Idle;
                 let _ = app.emit("status-changed", "Idle");
+                notify_no_result(app, "error", "Transcription failed — check logs");
                 return;
             }
         }
     };
 
     if text.is_empty() {
-        log::warn!("No speech detected");
         state.lock().unwrap().status = AppStatus::Idle;
         let _ = app.emit("status-changed", "Idle");
+        notify_no_result(app, "no-speech", "No speech detected — try again");
         return;
     }
 
@@ -481,9 +510,9 @@ async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
     log::info!("Transcription (cleaned): {}", text);
 
     if text.is_empty() {
-        log::warn!("No speech after filler removal");
         state.lock().unwrap().status = AppStatus::Idle;
         let _ = app.emit("status-changed", "Idle");
+        notify_no_result(app, "no-speech", "No speech detected — try again");
         return;
     }
 

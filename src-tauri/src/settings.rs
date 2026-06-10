@@ -17,6 +17,10 @@ pub struct Settings {
     pub run_on_startup: bool,
     #[serde(default = "default_show_overlay")]
     pub show_overlay: bool,
+    /// Whisper model filename inside the models dir. The loader falls back to
+    /// ggml-medium.bin when this file is missing.
+    #[serde(default = "default_model_file")]
+    pub model_file: String,
 }
 
 fn default_volume() -> f32 {
@@ -25,6 +29,10 @@ fn default_volume() -> f32 {
 
 fn default_show_overlay() -> bool {
     true
+}
+
+pub fn default_model_file() -> String {
+    "ggml-large-v3-turbo.bin".to_string()
 }
 
 impl Default for Settings {
@@ -37,6 +45,7 @@ impl Default for Settings {
             ai: AiSettings::default(),
             run_on_startup: false,
             show_overlay: true,
+            model_file: default_model_file(),
         }
     }
 }

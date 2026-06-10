@@ -20,6 +20,7 @@ interface AiSettings {
 
 function App() {
   const [status, setStatus] = useState("Idle");
+  const [notice, setNotice] = useState("");
   const [lastTranscription, setLastTranscription] = useState("");
   const [streamingPreview, setStreamingPreview] = useState("");
   const [modelLoaded, setModelLoaded] = useState(false);
@@ -37,7 +38,7 @@ function App() {
     provider: "none",
     api_key: "",
     openai_model: "gpt-4o-mini",
-    claude_model: "claude-sonnet-4-20250514",
+    claude_model: "claude-haiku-4-5-20251001",
     prompt: "",
   });
 
@@ -73,10 +74,24 @@ function App() {
       setStreamingPreview(event.payload);
     });
 
+    let noticeTimer: ReturnType<typeof setTimeout> | undefined;
+    const unlisten4 = listen<string>("transcription-empty", (event) => {
+      const messages: Record<string, string> = {
+        "too-short": "Recording too short — nothing captured",
+        "no-speech": "No speech detected — try again",
+        error: "Transcription failed — check logs",
+      };
+      setNotice(messages[event.payload] ?? "Nothing transcribed");
+      clearTimeout(noticeTimer);
+      noticeTimer = setTimeout(() => setNotice(""), 4000);
+    });
+
     return () => {
       unlisten1.then((fn) => fn());
       unlisten2.then((fn) => fn());
       unlisten3.then((fn) => fn());
+      unlisten4.then((fn) => fn());
+      clearTimeout(noticeTimer);
     };
   }, []);
 
@@ -262,7 +277,7 @@ function App() {
                 ? "Formatting..."
                 : isInjecting
                 ? "Pasting..."
-                : "Ready"}
+                : notice || "Ready"}
             </div>
 
             {isRecording && streamingPreview && (
@@ -491,7 +506,7 @@ function App() {
                     onChange={(e) =>
                       updateAiSettings({ claude_model: e.target.value })
                     }
-                    placeholder="claude-sonnet-4-20250514"
+                    placeholder="claude-haiku-4-5-20251001"
                   />
                 </div>
               </>
@@ -522,7 +537,7 @@ function App() {
         </div>
         {!modelLoaded && (
           <div className="model-help">
-            Download <code>ggml-base.en.bin</code> to:
+            Download <code>ggml-large-v3-turbo.bin</code> to:
             <span className="model-path">{modelsDir}</span>
           </div>
         )}

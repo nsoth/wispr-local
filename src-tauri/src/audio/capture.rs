@@ -5,12 +5,16 @@ use tauri::{AppHandle, Emitter};
 
 use super::buffer::AudioBuffer;
 
-/// Microphone gain multiplier. Boost quiet mics for better recognition.
-const MIC_GAIN: f32 = 4.0;
+/// Visual gain for the UI level meter only. Samples are stored raw; loudness
+/// is peak-normalized right before transcription (see WhisperEngine), which
+/// avoids the clipping distortion a fixed capture gain caused on loud speech.
+const LEVEL_GAIN: f32 = 4.0;
 
 /// Wrapper to make cpal::Stream usable across threads.
 /// On WASAPI (Windows), the stream handle is safe to move between threads.
-struct SendStream(Stream);
+/// The field is never read — it exists to keep the stream alive (dropping it
+/// stops capture).
+struct SendStream(#[allow(dead_code)] Stream);
 unsafe impl Send for SendStream {}
 
 pub struct AudioCapture {
@@ -61,14 +65,13 @@ impl AudioCapture {
                         move |data: &[f32], _info: &cpal::InputCallbackInfo| {
                             let mono = to_mono(data, channels);
                             let resampled = resample(&mono, native_rate, 16000);
-                            let amplified = apply_gain(&resampled, MIC_GAIN);
-                            buffer.push_samples(&amplified);
+                            buffer.push_samples(&resampled);
 
                             if let Some(ref h) = app_cb {
                                 let now = Instant::now();
                                 if now.duration_since(last_emit) >= LEVEL_INTERVAL {
                                     last_emit = now;
-                                    let _ = h.emit("audio-level", rms(&amplified));
+                                    let _ = h.emit("audio-level", rms(&resampled) * LEVEL_GAIN);
                                 }
                             }
                         },
@@ -89,14 +92,13 @@ impl AudioCapture {
                                 data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
                             let mono = to_mono(&float_data, channels);
                             let resampled = resample(&mono, native_rate, 16000);
-                            let amplified = apply_gain(&resampled, MIC_GAIN);
-                            buffer.push_samples(&amplified);
+                            buffer.push_samples(&resampled);
 
                             if let Some(ref h) = app_cb {
                                 let now = Instant::now();
                                 if now.duration_since(last_emit) >= LEVEL_INTERVAL {
                                     last_emit = now;
-                                    let _ = h.emit("audio-level", rms(&amplified));
+                                    let _ = h.emit("audio-level", rms(&resampled) * LEVEL_GAIN);
                                 }
                             }
                         },
@@ -136,11 +138,6 @@ fn to_mono(data: &[f32], channels: usize) -> Vec<f32> {
     data.chunks(channels)
         .map(|frame| frame.iter().sum::<f32>() / channels as f32)
         .collect()
-}
-
-/// Apply gain and clamp to [-1.0, 1.0] to avoid clipping.
-fn apply_gain(data: &[f32], gain: f32) -> Vec<f32> {
-    data.iter().map(|&s| (s * gain).clamp(-1.0, 1.0)).collect()
 }
 
 /// Root-mean-square amplitude in [0, 1] — used to drive the UI waveform.
