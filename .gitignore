@@ -9,8 +9,9 @@ src-tauri/target/
 src-tauri/models/
 *.bin
 
-# User settings (may contain API keys)
+# User settings / data (may contain API keys or dictated transcription text)
 settings.json
+history.json
 
 # Environment files
 .env
