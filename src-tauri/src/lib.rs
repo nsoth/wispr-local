@@ -245,6 +245,8 @@ pub fn run() {
             commands::set_autostart,
             commands::get_show_overlay,
             commands::set_show_overlay,
+            commands::get_language,
+            commands::set_language,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -406,7 +408,12 @@ async fn streaming_preview_loop(app: tauri::AppHandle) {
             if let Ok(eng) = lock_result {
                 let duration = samples.len() as f32 / 16000.0;
                 log::info!("Streaming preview: transcribing {:.1}s", duration);
-                match eng.transcribe(samples) {
+                let language = {
+                    let settings = app.state::<Mutex<Settings>>();
+                    let guard = settings.lock().unwrap();
+                    guard.language
+                };
+                match eng.transcribe(samples, language) {
                     Ok(text) if !text.is_empty() => {
                         log::info!("Preview: {}", text);
                         let _ = app.emit("streaming-preview", &text);
@@ -545,9 +552,14 @@ async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
         samples.len() as f32 / 16000.0
     );
 
+    let language = {
+        let settings = app.state::<Mutex<Settings>>();
+        let guard = settings.lock().unwrap();
+        guard.language
+    };
     let text = {
         let eng = engine.lock().unwrap();
-        match eng.transcribe(&samples) {
+        match eng.transcribe(&samples, language) {
             Ok(t) => t,
             Err(e) => {
                 log::error!("Transcription failed: {}", e);

@@ -18,6 +18,9 @@ interface AiSettings {
   prompt: string;
 }
 
+// Mirrors the Rust LanguageMode enum (serde "auto"/"ru"/"en").
+type LanguageMode = "auto" | "ru" | "en";
+
 function App() {
   const [status, setStatus] = useState("Idle");
   const [notice, setNotice] = useState("");
@@ -35,6 +38,7 @@ function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [autostart, setAutostart] = useState(false);
   const [showOverlay, setShowOverlay] = useState(true);
+  const [language, setLanguage] = useState<LanguageMode>("auto");
   const [aiSettings, setAiSettings] = useState<AiSettings>({
     provider: "none",
     api_key: "",
@@ -56,6 +60,7 @@ function App() {
     invoke<AiSettings>("get_ai_settings").then((ai) => setAiSettings(ai));
     invoke<boolean>("get_autostart").then((v) => setAutostart(v));
     invoke<boolean>("get_show_overlay").then((v) => setShowOverlay(v));
+    invoke<LanguageMode>("get_language").then((v) => setLanguage(v));
 
     const unlisten1 = listen<string>("status-changed", (event) => {
       setStatus(event.payload);
@@ -388,6 +393,22 @@ function App() {
                 />
                 <span className="toggle-slider"></span>
               </label>
+            </div>
+            <div className="setting-row">
+              <span className="setting-label">Language</span>
+              <select
+                className="setting-select"
+                value={language}
+                onChange={(e) => {
+                  const lang = e.target.value as LanguageMode;
+                  setLanguage(lang);
+                  invoke("set_language", { language: lang });
+                }}
+              >
+                <option value="auto">Auto (Russian / English)</option>
+                <option value="ru">Russian</option>
+                <option value="en">English</option>
+              </select>
             </div>
           </div>
 

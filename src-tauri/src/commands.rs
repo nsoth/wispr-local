@@ -44,6 +44,7 @@ pub async fn stop_recording_and_transcribe(
     capture: State<'_, Mutex<AudioCapture>>,
     buffer: State<'_, AudioBuffer>,
     engine: State<'_, Mutex<WhisperEngine>>,
+    settings: State<'_, Mutex<Settings>>,
 ) -> Result<String, String> {
     // Stop recording
     {
@@ -69,10 +70,14 @@ pub async fn stop_recording_and_transcribe(
         samples.len() as f32 / 16000.0
     );
 
-    // Transcribe
+    // Transcribe in the user's configured language mode (Auto detects ru/en).
+    let language = {
+        let s = settings.lock().map_err(|e| e.to_string())?;
+        s.language
+    };
     let text = {
         let eng = engine.lock().map_err(|e| e.to_string())?;
-        eng.transcribe(&samples)?
+        eng.transcribe(&samples, language)?
     };
 
     if text.is_empty() {
@@ -327,6 +332,27 @@ pub fn set_show_overlay(
         }
     }
 
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_language(
+    settings: State<'_, Mutex<Settings>>,
+) -> Result<crate::transcription::engine::LanguageMode, String> {
+    let s = settings.lock().map_err(|e| e.to_string())?;
+    Ok(s.language)
+}
+
+#[tauri::command]
+pub fn set_language(
+    language: crate::transcription::engine::LanguageMode,
+    settings: State<'_, Mutex<Settings>>,
+    config: State<'_, AppConfig>,
+) -> Result<(), String> {
+    let mut s = settings.lock().map_err(|e| e.to_string())?;
+    log::info!("Language mode updated: {:?}", language);
+    s.language = language;
+    s.save(&config.data_dir)?;
     Ok(())
 }
 

@@ -1,4 +1,5 @@
 use crate::formatting::AiSettings;
+use crate::transcription::engine::LanguageMode;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -21,6 +22,10 @@ pub struct Settings {
     /// ggml-medium.bin when this file is missing.
     #[serde(default = "default_model_file")]
     pub model_file: String,
+    /// Transcription language. `Auto` detects Russian vs English per utterance;
+    /// `Russian`/`English` pin the decoder. Defaults to Auto.
+    #[serde(default)]
+    pub language: LanguageMode,
 }
 
 fn default_volume() -> f32 {
@@ -46,6 +51,7 @@ impl Default for Settings {
             run_on_startup: false,
             show_overlay: true,
             model_file: default_model_file(),
+            language: LanguageMode::default(),
         }
     }
 }

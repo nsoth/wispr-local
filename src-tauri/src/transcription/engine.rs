@@ -1,5 +1,30 @@
+use serde::{Deserialize, Serialize};
 use std::path::Path;
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+use whisper_rs::{
+    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
+};
+
+/// Which language Whisper decodes as.
+///
+/// `Auto` runs a cheap detection pass constrained to Russian vs English — every
+/// other language is ignored, so a Russian speaker's audio can never leak into
+/// Ukrainian/Belarusian/Polish. `Russian` and `English` pin the decoder
+/// deterministically and skip the detection pass entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum LanguageMode {
+    #[serde(rename = "auto")]
+    Auto,
+    #[serde(rename = "ru")]
+    Russian,
+    #[serde(rename = "en")]
+    English,
+}
+
+impl Default for LanguageMode {
+    fn default() -> Self {
+        LanguageMode::Auto
+    }
+}
 
 pub struct WhisperEngine {
     context: Option<WhisperContext>,
@@ -30,7 +55,7 @@ impl WhisperEngine {
     }
 
     /// Transcribe audio samples (must be 16kHz, mono, f32).
-    pub fn transcribe(&self, audio: &[f32]) -> Result<String, String> {
+    pub fn transcribe(&self, audio: &[f32], language: LanguageMode) -> Result<String, String> {
         let ctx = self.context.as_ref().ok_or("Whisper model not loaded")?;
 
         // Peak-normalize so quiet mics still register, without the clipping
@@ -42,16 +67,24 @@ impl WhisperEngine {
             .create_state()
             .map_err(|e| format!("Failed to create Whisper state: {}", e))?;
 
+        // Decide the decode language before building params.
+        // History: we used to hardcode `set_language(Some("ru"))`, which ran
+        // pure-English speech through the Russian decoder head and "translated"
+        // it to Russian. A bare `set_language(None)` auto-detect (the even
+        // earlier approach) leaked into Ukrainian/Belarusian/Polish ~5-10% of
+        // the time for Russian speakers, which is why Auto detection is now
+        // clamped to just ru vs en (see detect_ru_or_en).
+        let lang = match language {
+            LanguageMode::Russian => "ru",
+            LanguageMode::English => "en",
+            LanguageMode::Auto => detect_ru_or_en(&mut state, &audio)?,
+        };
+
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-        // Pin to Russian. The medium model handles English code-switching
-        // (technical terms, mixed phrases) inside a Russian utterance fine.
-        // History: we previously used `set_language(None)` + a bilingual
-        // `initial_prompt`. That had two bugs — initial_prompt does NOT
-        // influence Whisper's language detector (so Ukrainian/Polish still
-        // leaked), and on silent/low-signal segments the decoder echoed the
-        // initial_prompt back as a hallucinated transcription
-        // ("Text in Russian or English." repeated).
-        params.set_language(Some("ru"));
+        // The medium+ models handle English code-switching (technical terms,
+        // mixed phrases) inside a Russian utterance fine when the language is
+        // pinned, so a ru-detected utterance keeps embedded English terms.
+        params.set_language(Some(lang));
         params.set_suppress_blank(true);
         // Ban non-speech "meta" tokens ([музыка], [текст на русском], ♪ …) at
         // decode time. These are subtitle artifacts the model hallucinates on
@@ -116,6 +149,57 @@ fn normalize_peak(audio: &[f32]) -> Vec<f32> {
     }
     let gain = (0.95 / peak).min(8.0);
     audio.iter().map(|&s| s * gain).collect()
+}
+
+/// English must beat Russian by a comfortable margin in the two-way ru/en race
+/// before we switch the decoder off Russian — English's share must be at least
+/// this fraction of `P(ru) + P(en)`. A near-tie (Russian speech with embedded
+/// English terms) therefore stays Russian, so code-switching isn't mangled into
+/// English. Pure English scores ~0.97 here and clears the bar easily.
+const EN_THRESHOLD: f32 = 0.60;
+
+/// Pick "ru" or "en" from their detection probabilities, biased toward Russian.
+/// Only these two probabilities matter; every other language is ignored by the
+/// caller, so this is a strict two-way decision.
+fn pick_language(p_ru: f32, p_en: f32) -> &'static str {
+    let total = p_ru + p_en;
+    if total <= 0.0 {
+        // Degenerate detection — fall back to the historical default.
+        return "ru";
+    }
+    if p_en / total >= EN_THRESHOLD {
+        "en"
+    } else {
+        "ru"
+    }
+}
+
+/// Run Whisper's language detector but consider ONLY Russian and English —
+/// every other language's probability is discarded, so acoustically-close
+/// Slavic languages (Ukrainian, Belarusian, Polish) can never win for a Russian
+/// speaker. Costs one extra encoder pass over the audio (Auto mode only).
+fn detect_ru_or_en(state: &mut WhisperState, audio: &[f32]) -> Result<&'static str, String> {
+    state
+        .pcm_to_mel(audio, 8)
+        .map_err(|e| format!("Language detection (mel) failed: {}", e))?;
+    let (_, probs) = state
+        .lang_detect(0, 8)
+        .map_err(|e| format!("Language detection failed: {}", e))?;
+
+    let prob_of = |code: &str| -> f32 {
+        whisper_rs::get_lang_id(code)
+            .and_then(|id| probs.get(id as usize).copied())
+            .unwrap_or(0.0)
+    };
+    let (p_ru, p_en) = (prob_of("ru"), prob_of("en"));
+    let lang = pick_language(p_ru, p_en);
+    log::info!(
+        "Auto language: {} (p_ru={:.3}, p_en={:.3})",
+        lang,
+        p_ru,
+        p_en
+    );
+    Ok(lang)
 }
 
 /// Stock phrases Whisper hallucinates on silence — subtitle credits and
@@ -223,5 +307,35 @@ mod tests {
     fn drops_punctuation_only() {
         assert_eq!(clean_hallucinations("..."), None);
         assert_eq!(clean_hallucinations(""), None);
+    }
+
+    use super::pick_language;
+
+    #[test]
+    fn pick_language_pure_english() {
+        assert_eq!(pick_language(0.02, 0.97), "en");
+    }
+
+    #[test]
+    fn pick_language_pure_russian() {
+        assert_eq!(pick_language(0.96, 0.03), "ru");
+    }
+
+    #[test]
+    fn pick_language_near_tie_stays_russian() {
+        // Russian with embedded English terms: English edges ahead but not by
+        // the required margin, so it stays Russian and code-switching survives.
+        assert_eq!(pick_language(0.45, 0.50), "ru");
+    }
+
+    #[test]
+    fn pick_language_clear_english_majority_switches() {
+        // English well past the 0.60 share threshold.
+        assert_eq!(pick_language(0.20, 0.80), "en");
+    }
+
+    #[test]
+    fn pick_language_zero_defaults_russian() {
+        assert_eq!(pick_language(0.0, 0.0), "ru");
     }
 }
