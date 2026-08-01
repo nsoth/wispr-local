@@ -197,6 +197,7 @@ pub fn run() {
             place_overlay_window(app.handle());
             if let Some(overlay) = app.get_webview_window("overlay") {
                 let _ = overlay.hide();
+                sync_overlay_webview_visibility(&overlay, false);
                 // WS_EX_NOACTIVATE: the pin button must be clickable without
                 // stealing focus from the app the user is dictating into —
                 // otherwise the eventual paste would land in the wrong window.
@@ -481,6 +482,33 @@ fn place_overlay_window(app: &tauri::AppHandle) {
     apply_pill_region(&overlay, win_w, win_h);
 }
 
+/// Sync the WebView2 controller's own visibility flag with the overlay
+/// window. Since the late-July 2026 updates (WebView2 150.x runtime /
+/// KB5101711), ShowWindow alone no longer resumes composition that was
+/// suspended when this WS_EX_NOACTIVATE window was hidden: Win32 reports the
+/// window visible with correct rect and region, but not a single pixel (not
+/// even backgroundColor) reaches the screen. Dropping the controller to
+/// hidden and back forces WebView2 to resume drawing; keeping it hidden
+/// while the window is hidden also stops pointless background compositing.
+#[cfg(windows)]
+fn sync_overlay_webview_visibility(overlay: &tauri::WebviewWindow, visible: bool) {
+    let result = overlay.with_webview(move |webview| unsafe {
+        let controller = webview.controller();
+        let _ = controller.SetIsVisible(false);
+        if visible {
+            if let Err(e) = controller.SetIsVisible(true) {
+                log::error!("WebView2 SetIsVisible(true) failed: {e}");
+            }
+        }
+    });
+    if let Err(e) = result {
+        log::error!("Overlay webview visibility sync failed: {e}");
+    }
+}
+
+#[cfg(not(windows))]
+fn sync_overlay_webview_visibility(_overlay: &tauri::WebviewWindow, _visible: bool) {}
+
 fn show_overlay_if_enabled(app: &tauri::AppHandle) {
     let show = {
         let settings = app.state::<Mutex<Settings>>();
@@ -498,6 +526,7 @@ fn show_overlay_if_enabled(app: &tauri::AppHandle) {
     if let Err(e) = overlay.show() {
         log::error!("Failed to show overlay: {}", e);
     }
+    sync_overlay_webview_visibility(&overlay, true);
     // Crossing to a monitor with a different scale factor resizes the window
     // shortly after set_position; re-clip once the size has settled so the
     // pill isn't left with a stale region.
@@ -523,6 +552,7 @@ fn show_overlay_if_enabled(app: &tauri::AppHandle) {
 fn hide_overlay(app: &tauri::AppHandle) {
     if let Some(overlay) = app.get_webview_window("overlay") {
         let _ = overlay.hide();
+        sync_overlay_webview_visibility(&overlay, false);
     }
 }
 
