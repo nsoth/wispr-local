@@ -14,15 +14,17 @@ Local, privacy-first voice-to-text dictation tool. Hold a hotkey, speak, and tex
 - **Animated tray icon** pulses while recording
 - **Run on startup** — optional Windows autostart
 - **Custom start/stop recording sounds** with volume control
+- **Microphone selection** with default-device fallback and disconnect recovery
+- **Crash recovery** — a lightweight supervisor restarts the app after native CUDA failures
+- **Automatic CPU recovery** after a native CUDA fast-fail
+- **Encrypted API keys** using Windows Data Protection API (DPAPI)
 - Built with **Tauri v2** (Rust + React)
 
 ## Language support
 
-Whisper transcription is pinned to **Russian** (`language = "ru"`) by default. The medium model handles English code-switching inside a Russian utterance well — technical terms and mixed phrases come through correctly.
+Whisper transcription defaults to **Auto (Russian / English)**. Auto mode runs a constrained two-language detection pass, biased toward Russian when Russian speech is present. This avoids accidental Ukrainian / Belarusian / Polish decoding while still handling fully English dictation. You can pin Russian or English in Settings.
 
-Why pinned and not auto-detect: Whisper's language detector mis-classifies Russian as Ukrainian / Belarusian / Polish 5–10% of the time on short utterances or with English code-switching. Auto-detect also makes Whisper vulnerable to a known initial-prompt echo hallucination on silent / low-signal segments. Pinning the language sidesteps both issues.
-
-If you primarily speak a different language, change `set_language(Some("ru"))` in [`src-tauri/src/transcription/engine.rs`](src-tauri/src/transcription/engine.rs) to your language code (e.g. `"en"`, `"es"`).
+Use a multilingual GGML model. English-only files ending in `.en.bin` cannot transcribe Russian and are intentionally skipped by model discovery.
 
 ## Requirements
 
@@ -69,11 +71,11 @@ Download a GGML model to the app's data directory:
 $modelsDir = "$env:APPDATA\wispr-local\WisprLocal\data\models"
 New-Item -ItemType Directory -Force -Path $modelsDir
 
-# Download the medium model (~1.5 GB, best quality)
-Invoke-WebRequest -Uri "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin" -OutFile "$modelsDir\ggml-medium.bin"
+# Recommended: large-v3-turbo (~1.6 GB, best speed/quality balance)
+Invoke-WebRequest -Uri "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin" -OutFile "$modelsDir\ggml-large-v3-turbo.bin"
 
-# Or download the base English model (~142 MB, faster, lower quality)
-Invoke-WebRequest -Uri "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin" -OutFile "$modelsDir\ggml-base.en.bin"
+# Lower-memory fallback: multilingual base model (~142 MB)
+Invoke-WebRequest -Uri "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin" -OutFile "$modelsDir\ggml-base.bin"
 ```
 
 ### 4. Run in development mode
@@ -98,12 +100,15 @@ Click **Settings** in the app window to configure:
 - **Hotkey** — rebind the hold-to-dictate global shortcut
 - **Sounds** — custom start/stop recording sounds, volume control
 - **Overlay** — show / hide the small recording indicator above the taskbar
+- **Microphone** — use the Windows default or choose a specific input device
 - **Run on startup** — launch the app automatically when Windows starts
 - **AI Formatting** — enable AI-powered text formatting:
   - **OpenAI** — uses GPT models, requires API key
   - **Claude** — uses Anthropic models, requires API key
 
   When AI formatting is off (default), transcribed text is pasted as-is after filler-word cleanup.
+
+The core dictation loop stays local. Enabling OpenAI or Claude sends the transcript to that provider for formatting. API keys are encrypted for the current Windows user with DPAPI and migrated automatically from older plaintext settings. Other settings and the five-item transcription history are stored in the app data directory; history can be cleared from the main window.
 
 ## Building for production
 
@@ -112,6 +117,8 @@ npm run tauri build
 ```
 
 This creates an installer in `src-tauri/target/release/bundle/`.
+
+Run `npm run check` for the frontend build and Rust unit tests.
 
 ## Architecture
 
@@ -125,21 +132,25 @@ wispr-local/
 │   └── src/
 │       ├── lib.rs                # App setup, recording / transcription flow
 │       ├── audio/                # Mic capture (cpal), resampling, buffer
-│       ├── transcription/        # Whisper engine wrapper (pinned to "ru")
+│       ├── transcription/        # Whisper engine and constrained ru/en detection
 │       ├── formatting.rs         # AI formatting (OpenAI / Claude)
 │       ├── system/               # Text injection, tray + animator, sounds
 │       ├── autostart.rs          # Windows Run-key autostart
 │       ├── settings.rs           # Persistent user settings
+│       ├── secrets.rs            # DPAPI-encrypted API-key storage
+│       ├── supervisor.rs         # Native crash logging and restart watchdog
 │       └── commands.rs           # Tauri IPC commands
 ```
 
 ## CUDA support
 
-The project is configured with `whisper-rs = { features = ["cuda"] }` for GPU acceleration. If you don't have an NVIDIA GPU, change `Cargo.toml`:
+The project is configured with the `cuda` feature for GPU acceleration. If you don't have an NVIDIA GPU, keep native logging but remove CUDA in `Cargo.toml`:
 
 ```toml
-whisper-rs = "0.15"  # remove features = ["cuda"]
+whisper-rs = { version = "0.15", features = ["log_backend"] }
 ```
+
+If CUDA initialization returns a regular error, the same process retries the model on CPU. If whisper.cpp terminates with its native CUDA fast-fail code, the supervisor restarts Wispr Local in CPU mode for the rest of that session. A clean application restart tries CUDA again.
 
 ## License
 
