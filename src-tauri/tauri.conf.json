@@ -17,6 +17,8 @@
         "title": "Wispr Local",
         "width": 380,
         "height": 460,
+        "minWidth": 340,
+        "minHeight": 400,
         "resizable": true,
         "visible": false
       },

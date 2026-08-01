@@ -41,6 +41,11 @@ export default function Overlay() {
   }, []);
 
   useEffect(() => {
+    if (!isRecording) {
+      levelsRef.current.fill(0);
+      return;
+    }
+
     const draw = () => {
       const canvas = canvasRef.current;
       if (canvas) {
@@ -49,9 +54,11 @@ export default function Overlay() {
           const dpr = window.devicePixelRatio || 1;
           const cssW = canvas.clientWidth;
           const cssH = canvas.clientHeight;
-          if (canvas.width !== cssW * dpr || canvas.height !== cssH * dpr) {
-            canvas.width = cssW * dpr;
-            canvas.height = cssH * dpr;
+          const pixelW = Math.round(cssW * dpr);
+          const pixelH = Math.round(cssH * dpr);
+          if (canvas.width !== pixelW || canvas.height !== pixelH) {
+            canvas.width = pixelW;
+            canvas.height = pixelH;
           }
           ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
           ctx.clearRect(0, 0, cssW, cssH);
@@ -68,8 +75,8 @@ export default function Overlay() {
 
           for (let i = 0; i < BAR_COUNT; i++) {
             const v = arr[i];
-            // Decay idle bars so the waveform fades when silent.
-            if (!isRecording) arr[i] = v * DECAY;
+            // Decay older bars so the waveform remains responsive to silence.
+            arr[i] = v * DECAY;
             const h = Math.max(2, v * maxH);
             const x = i * (barW + gap);
             const y = midY - h / 2;
@@ -102,8 +109,10 @@ export default function Overlay() {
       <canvas ref={canvasRef} className="overlay-canvas" />
       {isRecording && (
         <button
+          type="button"
           className="overlay-pin"
           onClick={handlePinClick}
+          aria-label={isLocked ? "Stop recording" : "Continue recording hands-free"}
           title={
             isLocked
               ? "Stop recording"
@@ -112,7 +121,7 @@ export default function Overlay() {
         >
           {isLocked ? (
             // Stop icon
-            <svg width="12" height="12" viewBox="0 0 12 12">
+            <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
               <rect x="2" y="2" width="8" height="8" rx="1.5" fill="currentColor" />
             </svg>
           ) : (
@@ -126,6 +135,7 @@ export default function Overlay() {
               strokeWidth="2.2"
               strokeLinecap="round"
               strokeLinejoin="round"
+              aria-hidden="true"
             >
               <path d="M12 17v5" />
               <path d="M9 3h6l-1 7 3 3H7l3-3-1-7z" />

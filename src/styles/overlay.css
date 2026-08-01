@@ -57,6 +57,11 @@ body,
   color: #fff;
 }
 
+.overlay-pin:focus-visible {
+  outline: 2px solid #fbbf24;
+  outline-offset: 2px;
+}
+
 .overlay-pill.locked .overlay-pin {
   background: rgba(245, 158, 11, 0.22);
   color: #f59e0b;
@@ -102,4 +107,13 @@ body,
   min-width: 0;
   height: 100%;
   display: block;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .overlay-pill,
+  .overlay-pin,
+  .overlay-dot {
+    animation: none;
+    transition: none;
+  }
 }

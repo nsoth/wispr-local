@@ -12,6 +12,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "test": "cargo test --manifest-path src-tauri/Cargo.toml --lib",
+    "check": "npm run build && npm run test",
     "preview": "vite preview",
     "tauri": "tauri"
   },
