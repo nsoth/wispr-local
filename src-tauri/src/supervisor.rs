@@ -35,6 +35,13 @@ const FORCE_CPU_ENV: &str = "WISPR_FORCE_CPU";
 /// whisper.cpp's GGML_ABORT path on Windows terminates with fast-fail
 /// STATUS_STACK_BUFFER_OVERRUN. Field crashes from ggml-cuda use this code.
 const NATIVE_FAST_FAIL: u32 = 0xC000_0409;
+/// Exit codes Windows hands a GUI process at logoff/shutdown:
+/// DBG_TERMINATE_PROCESS when session teardown kills the child, and
+/// STATUS_DLL_INIT_FAILED_LOGOFF for anything spawned while the window
+/// station is already closing. Neither is a crash — restarting into a dying
+/// session burns the fast-crash budget and pops a give-up MessageBox that
+/// blocks shutdown (observed 2026-07-31).
+const SESSION_END_EXIT_CODES: [u32; 2] = [0x4001_0004, 0xC000_026B];
 
 /// True when this process is the supervised child that should run the app.
 pub fn should_run_app() -> bool {
@@ -110,6 +117,17 @@ pub fn run_supervisor() -> ! {
             sup_log(&log_path, "app quit cleanly");
             break;
         }
+        if is_session_end(code) {
+            sup_log(
+                &log_path,
+                &format!(
+                    "session shutdown killed the app (exit code {:#x}) — exiting without restart",
+                    code
+                ),
+            );
+            last_code = 0;
+            break;
+        }
         sup_log(
             &log_path,
             &format!(
@@ -147,6 +165,10 @@ pub fn run_supervisor() -> ! {
 
 fn is_native_fast_fail(code: i32) -> bool {
     code as u32 == NATIVE_FAST_FAIL
+}
+
+fn is_session_end(code: i32) -> bool {
+    SESSION_END_EXIT_CODES.contains(&(code as u32))
 }
 
 /// Copy child output into the log file line by line. In debug builds also
@@ -227,11 +249,20 @@ fn fatal_message_box(_text: &str) {}
 
 #[cfg(test)]
 mod tests {
-    use super::{is_native_fast_fail, NATIVE_FAST_FAIL};
+    use super::{is_native_fast_fail, is_session_end, NATIVE_FAST_FAIL};
 
     #[test]
     fn recognizes_windows_native_fast_fail_exit_code() {
         assert!(is_native_fast_fail(NATIVE_FAST_FAIL as i32));
         assert!(!is_native_fast_fail(1));
+    }
+
+    #[test]
+    fn session_end_codes_do_not_count_as_crashes() {
+        assert!(is_session_end(0x4001_0004u32 as i32));
+        assert!(is_session_end(0xC000_026Bu32 as i32));
+        assert!(!is_session_end(NATIVE_FAST_FAIL as i32));
+        assert!(!is_session_end(1));
+        assert!(!is_session_end(0));
     }
 }
