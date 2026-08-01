@@ -1,29 +1,54 @@
 use std::sync::{Arc, Mutex};
 
-/// Simple thread-safe audio buffer that accumulates f32 samples at 16kHz.
-/// Phase 1 uses a record-all-then-transcribe pattern.
+/// Keep recording memory bounded even when hands-free mode is left running.
+/// At 16 kHz mono f32, 30 minutes is roughly 110 MiB.
+pub const MAX_RECORDING_SAMPLES: usize = 16_000 * 60 * 30;
+const INITIAL_CAPACITY: usize = 16_000 * 30;
+
+/// Thread-safe audio buffer that accumulates f32 samples at 16kHz.
 #[derive(Clone)]
 pub struct AudioBuffer {
     samples: Arc<Mutex<Vec<f32>>>,
+}
+
+impl Default for AudioBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AudioBuffer {
     pub fn new() -> Self {
         Self {
             // Pre-allocate for 30 seconds of 16kHz audio
-            samples: Arc::new(Mutex::new(Vec::with_capacity(16000 * 30))),
+            samples: Arc::new(Mutex::new(Vec::with_capacity(INITIAL_CAPACITY))),
         }
     }
 
-    pub fn push_samples(&self, data: &[f32]) {
+    /// Append samples and return true once the recording limit has been hit.
+    pub fn push_samples(&self, data: &[f32]) -> bool {
+        self.push_samples_with_limit(data, MAX_RECORDING_SAMPLES)
+    }
+
+    fn push_samples_with_limit(&self, data: &[f32], limit: usize) -> bool {
         if let Ok(mut buf) = self.samples.lock() {
-            buf.extend_from_slice(data);
+            let remaining = limit.saturating_sub(buf.len());
+            if remaining > 0 {
+                buf.extend_from_slice(&data[..data.len().min(remaining)]);
+            }
+            buf.len() >= limit
+        } else {
+            false
         }
     }
 
     pub fn take_samples(&self) -> Vec<f32> {
         if let Ok(mut buf) = self.samples.lock() {
-            std::mem::take(&mut *buf)
+            // Retain a useful allocation for the next recording instead of
+            // forcing the real-time audio callback to grow from zero again.
+            let mut replacement = Vec::with_capacity(INITIAL_CAPACITY);
+            std::mem::swap(&mut *buf, &mut replacement);
+            replacement
         } else {
             Vec::new()
         }
@@ -35,16 +60,33 @@ impl AudioBuffer {
         }
     }
 
-    pub fn len(&self) -> usize {
-        self.samples.lock().map(|b| b.len()).unwrap_or(0)
-    }
-
-    /// Return a copy of the current samples without clearing the buffer.
-    pub fn snapshot(&self) -> Vec<f32> {
+    /// Copy at most the newest `max_samples` without cloning a long recording.
+    pub fn snapshot_tail(&self, max_samples: usize) -> Vec<f32> {
         if let Ok(buf) = self.samples.lock() {
-            buf.clone()
+            let start = buf.len().saturating_sub(max_samples);
+            buf[start..].to_vec()
         } else {
             Vec::new()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AudioBuffer;
+
+    #[test]
+    fn snapshot_tail_only_copies_requested_samples() {
+        let buffer = AudioBuffer::new();
+        assert!(!buffer.push_samples(&[1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(buffer.snapshot_tail(2), vec![3.0, 4.0]);
+        assert_eq!(buffer.snapshot_tail(10), vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn recording_buffer_is_bounded() {
+        let buffer = AudioBuffer::new();
+        assert!(buffer.push_samples_with_limit(&[1.0, 2.0, 3.0, 4.0], 3));
+        assert_eq!(buffer.take_samples(), vec![1.0, 2.0, 3.0]);
     }
 }

@@ -3,8 +3,10 @@ pub mod autostart;
 pub mod commands;
 pub mod config;
 pub mod formatting;
+pub mod secrets;
 pub mod settings;
 pub mod state;
+pub mod supervisor;
 pub mod system;
 pub mod transcription;
 
@@ -22,6 +24,22 @@ use transcription::engine::WhisperEngine;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // The process the user (or autostart) launches is only a crash watchdog;
+    // the actual app runs as its supervised child. whisper.cpp aborts the
+    // whole process on CUDA errors, and the supervisor turns that into an
+    // automatic restart instead of silently dead dictation (supervisor.rs).
+    if !supervisor::should_run_app() {
+        supervisor::run_supervisor();
+    }
+
+    // Only the supervised child owns the instance guard. A second launch
+    // starts its own supervisor/child pair, sees this guard, then exits cleanly
+    // instead of repeatedly crashing on the already-registered global hotkey.
+    if !claim_single_instance() {
+        eprintln!("Wispr Local is already running");
+        return;
+    }
+
     // When launched via autostart, detach from the parent console so no
     // terminal window lingers on the desktop. In release builds the binary
     // already uses windows_subsystem = "windows", so this is a no-op there;
@@ -36,6 +54,11 @@ pub fn run() {
     }
 
     env_logger::init();
+    // Route whisper.cpp/GGML native log output through the `log` crate →
+    // env_logger → stderr → supervisor pipe → wispr.log. Without this the
+    // CUDA error text printed right before a GGML abort was lost with the
+    // invisible stderr of a windows-subsystem process.
+    whisper_rs::install_logging_hooks();
 
     tauri::Builder::default()
         .plugin(
@@ -81,7 +104,9 @@ pub fn run() {
         .setup(|app| {
             // Initialize configuration
             let config = AppConfig::new();
-            config.ensure_dirs().expect("Failed to create app directories");
+            config
+                .ensure_dirs()
+                .expect("Failed to create app directories");
 
             // Initialize audio pipeline
             let buffer = AudioBuffer::new();
@@ -95,13 +120,23 @@ pub fn run() {
             // fall back to older models so an incomplete download doesn't
             // leave the app without transcription.
             let mut engine = WhisperEngine::new();
-            let mut initial_state = AppState::default();
-            initial_state.history = state::load_history(&config.data_dir);
+            let mut initial_state = AppState {
+                history: state::load_history(&config.data_dir),
+                ..AppState::default()
+            };
 
             let mut candidates = vec![user_settings.model_file.clone()];
-            for fallback in [settings::default_model_file(), "ggml-medium.bin".to_string()] {
+            for fallback in [
+                settings::default_model_file(),
+                "ggml-medium.bin".to_string(),
+            ] {
                 if !candidates.contains(&fallback) {
                     candidates.push(fallback);
+                }
+            }
+            for discovered in config.available_model_files() {
+                if !candidates.contains(&discovered) {
+                    candidates.push(discovered);
                 }
             }
 
@@ -124,6 +159,11 @@ pub fn run() {
                 log::error!(
                     "No usable Whisper model found in {:?}. Download one to enable transcription.",
                     config.models_dir
+                );
+            } else if std::env::var("WISPR_FORCE_CPU").is_ok() {
+                notify_user(
+                    app.handle(),
+                    "Wispr Local recovered from a GPU failure and is using CPU transcription until restart.",
                 );
             }
 
@@ -154,18 +194,13 @@ pub fn run() {
 
             // Position the overlay window just above the Windows taskbar and
             // ensure it respects the current show_overlay setting.
-            position_overlay_window(app.handle());
+            place_overlay_window(app.handle());
             if let Some(overlay) = app.get_webview_window("overlay") {
                 let _ = overlay.hide();
                 // WS_EX_NOACTIVATE: the pin button must be clickable without
                 // stealing focus from the app the user is dictating into —
                 // otherwise the eventual paste would land in the wrong window.
                 let _ = overlay.set_focusable(false);
-                // Clip the window itself to a pill shape at the OS level.
-                // WebView2 transparency proved unreliable here (square backdrop
-                // behind the rounded CSS pill), so instead the window is opaque
-                // and simply has no pixels outside the rounded region.
-                apply_pill_region(&overlay);
             }
 
             // Register global hotkey from settings
@@ -174,7 +209,10 @@ pub fn run() {
                 let shortcut = commands::parse_hotkey(&user_settings.hotkey)
                     .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
                 app.global_shortcut().register(shortcut)?;
-                log::info!("Global hotkey registered: {} (hold to dictate)", user_settings.hotkey);
+                log::info!(
+                    "Global hotkey registered: {} (hold to dictate)",
+                    user_settings.hotkey
+                );
             }
 
             // Make close button hide the window instead of destroying it
@@ -191,18 +229,12 @@ pub fn run() {
             // Handle start recording (from hotkey or tray)
             let app_handle = app.handle().clone();
             app.listen("hotkey-start-recording", move |_event| {
-                let app = app_handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    start_recording_flow(&app);
-                });
+                start_recording_flow(&app_handle);
             });
 
             let app_handle = app.handle().clone();
             app.listen("tray-start-recording", move |_event| {
-                let app = app_handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    start_recording_flow(&app);
-                });
+                start_recording_flow(&app_handle);
             });
 
             // Handle stop recording (from hotkey or tray)
@@ -222,18 +254,46 @@ pub fn run() {
                 });
             });
 
+            // A pinned recording cannot grow memory forever. The audio callback
+            // emits this once at 30 minutes, then the normal finalization path
+            // transcribes everything captured so far.
+            let app_handle = app.handle().clone();
+            app.listen("recording-limit-reached", move |_event| {
+                let app = app_handle.clone();
+                notify_user(
+                    &app,
+                    "Recording reached the 30-minute limit and is being processed.",
+                );
+                tauri::async_runtime::spawn(async move {
+                    stop_and_transcribe_flow(&app).await;
+                });
+            });
+
+            let app_handle = app.handle().clone();
+            app.listen("audio-stream-error", move |_event| {
+                let app = app_handle.clone();
+                let message =
+                    "The microphone disconnected or stopped responding; processing captured audio.";
+                let _ = app.emit("operation-notice", message);
+                notify_user(&app, message);
+                tauri::async_runtime::spawn(async move {
+                    stop_and_transcribe_flow(&app).await;
+                });
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            commands::start_recording,
-            commands::stop_recording_and_transcribe,
             commands::get_status,
             commands::is_model_loaded,
+            commands::get_compute_backend,
             commands::get_last_transcription,
             commands::toggle_recording_lock,
             commands::get_history,
+            commands::clear_history,
             commands::copy_text,
             commands::get_models_dir,
+            commands::open_models_dir,
             commands::get_hotkey,
             commands::set_hotkey,
             commands::get_sound_settings,
@@ -247,58 +307,178 @@ pub fn run() {
             commands::set_show_overlay,
             commands::get_language,
             commands::set_language,
+            commands::get_input_devices,
+            commands::get_input_device,
+            commands::set_input_device,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
 
+#[cfg(windows)]
+struct InstanceMutex(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+unsafe impl Send for InstanceMutex {}
+#[cfg(windows)]
+unsafe impl Sync for InstanceMutex {}
+
+#[cfg(windows)]
+impl Drop for InstanceMutex {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn claim_single_instance() -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use std::sync::OnceLock;
+    use windows_sys::Win32::Foundation::{
+        GetLastError, ERROR_ALREADY_EXISTS, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+
+    static INSTANCE_MUTEX: OnceLock<InstanceMutex> = OnceLock::new();
+    let name: Vec<u16> = std::ffi::OsStr::new("Local\\WisprLocalAppInstance")
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        // Failure to create the guard should not make dictation unavailable.
+        return true;
+    }
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(handle);
+        }
+        return false;
+    }
+    INSTANCE_MUTEX.set(InstanceMutex(handle)).is_ok()
+}
+
+#[cfg(not(windows))]
+fn claim_single_instance() -> bool {
+    true
+}
+
 /// Clip the overlay window to a rounded pill (corner radius = height/2) via
 /// SetWindowRgn, so nothing outside the pill exists at the compositor level.
-/// The region uses physical pixels, so this works at any DPI scale.
+/// WebView2 transparency proved unreliable here (square backdrop behind the
+/// rounded CSS pill), so instead the window is opaque and simply has no pixels
+/// outside the rounded region. `w`/`h` are physical pixels — the region must
+/// be recomputed whenever the window lands on a monitor with a different DPI.
 #[cfg(windows)]
-fn apply_pill_region(overlay: &tauri::WebviewWindow) {
-    let (Ok(hwnd), Ok(size)) = (overlay.hwnd(), overlay.outer_size()) else {
-        log::warn!("Could not get overlay hwnd/size for pill region");
+fn apply_pill_region(overlay: &tauri::WebviewWindow, w: i32, h: i32) {
+    let Ok(hwnd) = overlay.hwnd() else {
+        log::warn!("Could not get overlay hwnd for pill region");
         return;
     };
     unsafe {
-        use windows_sys::Win32::Graphics::Gdi::{CreateRoundRectRgn, SetWindowRgn};
-        let w = size.width as i32;
-        let h = size.height as i32;
+        use windows_sys::Win32::Graphics::Gdi::{CreateRoundRectRgn, DeleteObject, SetWindowRgn};
         // Ellipse w/h = window height -> fully rounded ends, matching the
         // CSS border-radius: 999px pill. The region takes ownership of rgn.
         let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, h, h);
-        SetWindowRgn(hwnd.0 as _, rgn, 1);
+        if rgn.is_null() {
+            log::warn!("Could not create overlay pill region");
+        } else if SetWindowRgn(hwnd.0 as _, rgn, 1) == 0 {
+            // Windows takes ownership only on success.
+            let _ = DeleteObject(rgn as _);
+            log::warn!("Could not apply overlay pill region");
+        }
     }
 }
 
 #[cfg(not(windows))]
-fn apply_pill_region(_overlay: &tauri::WebviewWindow) {}
+fn apply_pill_region(_overlay: &tauri::WebviewWindow, _w: i32, _h: i32) {}
 
-fn position_overlay_window(app: &tauri::AppHandle) {
+/// Physical-pixel rect of the window that currently has keyboard focus — the
+/// app the user is dictating into.
+#[cfg(windows)]
+fn foreground_window_rect() -> Option<windows_sys::Win32::Foundation::RECT> {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowRect};
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_null() {
+            return None;
+        }
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        if GetWindowRect(hwnd, &mut rect) == 0 {
+            return None;
+        }
+        Some(rect)
+    }
+}
+
+/// The monitor hosting the focused window, falling back to the primary.
+/// Dictation pastes into the focused app, so that monitor is where the user
+/// is looking; pinning the overlay to the primary monitor made it invisible
+/// whenever the user worked on another display.
+fn target_monitor(overlay: &tauri::WebviewWindow) -> Option<tauri::Monitor> {
+    #[cfg(windows)]
+    if let Some(r) = foreground_window_rect() {
+        let cx = r.left + (r.right - r.left) / 2;
+        let cy = r.top + (r.bottom - r.top) / 2;
+        if let Ok(monitors) = overlay.available_monitors() {
+            let hit = monitors.into_iter().find(|m| {
+                let p = m.position();
+                let s = m.size();
+                cx >= p.x && cx < p.x + s.width as i32 && cy >= p.y && cy < p.y + s.height as i32
+            });
+            if hit.is_some() {
+                return hit;
+            }
+        }
+    }
+    overlay.primary_monitor().ok().flatten()
+}
+
+/// Position the overlay bottom-center on the monitor the user is working on
+/// and clip it to the pill shape at that monitor's DPI.
+fn place_overlay_window(app: &tauri::AppHandle) {
     let Some(overlay) = app.get_webview_window("overlay") else {
         return;
     };
-    let Ok(Some(monitor)) = overlay.primary_monitor() else {
+
+    // Logical size mirrors the overlay entry in tauri.conf.json.
+    const LOGICAL_W: f64 = 312.0;
+    const LOGICAL_H: f64 = 52.0;
+    // Room for the default Windows taskbar (48 logical px) plus a small gap
+    // so the overlay doesn't feel glued to it.
+    const BOTTOM_MARGIN: f64 = 64.0;
+
+    let Some(monitor) = target_monitor(&overlay) else {
+        log::warn!("Overlay positioning skipped: no monitor found");
         return;
     };
 
-    let monitor_size = monitor.size();
-    let monitor_pos = monitor.position();
+    let scale = monitor.scale_factor();
+    let mon_pos = monitor.position();
+    let mon_size = monitor.size();
 
-    let win_size = overlay.outer_size().unwrap_or(tauri::PhysicalSize {
-        width: 312,
-        height: 52,
-    });
+    // Physical size the window will have ON the target monitor. outer_size()
+    // can't be used here: it reports the size at the window's current DPI,
+    // which is stale while moving between monitors with different scales.
+    let win_w = (LOGICAL_W * scale).round() as i32;
+    let win_h = (LOGICAL_H * scale).round() as i32;
+    let margin = (BOTTOM_MARGIN * scale).round() as i32;
 
-    // Center horizontally, park above the taskbar. 64px leaves room for the
-    // default Windows taskbar (48px) plus a small gap so the overlay doesn't
-    // feel glued to it.
-    const BOTTOM_MARGIN: i32 = 64;
-    let x = monitor_pos.x + (monitor_size.width as i32 - win_size.width as i32) / 2;
-    let y = monitor_pos.y + monitor_size.height as i32 - win_size.height as i32 - BOTTOM_MARGIN;
+    let x = mon_pos.x + (mon_size.width as i32 - win_w) / 2;
+    let y = mon_pos.y + mon_size.height as i32 - win_h - margin;
 
-    let _ = overlay.set_position(tauri::PhysicalPosition { x, y });
+    if let Err(e) = overlay.set_position(tauri::PhysicalPosition { x, y }) {
+        log::warn!("Failed to position overlay: {}", e);
+    }
+    apply_pill_region(&overlay, win_w, win_h);
 }
 
 fn show_overlay_if_enabled(app: &tauri::AppHandle) {
@@ -310,10 +490,34 @@ fn show_overlay_if_enabled(app: &tauri::AppHandle) {
     if !show {
         return;
     }
-    if let Some(overlay) = app.get_webview_window("overlay") {
-        position_overlay_window(app);
-        let _ = overlay.show();
+    let Some(overlay) = app.get_webview_window("overlay") else {
+        log::error!("Overlay window is gone — recording indicator unavailable");
+        return;
+    };
+    place_overlay_window(app);
+    if let Err(e) = overlay.show() {
+        log::error!("Failed to show overlay: {}", e);
     }
+    // Crossing to a monitor with a different scale factor resizes the window
+    // shortly after set_position; re-clip once the size has settled so the
+    // pill isn't left with a stale region.
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let recording = {
+            let state = app.state::<Mutex<AppState>>();
+            let s = state.lock().unwrap();
+            s.status == AppStatus::Recording
+        };
+        if !recording {
+            return;
+        }
+        if let Some(overlay) = app.get_webview_window("overlay") {
+            if let Ok(size) = overlay.outer_size() {
+                apply_pill_region(&overlay, size.width as i32, size.height as i32);
+            }
+        }
+    });
 }
 
 fn hide_overlay(app: &tauri::AppHandle) {
@@ -328,14 +532,85 @@ fn start_recording_flow(app: &tauri::AppHandle) {
     let capture = app.state::<Mutex<AudioCapture>>();
     let buffer = app.state::<AudioBuffer>();
 
-    {
-        let mut s = state.lock().unwrap();
-        if s.status == AppStatus::Recording {
+    let can_start = {
+        let Ok(mut s) = state.lock() else {
+            log::error!("App state lock poisoned while starting recording");
+            return;
+        };
+        if !matches!(s.status, AppStatus::Idle | AppStatus::Error(_)) {
+            log::info!("Ignoring recording request while app is busy");
             return;
         }
+        if !s.model_loaded {
+            false
+        } else {
+            s.status = AppStatus::Recording;
+            s.recording_locked = false;
+            true
+        }
+    };
+
+    if !can_start {
+        notify_user(
+            app,
+            "Whisper model is not loaded. Open Wispr Local for setup help.",
+        );
+        let _ = app.emit("operation-notice", "Whisper model is not loaded");
+        return;
+    }
+
+    {
         buffer.clear();
-        s.status = AppStatus::Recording;
-        s.recording_locked = false;
+    }
+
+    let preferred_device = {
+        let settings = app.state::<Mutex<Settings>>();
+        settings
+            .lock()
+            .map(|s| s.input_device.clone())
+            .unwrap_or_default()
+    };
+    let start_result = capture
+        .lock()
+        .map_err(|e| e.to_string())
+        .and_then(|mut cap| {
+            cap.start(
+                Some(app.clone()),
+                (!preferred_device.is_empty()).then_some(preferred_device.as_str()),
+            )
+        });
+    match start_result {
+        Ok(start) => {
+            if let Ok(mut s) = state.lock() {
+                s.device_sample_rate = start.sample_rate;
+            }
+            log::info!(
+                "Recording started at {} Hz with input device {}",
+                start.sample_rate,
+                start.device_name
+            );
+            if start.used_fallback {
+                let message = format!(
+                    "Selected microphone is unavailable; using {}.",
+                    start.device_name
+                );
+                let _ = app.emit("operation-notice", &message);
+                notify_user(app, &message);
+            }
+        }
+        Err(e) => {
+            log::error!("Failed to start recording: {}", e);
+            if let Ok(mut s) = state.lock() {
+                s.status = AppStatus::Error(e.clone());
+            }
+            let message = format!("Microphone error: {e}");
+            let _ = app.emit("status-changed", &message);
+            let _ = app.emit("operation-notice", &message);
+            notify_user(app, &message);
+            app.state::<TrayAnimator>().stop();
+            hide_overlay(app);
+            return;
+        }
     }
 
     let _ = app.emit("status-changed", "Recording");
@@ -345,19 +620,6 @@ fn start_recording_flow(app: &tauri::AppHandle) {
     // Kick off tray animation and reveal overlay (if user hasn't disabled it).
     app.state::<TrayAnimator>().start();
     show_overlay_if_enabled(app);
-
-    let mut cap = capture.lock().unwrap();
-    match cap.start(Some(app.clone())) {
-        Ok(rate) => log::info!("Recording started at {} Hz", rate),
-        Err(e) => {
-            log::error!("Failed to start recording: {}", e);
-            state.lock().unwrap().status = AppStatus::Error(e);
-            let _ = app.emit("status-changed", "Error");
-            app.state::<TrayAnimator>().stop();
-            hide_overlay(app);
-            return;
-        }
-    }
 
     // Spawn streaming preview: transcribe every ~2s while recording
     let app_clone = app.clone();
@@ -382,18 +644,15 @@ async fn streaming_preview_loop(app: tauri::AppHandle) {
         }
     }
 
+    // Language detected on the first preview cycle is reused for the rest of
+    // this recording — see WhisperEngine::transcribe_cached for the trade-off.
+    let mut lang_cache: Option<&'static str> = None;
+
     loop {
         let buffer = app.state::<AudioBuffer>();
-        let full_samples = buffer.snapshot();
+        let samples = buffer.snapshot_tail(MAX_PREVIEW_SAMPLES);
 
-        if full_samples.len() >= 16000 {
-            // Only transcribe the last 10s for speed; show full context on final
-            let samples = if full_samples.len() > MAX_PREVIEW_SAMPLES {
-                &full_samples[full_samples.len() - MAX_PREVIEW_SAMPLES..]
-            } else {
-                &full_samples
-            };
-
+        if samples.len() >= 16000 {
             // Check if still recording right before locking the engine
             {
                 let state = app.state::<Mutex<AppState>>();
@@ -413,9 +672,9 @@ async fn streaming_preview_loop(app: tauri::AppHandle) {
                     let guard = settings.lock().unwrap();
                     guard.language
                 };
-                match eng.transcribe(samples, language) {
+                match eng.transcribe_cached(&samples, language, &mut lang_cache) {
                     Ok(text) if !text.is_empty() => {
-                        log::info!("Preview: {}", text);
+                        log::info!("Streaming preview ready ({} chars)", text.chars().count());
                         let _ = app.emit("streaming-preview", &text);
                     }
                     _ => {}
@@ -445,8 +704,7 @@ async fn streaming_preview_loop(app: tauri::AppHandle) {
 fn remove_fillers(text: &str) -> String {
     const FILLERS: &[&str] = &[
         // Russian
-        "э", "ээ", "эээ", "эм", "ээм", "эмм", "ам", "хм", "мм", "ммм",
-        // English
+        "э", "ээ", "эээ", "эм", "ээм", "эмм", "ам", "хм", "мм", "ммм", // English
         "um", "umm", "uh", "uhh", "hmm", "er", "erm", "ah", "mhm",
     ];
 
@@ -454,37 +712,13 @@ fn remove_fillers(text: &str) -> String {
         .split_whitespace()
         .filter(|w| {
             let lower = w.to_lowercase();
-            let stripped = lower
-                .trim_matches(|c: char| matches!(c, ',' | '.' | '!' | '?' | '…' | '-' | '—'));
+            let stripped =
+                lower.trim_matches(|c: char| matches!(c, ',' | '.' | '!' | '?' | '…' | '-' | '—'));
             !FILLERS.contains(&stripped)
         })
         .collect();
 
     cleaned.join(" ").trim().to_string()
-}
-
-#[cfg(test)]
-mod filler_tests {
-    use super::remove_fillers;
-
-    #[test]
-    fn removes_interjections() {
-        assert_eq!(remove_fillers("Эм, привет, э, как дела?"), "привет, как дела?");
-        assert_eq!(remove_fillers("Um, hello there, uh, okay"), "hello there, okay");
-    }
-
-    #[test]
-    fn keeps_semantic_words() {
-        assert_eq!(remove_fillers("I like this approach"), "I like this approach");
-        assert_eq!(remove_fillers("Ну, это значит, что всё хорошо"), "Ну, это значит, что всё хорошо");
-        assert_eq!(remove_fillers("So, well, basically it works"), "So, well, basically it works");
-    }
-
-    #[test]
-    fn handles_empty_and_filler_only() {
-        assert_eq!(remove_fillers("эм... ээ"), "");
-        assert_eq!(remove_fillers(""), "");
-    }
 }
 
 /// Tell the user why nothing was pasted instead of failing silently.
@@ -494,6 +728,10 @@ fn notify_no_result(app: &tauri::AppHandle, reason: &str, message: &str) {
     log::warn!("No transcription result: {}", reason);
     let _ = app.emit("transcription-empty", reason);
 
+    notify_user(app, message);
+}
+
+fn notify_user(app: &tauri::AppHandle, message: &str) {
     use tauri_plugin_notification::NotificationExt;
     let _ = app
         .notification()
@@ -510,15 +748,18 @@ async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
     let buffer = app.state::<AudioBuffer>();
     let engine = app.state::<Mutex<WhisperEngine>>();
 
-    // Only stop if we're actually recording
+    // Claim the stop atomically. Hotkey release, tray, pin button, and the
+    // recording-limit event can arrive together; only one may finalize audio.
     {
         let mut s = state.lock().unwrap();
         if s.status != AppStatus::Recording {
             return;
         }
         s.recording_locked = false;
+        s.status = AppStatus::Transcribing;
     }
     let _ = app.emit("lock-changed", false);
+    let _ = app.emit("status-changed", "Transcribing");
 
     // Stop capture
     {
@@ -530,11 +771,6 @@ async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
     // runs afterwards and doesn't need the red pulse.
     app.state::<TrayAnimator>().stop();
     hide_overlay(app);
-
-    {
-        state.lock().unwrap().status = AppStatus::Transcribing;
-    }
-    let _ = app.emit("status-changed", "Transcribing");
 
     let samples = buffer.take_samples();
     // Under ~0.5s is an accidental hotkey tap — not enough audio for even one
@@ -579,7 +815,7 @@ async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
     }
 
     let text = remove_fillers(&text);
-    log::info!("Transcription (cleaned): {}", text);
+    log::info!("Transcription cleaned ({} chars)", text.chars().count());
 
     if text.is_empty() {
         state.lock().unwrap().status = AppStatus::Idle;
@@ -600,7 +836,16 @@ async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
             state.lock().unwrap().status = AppStatus::Formatting;
         }
         let _ = app.emit("status-changed", "Formatting");
-        formatting::format_text(&text, &ai_settings).await
+        match formatting::format_text(&text, &ai_settings).await {
+            Ok(formatted) => formatted,
+            Err(e) => {
+                log::error!("AI formatting failed; using raw text: {e}");
+                let message = "AI formatting failed; pasted the raw transcript instead.";
+                let _ = app.emit("operation-notice", message);
+                notify_user(app, message);
+                text
+            }
+        }
     } else {
         text
     };
@@ -612,7 +857,17 @@ async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
 
     match system::text_injection::inject_text(&text) {
         Ok(_) => log::info!("Text injected successfully"),
-        Err(e) => log::error!("Text injection failed: {}", e),
+        Err(e) => {
+            log::error!("Text injection failed: {}", e);
+            let copied = commands::copy_text(text.clone()).is_ok();
+            let message = if copied {
+                "Automatic paste failed; the transcript was copied to your clipboard."
+            } else {
+                "Automatic paste failed; open Wispr Local to copy the transcript from history."
+            };
+            let _ = app.emit("operation-notice", message);
+            notify_user(app, message);
+        }
     }
 
     let history = {
@@ -622,8 +877,50 @@ async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
         s.status = AppStatus::Idle;
         s.history.clone()
     };
-    state::save_history(&app.state::<AppConfig>().data_dir, &history);
+    if let Err(e) = state::save_history(&app.state::<AppConfig>().data_dir, &history) {
+        log::warn!("Failed to save transcription history: {e}");
+        let _ = app.emit("operation-notice", "History could not be saved to disk");
+    }
     let _ = app.emit("status-changed", "Idle");
     let _ = app.emit("history-changed", &history);
     let _ = app.emit("transcription-complete", text);
+}
+
+#[cfg(test)]
+mod filler_tests {
+    use super::remove_fillers;
+
+    #[test]
+    fn removes_interjections() {
+        assert_eq!(
+            remove_fillers("Эм, привет, э, как дела?"),
+            "привет, как дела?"
+        );
+        assert_eq!(
+            remove_fillers("Um, hello there, uh, okay"),
+            "hello there, okay"
+        );
+    }
+
+    #[test]
+    fn keeps_semantic_words() {
+        assert_eq!(
+            remove_fillers("I like this approach"),
+            "I like this approach"
+        );
+        assert_eq!(
+            remove_fillers("Ну, это значит, что всё хорошо"),
+            "Ну, это значит, что всё хорошо"
+        );
+        assert_eq!(
+            remove_fillers("So, well, basically it works"),
+            "So, well, basically it works"
+        );
+    }
+
+    #[test]
+    fn handles_empty_and_filler_only() {
+        assert_eq!(remove_fillers("эм... ээ"), "");
+        assert_eq!(remove_fillers(""), "");
+    }
 }

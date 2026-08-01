@@ -2,109 +2,11 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
 
-use crate::audio::buffer::AudioBuffer;
-use crate::audio::capture::AudioCapture;
 use crate::config::AppConfig;
 use crate::settings::Settings;
 use crate::state::{AppState, AppStatus};
 use crate::system::sounds::SoundPlayer;
-use crate::system::text_injection;
 use crate::transcription::engine::WhisperEngine;
-
-#[tauri::command]
-pub async fn start_recording(
-    app: AppHandle,
-    state: State<'_, Mutex<AppState>>,
-    capture: State<'_, Mutex<AudioCapture>>,
-    buffer: State<'_, AudioBuffer>,
-) -> Result<String, String> {
-    {
-        let mut app_state = state.lock().map_err(|e| e.to_string())?;
-        if app_state.status == AppStatus::Recording {
-            return Err("Already recording".to_string());
-        }
-        buffer.clear();
-        app_state.status = AppStatus::Recording;
-    }
-
-    let mut cap = capture.lock().map_err(|e| e.to_string())?;
-    let sample_rate = cap.start(Some(app))?;
-
-    {
-        let mut app_state = state.lock().map_err(|e| e.to_string())?;
-        app_state.device_sample_rate = sample_rate;
-    }
-
-    Ok(format!("Recording at {} Hz", sample_rate))
-}
-
-#[tauri::command]
-pub async fn stop_recording_and_transcribe(
-    state: State<'_, Mutex<AppState>>,
-    capture: State<'_, Mutex<AudioCapture>>,
-    buffer: State<'_, AudioBuffer>,
-    engine: State<'_, Mutex<WhisperEngine>>,
-    settings: State<'_, Mutex<Settings>>,
-) -> Result<String, String> {
-    // Stop recording
-    {
-        let mut cap = capture.lock().map_err(|e| e.to_string())?;
-        cap.stop();
-    }
-
-    {
-        let mut app_state = state.lock().map_err(|e| e.to_string())?;
-        app_state.status = AppStatus::Transcribing;
-    }
-
-    let samples = buffer.take_samples();
-    if samples.is_empty() {
-        let mut app_state = state.lock().map_err(|e| e.to_string())?;
-        app_state.status = AppStatus::Idle;
-        return Err("No audio recorded".to_string());
-    }
-
-    log::info!(
-        "Transcribing {} samples ({:.1}s of audio)",
-        samples.len(),
-        samples.len() as f32 / 16000.0
-    );
-
-    // Transcribe in the user's configured language mode (Auto detects ru/en).
-    let language = {
-        let s = settings.lock().map_err(|e| e.to_string())?;
-        s.language
-    };
-    let text = {
-        let eng = engine.lock().map_err(|e| e.to_string())?;
-        eng.transcribe(&samples, language)?
-    };
-
-    if text.is_empty() {
-        let mut app_state = state.lock().map_err(|e| e.to_string())?;
-        app_state.status = AppStatus::Idle;
-        return Err("No speech detected".to_string());
-    }
-
-    log::info!("Transcription: {}", text);
-
-    // Inject text
-    {
-        let mut app_state = state.lock().map_err(|e| e.to_string())?;
-        app_state.status = AppStatus::Injecting;
-    }
-
-    text_injection::inject_text(&text)?;
-
-    // Done
-    {
-        let mut app_state = state.lock().map_err(|e| e.to_string())?;
-        app_state.last_transcription = text.clone();
-        app_state.status = AppStatus::Idle;
-    }
-
-    Ok(text)
-}
 
 #[tauri::command]
 pub fn get_status(state: State<'_, Mutex<AppState>>) -> Result<String, String> {
@@ -124,6 +26,12 @@ pub fn get_status(state: State<'_, Mutex<AppState>>) -> Result<String, String> {
 pub fn is_model_loaded(engine: State<'_, Mutex<WhisperEngine>>) -> Result<bool, String> {
     let eng = engine.lock().map_err(|e| e.to_string())?;
     Ok(eng.is_loaded())
+}
+
+#[tauri::command]
+pub fn get_compute_backend(engine: State<'_, Mutex<WhisperEngine>>) -> Result<String, String> {
+    let eng = engine.lock().map_err(|e| e.to_string())?;
+    Ok(eng.compute_backend().to_string())
 }
 
 #[tauri::command]
@@ -176,6 +84,28 @@ pub fn get_history(state: State<'_, Mutex<AppState>>) -> Result<Vec<String>, Str
     Ok(app_state.history.clone())
 }
 
+#[tauri::command]
+pub fn clear_history(
+    app: AppHandle,
+    state: State<'_, Mutex<AppState>>,
+    config: State<'_, AppConfig>,
+) -> Result<(), String> {
+    use tauri::Emitter;
+
+    {
+        let mut app_state = state.lock().map_err(|e| e.to_string())?;
+        let previous = std::mem::take(&mut app_state.history);
+        if let Err(e) = crate::state::save_history(&config.data_dir, &app_state.history) {
+            app_state.history = previous;
+            return Err(e);
+        }
+    }
+    let history: Vec<String> = Vec::new();
+    app.emit("history-changed", &history)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Copy arbitrary text to the system clipboard (used by the history list).
 #[tauri::command]
 pub fn copy_text(text: String) -> Result<(), String> {
@@ -193,6 +123,22 @@ pub fn get_models_dir(config: State<'_, crate::config::AppConfig>) -> Result<Str
 }
 
 #[tauri::command]
+pub fn open_models_dir(config: State<'_, AppConfig>) -> Result<(), String> {
+    #[cfg(windows)]
+    let mut command = std::process::Command::new("explorer.exe");
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("open");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = std::process::Command::new("xdg-open");
+
+    command
+        .arg(&config.models_dir)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Failed to open models folder: {e}"))
+}
+
+#[tauri::command]
 pub fn get_hotkey(settings: State<'_, Mutex<Settings>>) -> Result<String, String> {
     let s = settings.lock().map_err(|e| e.to_string())?;
     Ok(s.hotkey.clone())
@@ -207,30 +153,56 @@ pub fn set_hotkey(
 ) -> Result<String, String> {
     // Parse the new hotkey string
     let new_shortcut = parse_hotkey(&hotkey)?;
+    if !has_modifier(&hotkey) {
+        return Err("Use at least one modifier: Ctrl, Shift, Alt, or Win".to_string());
+    }
 
     // Get the old hotkey to unregister
     let old_hotkey = {
         let s = settings.lock().map_err(|e| e.to_string())?;
         s.hotkey.clone()
     };
+    if hotkey.eq_ignore_ascii_case(&old_hotkey) {
+        return Ok(old_hotkey);
+    }
     let old_shortcut = parse_hotkey(&old_hotkey)?;
 
-    // Unregister old, register new
+    // Register first so a conflict never removes the working shortcut. If a
+    // later step fails, roll back to the previous registration and setting.
     let gs = app.global_shortcut();
-    gs.unregister(old_shortcut)
-        .map_err(|e| format!("Failed to unregister old hotkey: {}", e))?;
     gs.register(new_shortcut)
         .map_err(|e| format!("Failed to register new hotkey: {}", e))?;
+    if let Err(e) = gs.unregister(old_shortcut) {
+        let _ = gs.unregister(new_shortcut);
+        return Err(format!("Failed to replace old hotkey: {e}"));
+    }
 
     // Save to settings
-    {
+    let save_result = {
         let mut s = settings.lock().map_err(|e| e.to_string())?;
         s.hotkey = hotkey.clone();
-        s.save(&config.data_dir)?;
+        s.save(&config.data_dir)
+    };
+    if let Err(e) = save_result {
+        let _ = gs.unregister(new_shortcut);
+        let _ = gs.register(old_shortcut);
+        if let Ok(mut s) = settings.lock() {
+            s.hotkey = old_hotkey;
+        }
+        return Err(e);
     }
 
     log::info!("Hotkey changed to: {}", hotkey);
     Ok(hotkey)
+}
+
+fn has_modifier(hotkey: &str) -> bool {
+    hotkey.split('+').any(|part| {
+        matches!(
+            part.trim().to_ascii_lowercase().as_str(),
+            "ctrl" | "control" | "shift" | "alt" | "super" | "win" | "meta" | "cmd"
+        )
+    })
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -261,17 +233,21 @@ pub fn set_sound_settings(
 ) -> Result<(), String> {
     let volume = sound_volume.clamp(0.0, 1.0);
 
-    // Update sound player at runtime
-    player.update_config(start_sound.clone(), stop_sound.clone(), volume);
-
-    // Save to settings
-    {
+    // Persist first; don't leave runtime behavior different from the UI if the
+    // settings file is temporarily unavailable.
+    let (runtime_start, runtime_stop) = {
         let mut s = settings.lock().map_err(|e| e.to_string())?;
+        let previous = (s.start_sound.clone(), s.stop_sound.clone(), s.sound_volume);
         s.start_sound = start_sound;
         s.stop_sound = stop_sound;
         s.sound_volume = volume;
-        s.save(&config.data_dir)?;
-    }
+        if let Err(e) = s.save(&config.data_dir) {
+            (s.start_sound, s.stop_sound, s.sound_volume) = previous;
+            return Err(e);
+        }
+        (s.start_sound.clone(), s.stop_sound.clone())
+    };
+    player.update_config(runtime_start, runtime_stop, volume);
 
     Ok(())
 }
@@ -287,7 +263,9 @@ pub fn test_sound(which: String, player: State<'_, SoundPlayer>) -> Result<(), S
 }
 
 #[tauri::command]
-pub fn get_ai_settings(settings: State<'_, Mutex<Settings>>) -> Result<crate::formatting::AiSettings, String> {
+pub fn get_ai_settings(
+    settings: State<'_, Mutex<Settings>>,
+) -> Result<crate::formatting::AiSettings, String> {
     let s = settings.lock().map_err(|e| e.to_string())?;
     Ok(s.ai.clone())
 }
@@ -300,8 +278,19 @@ pub fn set_ai_settings(
 ) -> Result<(), String> {
     let mut s = settings.lock().map_err(|e| e.to_string())?;
     log::info!("AI settings updated: provider={:?}", ai.provider);
+    let previous = s.ai.clone();
+    let key_changed = ai.api_key != previous.api_key;
+    if key_changed {
+        crate::secrets::save_api_key(&config.data_dir, &ai.api_key)?;
+    }
     s.ai = ai;
-    s.save(&config.data_dir)?;
+    if let Err(e) = s.save(&config.data_dir) {
+        s.ai = previous;
+        if key_changed {
+            let _ = crate::secrets::save_api_key(&config.data_dir, &s.ai.api_key);
+        }
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -320,8 +309,12 @@ pub fn set_show_overlay(
 ) -> Result<(), String> {
     {
         let mut s = settings.lock().map_err(|e| e.to_string())?;
+        let previous = s.show_overlay;
         s.show_overlay = show;
-        s.save(&config.data_dir)?;
+        if let Err(e) = s.save(&config.data_dir) {
+            s.show_overlay = previous;
+            return Err(e);
+        }
     }
 
     // If turning off, hide overlay immediately. Do not force-show on toggle
@@ -351,8 +344,47 @@ pub fn set_language(
 ) -> Result<(), String> {
     let mut s = settings.lock().map_err(|e| e.to_string())?;
     log::info!("Language mode updated: {:?}", language);
+    let previous = s.language;
     s.language = language;
-    s.save(&config.data_dir)?;
+    if let Err(e) = s.save(&config.data_dir) {
+        s.language = previous;
+        return Err(e);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_input_devices() -> Result<Vec<crate::audio::devices::AudioDeviceInfo>, String> {
+    Ok(crate::audio::devices::list_input_devices())
+}
+
+#[tauri::command]
+pub fn get_input_device(settings: State<'_, Mutex<Settings>>) -> Result<String, String> {
+    let s = settings.lock().map_err(|e| e.to_string())?;
+    Ok(s.input_device.clone())
+}
+
+#[tauri::command]
+pub fn set_input_device(
+    input_device: String,
+    settings: State<'_, Mutex<Settings>>,
+    config: State<'_, AppConfig>,
+) -> Result<(), String> {
+    if !input_device.is_empty()
+        && !crate::audio::devices::list_input_devices()
+            .iter()
+            .any(|device| device.name == input_device)
+    {
+        return Err("That microphone is no longer available".to_string());
+    }
+
+    let mut s = settings.lock().map_err(|e| e.to_string())?;
+    let previous = s.input_device.clone();
+    s.input_device = input_device;
+    if let Err(e) = s.save(&config.data_dir) {
+        s.input_device = previous;
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -370,8 +402,13 @@ pub fn set_autostart(
 ) -> Result<(), String> {
     crate::autostart::set_autostart_registry(enabled)?;
     let mut s = settings.lock().map_err(|e| e.to_string())?;
+    let previous = s.run_on_startup;
     s.run_on_startup = enabled;
-    s.save(&config.data_dir)?;
+    if let Err(e) = s.save(&config.data_dir) {
+        s.run_on_startup = previous;
+        let _ = crate::autostart::set_autostart_registry(previous);
+        return Err(e);
+    }
     log::info!("Autostart set to: {}", enabled);
     Ok(())
 }
@@ -488,5 +525,28 @@ fn parse_key_code(key: &str) -> Result<Code, String> {
         "y" => Ok(Code::KeyY),
         "z" => Ok(Code::KeyZ),
         other => Err(format!("Unknown key: {}", other)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{has_modifier, parse_hotkey};
+
+    #[test]
+    fn hotkey_parser_accepts_supported_combo() {
+        assert!(parse_hotkey("Ctrl+Shift+Space").is_ok());
+        assert!(parse_hotkey("Win+Alt+F12").is_ok());
+    }
+
+    #[test]
+    fn hotkey_parser_rejects_unknown_and_multiple_keys() {
+        assert!(parse_hotkey("Ctrl+NotAKey").is_err());
+        assert!(parse_hotkey("Ctrl+A+B").is_err());
+    }
+
+    #[test]
+    fn modifier_guard_protects_normal_typing() {
+        assert!(has_modifier("Ctrl+A"));
+        assert!(!has_modifier("A"));
     }
 }

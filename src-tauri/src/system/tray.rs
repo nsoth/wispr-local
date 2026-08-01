@@ -27,12 +27,15 @@ impl TrayAnimator {
 }
 
 pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
-    let start_item =
-        MenuItem::with_id(app, "start_recording", "Start Recording", true, None::<&str>)?;
-    let stop_item =
-        MenuItem::with_id(app, "stop_recording", "Stop Recording", true, None::<&str>)?;
-    let show_item =
-        MenuItem::with_id(app, "show_window", "Show Window", true, None::<&str>)?;
+    let start_item = MenuItem::with_id(
+        app,
+        "start_recording",
+        "Start Recording",
+        true,
+        None::<&str>,
+    )?;
+    let stop_item = MenuItem::with_id(app, "stop_recording", "Stop Recording", true, None::<&str>)?;
+    let show_item = MenuItem::with_id(app, "show_window", "Show Window", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
 
     let menu = Menu::with_items(app, &[&start_item, &stop_item, &show_item, &quit_item])?;

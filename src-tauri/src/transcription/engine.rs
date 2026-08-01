@@ -10,9 +10,10 @@ use whisper_rs::{
 /// other language is ignored, so a Russian speaker's audio can never leak into
 /// Ukrainian/Belarusian/Polish. `Russian` and `English` pin the decoder
 /// deterministically and skip the detection pass entirely.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub enum LanguageMode {
     #[serde(rename = "auto")]
+    #[default]
     Auto,
     #[serde(rename = "ru")]
     Russian,
@@ -20,33 +21,55 @@ pub enum LanguageMode {
     English,
 }
 
-impl Default for LanguageMode {
-    fn default() -> Self {
-        LanguageMode::Auto
-    }
-}
-
 pub struct WhisperEngine {
     context: Option<WhisperContext>,
+    using_gpu: bool,
+}
+
+impl Default for WhisperEngine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WhisperEngine {
     pub fn new() -> Self {
-        Self { context: None }
+        Self {
+            context: None,
+            using_gpu: false,
+        }
     }
 
     /// Load the Whisper model from disk. Expensive (~200-1100ms).
     /// Call once at startup and keep warm.
     pub fn load_model(&mut self, model_path: &Path) -> Result<(), String> {
         log::info!("Loading Whisper model from {:?}...", model_path);
-        let ctx = WhisperContext::new_with_params(
-            model_path.to_str().ok_or("Invalid model path")?,
-            WhisperContextParameters::default(),
-        )
-        .map_err(|e| format!("Failed to load Whisper model: {}", e))?;
+        let path = model_path.to_str().ok_or("Invalid model path")?;
+        let force_cpu = std::env::var("WISPR_FORCE_CPU").is_ok();
+        let mut params = WhisperContextParameters::default();
+        params.use_gpu(!force_cpu);
+        let (ctx, using_gpu) = match WhisperContext::new_with_params(path, params) {
+            Ok(ctx) => (ctx, !force_cpu),
+            Err(gpu_error) if !force_cpu => {
+                log::warn!(
+                    "GPU model initialization failed; retrying on CPU: {}",
+                    gpu_error
+                );
+                let mut cpu_params = WhisperContextParameters::default();
+                cpu_params.use_gpu(false);
+                let ctx = WhisperContext::new_with_params(path, cpu_params)
+                    .map_err(|e| format!("GPU load failed ({gpu_error}); CPU load failed ({e})"))?;
+                (ctx, false)
+            }
+            Err(e) => return Err(format!("Failed to load Whisper model: {e}")),
+        };
 
         self.context = Some(ctx);
-        log::info!("Whisper model loaded successfully");
+        self.using_gpu = using_gpu;
+        log::info!(
+            "Whisper model loaded successfully ({})",
+            if using_gpu { "CUDA" } else { "CPU" }
+        );
         Ok(())
     }
 
@@ -54,8 +77,34 @@ impl WhisperEngine {
         self.context.is_some()
     }
 
+    pub fn compute_backend(&self) -> &'static str {
+        if self.using_gpu {
+            "CUDA"
+        } else {
+            "CPU"
+        }
+    }
+
     /// Transcribe audio samples (must be 16kHz, mono, f32).
     pub fn transcribe(&self, audio: &[f32], language: LanguageMode) -> Result<String, String> {
+        self.transcribe_cached(audio, language, &mut None)
+    }
+
+    /// Like [`Self::transcribe`], but with a caller-held cache for the Auto
+    /// language decision. The streaming preview passes the same cache on every
+    /// ~2s cycle, so the detection pass — a full GPU encoder run — happens once
+    /// per recording instead of once per cycle. Half the CUDA launches means
+    /// half the exposure to whisper.cpp's abort-on-CUDA-error (see
+    /// supervisor.rs), and faster previews. The trade-off: the preview's
+    /// language sticks for the rest of the recording; the final transcription
+    /// uses a fresh cache, so the pasted result always re-detects on the full
+    /// utterance.
+    pub fn transcribe_cached(
+        &self,
+        audio: &[f32],
+        language: LanguageMode,
+        lang_cache: &mut Option<&'static str>,
+    ) -> Result<String, String> {
         let ctx = self.context.as_ref().ok_or("Whisper model not loaded")?;
 
         // Peak-normalize so quiet mics still register, without the clipping
@@ -77,7 +126,14 @@ impl WhisperEngine {
         let lang = match language {
             LanguageMode::Russian => "ru",
             LanguageMode::English => "en",
-            LanguageMode::Auto => detect_ru_or_en(&mut state, &audio)?,
+            LanguageMode::Auto => match *lang_cache {
+                Some(cached) => cached,
+                None => {
+                    let detected = detect_ru_or_en(&mut state, &audio)?;
+                    *lang_cache = Some(detected);
+                    detected
+                }
+            },
         };
 
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
@@ -118,9 +174,9 @@ impl WhisperEngine {
                 // decoder produced there is noise, not dictation.
                 if no_speech > 0.85 {
                     log::info!(
-                        "Dropping segment (no_speech_prob={:.2}): {}",
+                        "Dropping silent segment (no_speech_prob={:.2}, {} chars)",
                         no_speech,
-                        seg_text.trim()
+                        seg_text.trim().chars().count()
                     );
                     continue;
                 }
@@ -130,7 +186,10 @@ impl WhisperEngine {
                 match clean_hallucinations(&seg_text) {
                     Some(clean) => parts.push(clean),
                     None => {
-                        log::info!("Dropping hallucinated segment: {}", seg_text.trim());
+                        log::info!(
+                            "Dropping hallucinated segment ({} chars)",
+                            seg_text.trim().chars().count()
+                        );
                     }
                 }
             }
@@ -153,10 +212,18 @@ fn normalize_peak(audio: &[f32]) -> Vec<f32> {
 
 /// English must beat Russian by a comfortable margin in the two-way ru/en race
 /// before we switch the decoder off Russian — English's share must be at least
-/// this fraction of `P(ru) + P(en)`. A near-tie (Russian speech with embedded
-/// English terms) therefore stays Russian, so code-switching isn't mangled into
-/// English. Pure English scores ~0.97 here and clears the bar easily.
+/// this fraction of `P(ru) + P(en)`.
 const EN_THRESHOLD: f32 = 0.60;
+
+/// Switching to English additionally requires Russian to be essentially
+/// ABSENT: p_ru below this absolute probability. Field data (wispr.log
+/// 2026-07-22): Russian dictation dense with English tech terms ("artist
+/// mesh", "retop", "queue") accumulated enough English mass over a long
+/// utterance to win the share race (share_en 0.61–0.80) while p_ru stayed at
+/// 0.19–0.38 — and whole utterances got pasted as English translations.
+/// Genuine English speech scores p_ru ≈ 0.02–0.03, far below this bar, so it
+/// still switches; any audible Russian keeps the Russian decoder head.
+const RU_PRESENCE_MAX: f32 = 0.15;
 
 /// Pick "ru" or "en" from their detection probabilities, biased toward Russian.
 /// Only these two probabilities matter; every other language is ignored by the
@@ -167,7 +234,7 @@ fn pick_language(p_ru: f32, p_en: f32) -> &'static str {
         // Degenerate detection — fall back to the historical default.
         return "ru";
     }
-    if p_en / total >= EN_THRESHOLD {
+    if p_ru < RU_PRESENCE_MAX && p_en / total >= EN_THRESHOLD {
         "en"
     } else {
         "ru"
@@ -246,11 +313,7 @@ fn clean_hallucinations(text: &str) -> Option<String> {
     // Drop short segments that are just a stock hallucination phrase.
     let lower = clean.to_lowercase();
     let word_count = lower.split_whitespace().count();
-    if word_count <= 6
-        && HALLUCINATION_PHRASES
-            .iter()
-            .any(|p| lower.contains(p))
-    {
+    if word_count <= 6 && HALLUCINATION_PHRASES.iter().any(|p| lower.contains(p)) {
         return None;
     }
 
@@ -329,9 +392,29 @@ mod tests {
     }
 
     #[test]
-    fn pick_language_clear_english_majority_switches() {
-        // English well past the 0.60 share threshold.
-        assert_eq!(pick_language(0.20, 0.80), "en");
+    fn pick_language_russian_presence_blocks_english() {
+        // English share is high, but Russian is clearly audible (p_ru well
+        // above RU_PRESENCE_MAX) — term-heavy Russian, not English speech.
+        assert_eq!(pick_language(0.20, 0.80), "ru");
+    }
+
+    #[test]
+    fn pick_language_field_data_regressions_stay_russian() {
+        // Real mis-switches from wispr.log 2026-07-22: Russian dictation about
+        // "artist mesh"/"retop"/"queue" pasted as English translations. All
+        // must stay Russian under the presence gate.
+        assert_eq!(pick_language(0.285, 0.643), "ru");
+        assert_eq!(pick_language(0.363, 0.601), "ru");
+        assert_eq!(pick_language(0.379, 0.590), "ru");
+        assert_eq!(pick_language(0.188, 0.769), "ru");
+    }
+
+    #[test]
+    fn pick_language_genuine_english_still_switches() {
+        // Genuine English utterances score p_ru far below the presence bar
+        // (~0.02-0.03 observed), so the switch to English survives the gate.
+        assert_eq!(pick_language(0.03, 0.90), "en");
+        assert_eq!(pick_language(0.10, 0.55), "en");
     }
 
     #[test]

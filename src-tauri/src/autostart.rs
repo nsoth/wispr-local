@@ -11,8 +11,8 @@ pub fn set_autostart_registry(enabled: bool) -> Result<(), String> {
         .map_err(|e| format!("Failed to open registry key: {}", e))?;
 
     if enabled {
-        let exe_path = std::env::current_exe()
-            .map_err(|e| format!("Failed to get exe path: {}", e))?;
+        let exe_path =
+            std::env::current_exe().map_err(|e| format!("Failed to get exe path: {}", e))?;
         // Quote the path to handle spaces in directory names.
         // Pass --hidden so the app detaches from the console on startup
         // (debug builds would otherwise leave a terminal window open).

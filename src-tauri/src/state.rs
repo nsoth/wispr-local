@@ -1,23 +1,18 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Keep this many recent transcriptions for the in-app history.
 pub const HISTORY_LIMIT: usize = 5;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub enum AppStatus {
+    #[default]
     Idle,
     Recording,
     Transcribing,
     Formatting,
     Injecting,
     Error(String),
-}
-
-impl Default for AppStatus {
-    fn default() -> Self {
-        AppStatus::Idle
-    }
 }
 
 pub struct AppState {
@@ -57,28 +52,24 @@ impl AppState {
     }
 }
 
-fn history_path(data_dir: &PathBuf) -> PathBuf {
+fn history_path(data_dir: &Path) -> PathBuf {
     data_dir.join("history.json")
 }
 
-pub fn load_history(data_dir: &PathBuf) -> Vec<String> {
+pub fn load_history(data_dir: &Path) -> Vec<String> {
     let path = history_path(data_dir);
     if let Ok(contents) = std::fs::read_to_string(&path) {
-        if let Ok(history) = serde_json::from_str::<Vec<String>>(&contents) {
+        if let Ok(mut history) = serde_json::from_str::<Vec<String>>(&contents) {
+            history.retain(|item| !item.trim().is_empty());
+            history.truncate(HISTORY_LIMIT);
             return history;
         }
     }
     Vec::new()
 }
 
-pub fn save_history(data_dir: &PathBuf, history: &[String]) {
+pub fn save_history(data_dir: &Path, history: &[String]) -> Result<(), String> {
     let path = history_path(data_dir);
-    match serde_json::to_string_pretty(history) {
-        Ok(json) => {
-            if let Err(e) = std::fs::write(&path, json) {
-                log::warn!("Failed to save history: {}", e);
-            }
-        }
-        Err(e) => log::warn!("Failed to serialize history: {}", e),
-    }
+    let json = serde_json::to_string_pretty(history).map_err(|e| e.to_string())?;
+    crate::config::write_file_atomic(&path, json.as_bytes())
 }

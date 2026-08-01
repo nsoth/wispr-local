@@ -1,9 +1,10 @@
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{SampleFormat, Stream, StreamConfig};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
 use super::buffer::AudioBuffer;
+use super::devices;
 
 /// Visual gain for the UI level meter only. Samples are stored raw; loudness
 /// is peak-normalized right before transcription (see WhisperEngine), which
@@ -23,6 +24,12 @@ pub struct AudioCapture {
     device_sample_rate: u32,
 }
 
+pub struct CaptureStart {
+    pub sample_rate: u32,
+    pub device_name: String,
+    pub used_fallback: bool,
+}
+
 // AudioCapture is Send+Sync because SendStream is Send and other fields are Send+Sync
 unsafe impl Sync for AudioCapture {}
 
@@ -35,15 +42,13 @@ impl AudioCapture {
         }
     }
 
-    pub fn start(&mut self, app: Option<AppHandle>) -> Result<u32, String> {
-        let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .ok_or("No input device found")?;
-
-        let supported_config = device
-            .default_input_config()
-            .map_err(|e| format!("Failed to get default input config: {}", e))?;
+    pub fn start(
+        &mut self,
+        app: Option<AppHandle>,
+        preferred_device: Option<&str>,
+    ) -> Result<CaptureStart, String> {
+        let (device, supported_config, device_name, used_fallback) =
+            devices::select_input_device(preferred_device)?;
 
         let sample_format = supported_config.sample_format();
         let config: StreamConfig = supported_config.into();
@@ -58,16 +63,23 @@ impl AudioCapture {
             SampleFormat::F32 => {
                 let buffer = self.buffer.clone();
                 let app_cb = app.clone();
+                let error_app = app.clone();
                 let mut last_emit = Instant::now() - LEVEL_INTERVAL;
+                let mut limit_emitted = false;
+                let mut error_emitted = false;
                 device
                     .build_input_stream(
                         &config,
                         move |data: &[f32], _info: &cpal::InputCallbackInfo| {
                             let mono = to_mono(data, channels);
                             let resampled = resample(&mono, native_rate, 16000);
-                            buffer.push_samples(&resampled);
+                            let limit_reached = buffer.push_samples(&resampled);
 
                             if let Some(ref h) = app_cb {
+                                if limit_reached && !limit_emitted {
+                                    limit_emitted = true;
+                                    let _ = h.emit("recording-limit-reached", ());
+                                }
                                 let now = Instant::now();
                                 if now.duration_since(last_emit) >= LEVEL_INTERVAL {
                                     last_emit = now;
@@ -75,7 +87,15 @@ impl AudioCapture {
                                 }
                             }
                         },
-                        |err| log::error!("Audio stream error: {}", err),
+                        move |err| {
+                            log::error!("Audio stream error: {}", err);
+                            if !error_emitted {
+                                error_emitted = true;
+                                if let Some(ref h) = error_app {
+                                    let _ = h.emit("audio-stream-error", err.to_string());
+                                }
+                            }
+                        },
                         None,
                     )
                     .map_err(|e| format!("Failed to build f32 input stream: {}", e))?
@@ -83,7 +103,10 @@ impl AudioCapture {
             SampleFormat::I16 => {
                 let buffer = self.buffer.clone();
                 let app_cb = app.clone();
+                let error_app = app.clone();
                 let mut last_emit = Instant::now() - LEVEL_INTERVAL;
+                let mut limit_emitted = false;
+                let mut error_emitted = false;
                 device
                     .build_input_stream(
                         &config,
@@ -92,9 +115,13 @@ impl AudioCapture {
                                 data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
                             let mono = to_mono(&float_data, channels);
                             let resampled = resample(&mono, native_rate, 16000);
-                            buffer.push_samples(&resampled);
+                            let limit_reached = buffer.push_samples(&resampled);
 
                             if let Some(ref h) = app_cb {
+                                if limit_reached && !limit_emitted {
+                                    limit_emitted = true;
+                                    let _ = h.emit("recording-limit-reached", ());
+                                }
                                 let now = Instant::now();
                                 if now.duration_since(last_emit) >= LEVEL_INTERVAL {
                                     last_emit = now;
@@ -102,7 +129,15 @@ impl AudioCapture {
                                 }
                             }
                         },
-                        |err| log::error!("Audio stream error: {}", err),
+                        move |err| {
+                            log::error!("Audio stream error: {}", err);
+                            if !error_emitted {
+                                error_emitted = true;
+                                if let Some(ref h) = error_app {
+                                    let _ = h.emit("audio-stream-error", err.to_string());
+                                }
+                            }
+                        },
                         None,
                     )
                     .map_err(|e| format!("Failed to build i16 input stream: {}", e))?
@@ -114,7 +149,11 @@ impl AudioCapture {
             .play()
             .map_err(|e| format!("Failed to start stream: {}", e))?;
         self.stream = Some(SendStream(stream));
-        Ok(self.device_sample_rate)
+        Ok(CaptureStart {
+            sample_rate: self.device_sample_rate,
+            device_name,
+            used_fallback,
+        })
     }
 
     pub fn stop(&mut self) {

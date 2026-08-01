@@ -1,5 +1,7 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
+use std::time::Duration;
 
 const DEFAULT_PROMPT: &str = "You are a text formatting assistant. The user dictated the following text via speech-to-text. \
 Format it into well-structured text:\n\
@@ -10,9 +12,10 @@ Format it into well-structured text:\n\
 - Do NOT change the meaning, rephrase, or add new content\n\
 - Output ONLY the formatted text, nothing else (no explanations, no quotes)";
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub enum AiProvider {
     #[serde(rename = "none")]
+    #[default]
     None,
     #[serde(rename = "openai")]
     OpenAi,
@@ -20,17 +23,11 @@ pub enum AiProvider {
     Claude,
 }
 
-impl Default for AiProvider {
-    fn default() -> Self {
-        AiProvider::None
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiSettings {
     #[serde(default)]
     pub provider: AiProvider,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub api_key: String,
     #[serde(default = "default_openai_model")]
     pub openai_model: String,
@@ -63,31 +60,62 @@ impl Default for AiSettings {
     }
 }
 
-/// Format transcribed text using the configured AI provider.
-/// Returns the original text if provider is None or on error.
-pub async fn format_text(text: &str, settings: &AiSettings) -> String {
+fn http_client() -> Result<&'static Client, String> {
+    static CLIENT: OnceLock<Result<Client, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(20))
+                .build()
+                .map_err(|e| format!("Failed to initialize HTTP client: {e}"))
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+/// Format transcribed text using the configured AI provider. The caller owns
+/// fallback behavior so it can tell the user when raw text was used instead.
+pub async fn format_text(text: &str, settings: &AiSettings) -> Result<String, String> {
     if settings.provider == AiProvider::None || text.trim().is_empty() {
-        return text.to_string();
+        return Ok(text.to_string());
     }
 
-    log::info!("AI formatting with {:?} provider ({} chars)", settings.provider, text.len());
+    log::info!(
+        "AI formatting with {:?} provider ({} chars)",
+        settings.provider,
+        text.len()
+    );
 
     let result = match settings.provider {
         AiProvider::OpenAi => format_with_openai(text, settings).await,
         AiProvider::Claude => format_with_claude(text, settings).await,
-        AiProvider::None => return text.to_string(),
+        AiProvider::None => return Ok(text.to_string()),
     };
 
-    match result {
-        Ok(formatted) => {
-            log::info!("AI formatted: {} chars -> {} chars", text.len(), formatted.len());
-            formatted
-        }
-        Err(e) => {
-            log::error!("AI formatting failed: {}, using raw text", e);
-            text.to_string()
-        }
+    let formatted = result?;
+    validate_formatted_output(text, &formatted)?;
+    log::info!(
+        "AI formatted: {} chars -> {} chars",
+        text.len(),
+        formatted.len()
+    );
+    Ok(formatted)
+}
+
+fn validate_formatted_output(input: &str, output: &str) -> Result<(), String> {
+    if output.trim().is_empty() {
+        return Err("AI provider returned empty text".to_string());
     }
+
+    // Formatting should not turn a short dictation into a long generated
+    // answer. Allow ample punctuation/paragraph growth while rejecting clear
+    // prompt-following failures or provider glitches.
+    let max_chars = input.chars().count().saturating_mul(4).max(512);
+    if output.chars().count() > max_chars {
+        return Err("AI provider returned unexpectedly long text".to_string());
+    }
+    Ok(())
 }
 
 /// OpenAI Chat Completions API
@@ -105,12 +133,10 @@ async fn format_with_openai(text: &str, settings: &AiSettings) -> Result<String,
         "temperature": 0.1
     });
 
-    let client = Client::new();
-    let resp = client
+    let resp = http_client()?
         .post("https://api.openai.com/v1/chat/completions")
         .header("Authorization", format!("Bearer {}", settings.api_key))
         .json(&body)
-        .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
         .map_err(|e| format!("OpenAI request failed: {}", e))?;
@@ -148,14 +174,12 @@ async fn format_with_claude(text: &str, settings: &AiSettings) -> Result<String,
         "temperature": 0.1
     });
 
-    let client = Client::new();
-    let resp = client
+    let resp = http_client()?
         .post("https://api.anthropic.com/v1/messages")
         .header("x-api-key", &settings.api_key)
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
         .json(&body)
-        .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
         .map_err(|e| format!("Claude request failed: {}", e))?;
@@ -175,4 +199,20 @@ async fn format_with_claude(text: &str, settings: &AiSettings) -> Result<String,
         .as_str()
         .map(|s| s.trim().to_string())
         .ok_or_else(|| "No content in Claude response".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_formatted_output;
+
+    #[test]
+    fn rejects_empty_and_runaway_formatting() {
+        assert!(validate_formatted_output("hello", "   ").is_err());
+        assert!(validate_formatted_output("hello", &"x".repeat(513)).is_err());
+    }
+
+    #[test]
+    fn accepts_normal_formatted_text() {
+        assert!(validate_formatted_output("hello world", "Hello, world.").is_ok());
+    }
 }

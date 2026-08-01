@@ -86,12 +86,7 @@ impl SoundPlayer {
 }
 
 /// Play a sound: custom file if path is set, otherwise built-in tone.
-fn play_sound(
-    handle: &rodio::OutputStreamHandle,
-    custom_path: &str,
-    volume: f32,
-    is_start: bool,
-) {
+fn play_sound(handle: &rodio::OutputStreamHandle, custom_path: &str, volume: f32, is_start: bool) {
     let Ok(sink) = Sink::try_new(handle) else {
         return;
     };

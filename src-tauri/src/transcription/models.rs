@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const MODEL_BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main";
 
@@ -32,12 +32,12 @@ pub fn get_available_models() -> Vec<ModelInfo> {
     ]
 }
 
-pub fn model_exists(models_dir: &PathBuf, filename: &str) -> bool {
+pub fn model_exists(models_dir: &Path, filename: &str) -> bool {
     models_dir.join(filename).exists()
 }
 
 /// Download model file. Phase 1: simple blocking download.
-pub async fn download_model(models_dir: &PathBuf, model: &ModelInfo) -> Result<PathBuf, String> {
+pub async fn download_model(models_dir: &Path, model: &ModelInfo) -> Result<PathBuf, String> {
     let dest = models_dir.join(&model.filename);
     if dest.exists() {
         return Ok(dest);
@@ -68,8 +68,7 @@ pub async fn download_model(models_dir: &PathBuf, model: &ModelInfo) -> Result<P
         .await
         .map_err(|e| format!("Failed to read response: {}", e))?;
 
-    std::fs::write(&dest, &bytes)
-        .map_err(|e| format!("Failed to write model file: {}", e))?;
+    std::fs::write(&dest, &bytes).map_err(|e| format!("Failed to write model file: {}", e))?;
 
     log::info!("Model downloaded to {:?}", dest);
     Ok(dest)
