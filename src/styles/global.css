@@ -20,7 +20,8 @@ body {
 .app {
   display: flex;
   flex-direction: column;
-  min-height: 100vh;
+  height: 100vh;
+  overflow: hidden;
   padding: 24px;
   box-sizing: border-box;
   user-select: none;
@@ -84,13 +85,19 @@ button:disabled {
 
 /* ---- Main / Mic ---- */
 .main-section {
-  flex: 1;
+  flex: 1 0 auto;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
   gap: 12px;
   padding: 20px 0;
+}
+
+/* With history the status block gives up its stretch so the list gets the room. */
+.app:has(.transcript-card) .main-section {
+  flex: 0 0 auto;
+  padding: 12px 0;
 }
 
 .mic-ring-container {
@@ -348,11 +355,40 @@ button:disabled {
 
 /* ---- Transcript ---- */
 .transcript-card {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 120px;
   padding: 14px;
   background: #131318;
   border: 1px solid #1c1c28;
   border-radius: 10px;
   margin-top: auto;
+}
+
+.history-search {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0 8px;
+  padding: 3px 8px;
+  background: #18181f;
+  border: 1px solid #2a2a3a;
+  border-radius: 5px;
+  font: inherit;
+  font-size: 11px;
+  color: #d0d0dd;
+}
+
+.history-search:focus {
+  outline: none;
+  border-color: #7c3aed;
+}
+
+.history-empty {
+  padding: 10px;
+  font-size: 11px;
+  color: #6a6a7a;
+  text-align: center;
 }
 
 .transcript-label {
@@ -396,7 +432,8 @@ button:disabled {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  max-height: 220px;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
 }
 
@@ -410,8 +447,44 @@ button:disabled {
   border-radius: 8px;
 }
 
-.history-text {
+.history-body {
   flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.history-meta {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10px;
+  color: #80809a;
+}
+
+.history-lang {
+  padding: 0 4px;
+  border-radius: 3px;
+  background: rgba(148, 163, 184, 0.16);
+  font-weight: 700;
+  letter-spacing: 0.3px;
+}
+
+.history-flag {
+  padding: 0 4px;
+  border-radius: 3px;
+  background: rgba(245, 158, 11, 0.16);
+  color: #fbbf24;
+}
+
+.history-text {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  font: inherit;
   font-size: 12px;
   line-height: 1.5;
   color: #b0b0c0;
@@ -421,6 +494,19 @@ button:disabled {
   overflow: hidden;
   word-break: break-word;
   user-select: text;
+  cursor: pointer;
+}
+
+.history-item.expanded .history-text {
+  display: block;
+  -webkit-line-clamp: unset;
+}
+
+.history-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 0 0 auto;
 }
 
 .history-copy-btn {

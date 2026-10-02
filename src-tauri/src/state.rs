@@ -7,7 +7,52 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Keep this many recent transcriptions for the in-app history.
-pub const HISTORY_LIMIT: usize = 5;
+pub const HISTORY_LIMIT: usize = 100;
+
+fn default_true() -> bool {
+    true
+}
+
+/// One dictation in the history.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    pub text: String,
+    /// Unix time in milliseconds (0 for entries migrated from the old format).
+    #[serde(default)]
+    pub ts: u64,
+    /// Executable or title of the window the text was pasted into.
+    #[serde(default)]
+    pub target: String,
+    /// "ru" / "en".
+    #[serde(default)]
+    pub lang: String,
+    #[serde(default)]
+    pub duration_s: f32,
+    /// False when the paste was skipped (focus moved, cancelled) and the text
+    /// only lives here.
+    #[serde(default = "default_true")]
+    pub pasted: bool,
+    /// Window handle of the paste target in this session (not persisted).
+    #[serde(skip)]
+    pub hwnd: isize,
+}
+
+impl HistoryEntry {
+    pub fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+}
+
+/// history.json before 2026-10 held a bare list of strings.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum HistoryFile {
+    Entries(Vec<HistoryEntry>),
+    Legacy(Vec<String>),
+}
 
 /// Pipeline state as seen by the UI. Serializes as `{"state": "idle"}` or
 /// `{"state": "error", "code": "mic", "message": "..."}` so both webviews
@@ -104,7 +149,7 @@ pub struct AppState {
     /// release is ignored and the next press/pin-click stops the recording.
     pub recording_locked: bool,
     /// Most recent transcriptions, newest first, capped at HISTORY_LIMIT.
-    pub history: Vec<String>,
+    pub history: Vec<HistoryEntry>,
     pub diagnostics: StartupDiagnostics,
     /// The fallback microphone that was last announced, so the toast fires
     /// once per device instead of on every recording.
@@ -152,11 +197,11 @@ impl AppState {
     /// Prepend a transcription to the history, keeping it deduplicated
     /// against the most recent entry and capped at HISTORY_LIMIT. Returns
     /// whether the history changed (so callers can skip a disk write).
-    pub fn push_history(&mut self, text: &str) -> bool {
-        if self.history.first().map(|s| s.as_str()) == Some(text) {
+    pub fn push_history(&mut self, entry: HistoryEntry) -> bool {
+        if self.history.first().map(|e| e.text.as_str()) == Some(entry.text.as_str()) {
             return false;
         }
-        self.history.insert(0, text.to_string());
+        self.history.insert(0, entry);
         self.history.truncate(HISTORY_LIMIT);
         true
     }
@@ -168,7 +213,7 @@ fn history_path(data_dir: &Path) -> PathBuf {
 
 /// Load the history; a corrupt file is moved aside (never overwritten) and the
 /// problem is returned for the startup diagnostics banner.
-pub fn load_history_with_report(data_dir: &Path) -> (Vec<String>, Option<String>) {
+pub fn load_history_with_report(data_dir: &Path) -> (Vec<HistoryEntry>, Option<String>) {
     let path = history_path(data_dir);
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
@@ -179,9 +224,24 @@ pub fn load_history_with_report(data_dir: &Path) -> (Vec<String>, Option<String>
             return (Vec::new(), Some(message));
         }
     };
-    match serde_json::from_slice::<Vec<String>>(&bytes) {
-        Ok(mut history) => {
-            history.retain(|item| !item.trim().is_empty());
+    match serde_json::from_slice::<HistoryFile>(&bytes) {
+        Ok(file) => {
+            let mut history = match file {
+                HistoryFile::Entries(entries) => entries,
+                HistoryFile::Legacy(texts) => texts
+                    .into_iter()
+                    .map(|text| HistoryEntry {
+                        text,
+                        ts: 0,
+                        target: String::new(),
+                        lang: String::new(),
+                        duration_s: 0.0,
+                        pasted: true,
+                        hwnd: 0,
+                    })
+                    .collect(),
+            };
+            history.retain(|item| !item.text.trim().is_empty());
             history.truncate(HISTORY_LIMIT);
             (history, None)
         }
@@ -200,11 +260,11 @@ pub fn load_history_with_report(data_dir: &Path) -> (Vec<String>, Option<String>
     }
 }
 
-pub fn load_history(data_dir: &Path) -> Vec<String> {
+pub fn load_history(data_dir: &Path) -> Vec<HistoryEntry> {
     load_history_with_report(data_dir).0
 }
 
-pub fn save_history(data_dir: &Path, history: &[String]) -> Result<(), String> {
+pub fn save_history(data_dir: &Path, history: &[HistoryEntry]) -> Result<(), String> {
     let path = history_path(data_dir);
     let json = serde_json::to_string_pretty(history).map_err(|e| e.to_string())?;
     crate::config::write_file_atomic(&path, json.as_bytes())
@@ -212,7 +272,45 @@ pub fn save_history(data_dir: &Path, history: &[String]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_history_with_report, lock_or_recover, AppState, AppStatus, ModelState};
+    use super::{
+        load_history_with_report, lock_or_recover, AppState, AppStatus, HistoryEntry, ModelState,
+    };
+
+    fn entry(text: &str) -> HistoryEntry {
+        HistoryEntry {
+            text: text.into(),
+            ts: 1,
+            target: "Telegram.exe".into(),
+            lang: "ru".into(),
+            duration_s: 2.5,
+            pasted: true,
+            hwnd: 0,
+        }
+    }
+
+    #[test]
+    fn legacy_string_history_is_migrated() {
+        let dir = test_dir("legacy-history");
+        std::fs::write(dir.join("history.json"), br#"["one", "two", "  "]"#).unwrap();
+        let (history, error) = load_history_with_report(&dir);
+        assert!(error.is_none());
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].text, "one");
+        assert_eq!(history[0].ts, 0);
+        assert!(history[0].pasted);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn entries_round_trip_through_the_file() {
+        let dir = test_dir("entry-history");
+        let entries = vec![entry("first"), entry("second")];
+        super::save_history(&dir, &entries).unwrap();
+        let (loaded, error) = load_history_with_report(&dir);
+        assert!(error.is_none());
+        assert_eq!(loaded, entries);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     use crate::config::test_dir;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
@@ -299,9 +397,26 @@ mod tests {
     #[test]
     fn push_history_reports_whether_anything_changed() {
         let mut s = AppState::default();
-        assert!(s.push_history("first"));
-        assert!(!s.push_history("first"), "duplicate of the newest entry");
-        assert!(s.push_history("second"));
-        assert_eq!(s.history, vec!["second".to_string(), "first".to_string()]);
+        assert!(s.push_history(entry("first")));
+        assert!(
+            !s.push_history(entry("first")),
+            "duplicate of the newest entry"
+        );
+        assert!(s.push_history(entry("second")));
+        let texts: Vec<&str> = s.history.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(texts, vec!["second", "first"]);
+    }
+
+    #[test]
+    fn history_is_capped() {
+        let mut s = AppState::default();
+        for i in 0..(super::HISTORY_LIMIT + 10) {
+            s.push_history(entry(&format!("item {i}")));
+        }
+        assert_eq!(s.history.len(), super::HISTORY_LIMIT);
+        assert_eq!(
+            s.history[0].text,
+            format!("item {}", super::HISTORY_LIMIT + 9)
+        );
     }
 }

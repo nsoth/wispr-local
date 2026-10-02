@@ -328,6 +328,7 @@ pub fn run() {
             commands::get_last_transcription,
             commands::toggle_recording_lock,
             commands::get_history,
+            commands::paste_history_item,
             commands::clear_history,
             commands::copy_text,
             commands::get_models_dir,

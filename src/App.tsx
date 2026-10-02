@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
+import { ask, open } from "@tauri-apps/plugin-dialog";
 import { EVENTS, IDLE_STATUS, type AppStatus, type LanguageDetected } from "./ipc";
 import "./styles/global.css";
 
@@ -72,6 +72,28 @@ const HOTKEY_HINTS: Record<HotkeyMode, string> = {
   hybrid: "Hold to dictate, or tap to go hands-free",
 };
 
+interface HistoryEntry {
+  text: string;
+  ts: number;
+  target: string;
+  lang: string;
+  duration_s: number;
+  pasted: boolean;
+}
+
+function relativeTime(ts: number, now: number): string {
+  if (!ts) return "";
+  const s = Math.max(0, Math.round((now - ts) / 1000));
+  if (s < 45) return "just now";
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m} min ago`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h} h ago`;
+  const d = Math.round(h / 24);
+  if (d < 7) return `${d} d ago`;
+  return new Date(ts).toLocaleDateString();
+}
+
 type NoticeKind = "info" | "error";
 interface Notice {
   text: string;
@@ -95,8 +117,11 @@ function App() {
   const [notice, setNoticeState] = useState<Notice | null>(null);
   const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const [diagnostics, setDiagnostics] = useState<string[]>([]);
-  const [history, setHistory] = useState<string[]>([]);
+  const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
+  const [historyFilter, setHistoryFilter] = useState("");
+  const [expandedIndex, setExpandedIndex] = useState<number | null>(null);
+  const [clock, setClock] = useState(() => Date.now());
   const [streamingPreview, setStreamingPreview] = useState("");
   const [modelState, setModelState] = useState<ModelState>({ state: "loading" });
   const [textSettings, setTextSettings] = useState<TextSettings>({
@@ -183,7 +208,7 @@ function App() {
       load<string>("get_hotkey", setHotkey),
       load<HotkeyMode>("get_hotkey_mode", setHotkeyMode),
       load<string>("get_cancel_hotkey", setCancelHotkey),
-      load<string[]>("get_history", setHistory),
+      load<HistoryEntry[]>("get_history", setHistory),
       load<SoundSettings>("get_sound_settings", (sound) => {
         setStartSound(sound.start_sound);
         setStopSound(sound.stop_sound);
@@ -251,9 +276,12 @@ function App() {
       }
     });
 
-    const unlisten2 = listen<string[]>(EVENTS.historyChanged, (event) => {
+    const unlisten2 = listen<HistoryEntry[]>(EVENTS.historyChanged, (event) => {
       setHistory(event.payload);
+      setExpandedIndex(null);
     });
+    // Relative timestamps age without any other event arriving.
+    const clockTimer = setInterval(() => setClock(Date.now()), 30_000);
 
     const unlisten3 = listen<string>(EVENTS.streamingPreview, (event) => {
       setStreamingPreview(event.payload);
@@ -313,6 +341,7 @@ function App() {
       unlisten8.then((fn) => fn());
       unlisten9.then((fn) => fn());
       unlisten10.then((fn) => fn());
+      clearInterval(clockTimer);
       clearTimeout(noticeTimerRef.current);
       clearTimeout(copiedTimerRef.current);
       clearTimeout(soundSaveTimer.current);
@@ -609,7 +638,13 @@ function App() {
   };
 
   const clearHistory = async () => {
-    if (!window.confirm("Clear all saved transcription history?")) return;
+    const yes = await ask("Clear all saved transcription history?", {
+      title: "Wispr Local",
+      kind: "warning",
+      okLabel: "Clear",
+      cancelLabel: "Keep",
+    });
+    if (!yes) return;
     try {
       await invoke("clear_history");
       setHistory([]);
@@ -618,6 +653,20 @@ function App() {
       setError(`Could not clear history: ${String(error)}`);
     }
   };
+
+  const pasteHistoryItem = (index: number) => {
+    invoke<string>("paste_history_item", { index })
+      .then((result) =>
+        setNotice(result === "pasted" ? "Pasted into the original window" : "Copied to clipboard (window is gone)"),
+      )
+      .catch((error) => setError(`Paste failed: ${String(error)}`));
+  };
+
+  const visibleHistory = history
+    .map((entry, index) => ({ entry, index }))
+    .filter(({ entry }) =>
+      historyFilter.trim() ? entry.text.toLowerCase().includes(historyFilter.trim().toLowerCase()) : true,
+    );
 
   const updateToggle = async (
     command: string,
@@ -880,25 +929,63 @@ function App() {
           {history.length > 0 && (
             <div className="transcript-card">
               <div className="transcript-heading">
-                <div className="transcript-label">History</div>
+                <div className="transcript-label">History · {history.length}</div>
+                <input
+                  type="search"
+                  className="history-search"
+                  placeholder="Search…"
+                  aria-label="Search history"
+                  value={historyFilter}
+                  onChange={(e) => setHistoryFilter(e.target.value)}
+                />
                 <button type="button" className="history-clear-btn" onClick={clearHistory}>
                   Clear
                 </button>
               </div>
               <div className="history-list">
-                {history.map((item, i) => (
-                  <div className="history-item" key={`${i}-${item.slice(0, 24)}`}>
-                    <div className="history-text" title={item}>
-                      {item}
+                {visibleHistory.length === 0 && (
+                  <div className="history-empty">Nothing matches.</div>
+                )}
+                {visibleHistory.map(({ entry, index }) => (
+                  <div
+                    className={`history-item${expandedIndex === index ? " expanded" : ""}`}
+                    key={`${entry.ts}-${index}`}
+                  >
+                    <div className="history-body">
+                      <div className="history-meta">
+                        <span>{relativeTime(entry.ts, clock) || "earlier"}</span>
+                        {entry.target && <span>· {entry.target.replace(/\.exe$/i, "")}</span>}
+                        {entry.lang && <span className="history-lang">{entry.lang.toUpperCase()}</span>}
+                        {!entry.pasted && <span className="history-flag">not pasted</span>}
+                      </div>
+                      <button
+                        type="button"
+                        className="history-text"
+                        lang={/[\u0400-\u04FF]/.test(entry.text) ? "ru" : "en"}
+                        onClick={() => setExpandedIndex(expandedIndex === index ? null : index)}
+                        title={expandedIndex === index ? "Collapse" : "Expand"}
+                      >
+                        {entry.text}
+                      </button>
                     </div>
-                    <button
-                      type="button"
-                      className={`history-copy-btn${copiedIndex === i ? " copied" : ""}`}
-                      onClick={() => copyHistoryItem(item, i)}
-                      title="Copy to clipboard"
-                    >
-                      {copiedIndex === i ? "Copied" : "Copy"}
-                    </button>
+                    <div className="history-actions">
+                      <button
+                        type="button"
+                        className={`history-copy-btn${copiedIndex === index ? " copied" : ""}`}
+                        onClick={() => copyHistoryItem(entry.text, index)}
+                        title="Copy to clipboard"
+                      >
+                        {copiedIndex === index ? "Copied" : "Copy"}
+                      </button>
+                      <button
+                        type="button"
+                        className="history-copy-btn"
+                        onClick={() => pasteHistoryItem(index)}
+                        title="Paste again into the original window"
+                      >
+                        Paste
+                      </button>
+                    </div>
                   </div>
                 ))}
               </div>

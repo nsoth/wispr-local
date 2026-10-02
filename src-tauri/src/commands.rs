@@ -184,9 +184,54 @@ pub fn toggle_recording_lock(
 }
 
 #[tauri::command]
-pub fn get_history(state: State<'_, Mutex<AppState>>) -> Result<Vec<String>, String> {
-    let app_state = state.lock().map_err(|e| e.to_string())?;
-    Ok(app_state.history.clone())
+pub fn get_history(
+    state: State<'_, Mutex<AppState>>,
+) -> Result<Vec<crate::state::HistoryEntry>, String> {
+    Ok(crate::state::lock_or_recover(&state).history.clone())
+}
+
+/// Paste a history entry again: bring its original window back to the
+/// front when it still exists, otherwise leave the text in the clipboard.
+/// Returns "pasted" or "copied".
+#[tauri::command]
+pub fn paste_history_item(
+    index: usize,
+    state: State<'_, Mutex<AppState>>,
+) -> Result<String, String> {
+    let (entry, restore_clipboard) = {
+        let s = crate::state::lock_or_recover(&state);
+        let entry = s
+            .history
+            .get(index)
+            .cloned()
+            .ok_or_else(|| "That history entry no longer exists".to_string())?;
+        (entry, true)
+    };
+    if entry.hwnd != 0 && activate_window(entry.hwnd) {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let now = crate::system::focus::foreground_target();
+        if now.as_ref().map(|t| t.hwnd) == Some(entry.hwnd) {
+            crate::system::text_injection::inject_text(&entry.text, restore_clipboard)?;
+            log::info!("History entry {index} pasted again into {}", entry.target);
+            return Ok("pasted".to_string());
+        }
+    }
+    crate::system::text_injection::copy_only(&entry.text)?;
+    Ok("copied".to_string())
+}
+
+#[cfg(windows)]
+fn activate_window(hwnd: isize) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IsWindow, SetForegroundWindow};
+    unsafe {
+        let handle = hwnd as *mut core::ffi::c_void;
+        IsWindow(handle) != 0 && SetForegroundWindow(handle) != 0
+    }
+}
+
+#[cfg(not(windows))]
+fn activate_window(_hwnd: isize) -> bool {
+    false
 }
 
 #[tauri::command]
@@ -205,7 +250,7 @@ pub fn clear_history(
             return Err(e);
         }
     }
-    let history: Vec<String> = Vec::new();
+    let history: Vec<crate::state::HistoryEntry> = Vec::new();
     app.emit(crate::events::HISTORY_CHANGED, &history)
         .map_err(|e| e.to_string())?;
     Ok(())

@@ -20,7 +20,7 @@ use crate::config::AppConfig;
 use crate::events;
 use crate::overlay::{hide_overlay, show_overlay_if_enabled};
 use crate::settings::{self, Settings};
-use crate::state::{self, lock_or_recover, AppState, AppStatus, ModelState};
+use crate::state::{self, lock_or_recover, AppState, AppStatus, HistoryEntry, ModelState};
 use crate::system::focus::{self, PasteDecision};
 use crate::system::sounds::{SoundKind, SoundPlayer};
 use crate::system::tray::{TrayAnimator, TrayPhase};
@@ -889,7 +889,15 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
     let cancel_requested = lock_or_recover(&state).cancel_requested.clone();
     if cancel_requested.load(Ordering::Relaxed) {
         log::info!("utt#{utterance}: cancelled before formatting; kept in history only");
-        lock_or_recover(&state).push_history(&text);
+        lock_or_recover(&state).push_history(HistoryEntry {
+            text: text.clone(),
+            ts: HistoryEntry::now_ms(),
+            target: String::new(),
+            lang: result.language.to_string(),
+            duration_s: audio_s as f32,
+            pasted: false,
+            hwnd: 0,
+        });
         guard.disarm();
         finish_pipeline(app, Outcome::Cancelled);
         let history = lock_or_recover(&state).history.clone();
@@ -922,7 +930,15 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
 
     if cancel_requested.load(Ordering::Relaxed) {
         log::info!("utt#{utterance}: cancelled before pasting; kept in history only");
-        lock_or_recover(&state).push_history(&text);
+        lock_or_recover(&state).push_history(HistoryEntry {
+            text: text.clone(),
+            ts: HistoryEntry::now_ms(),
+            target: String::new(),
+            lang: result.language.to_string(),
+            duration_s: audio_s as f32,
+            pasted: false,
+            hwnd: 0,
+        });
         guard.disarm();
         finish_pipeline(app, Outcome::Cancelled);
         let history = lock_or_recover(&state).history.clone();
@@ -988,7 +1004,15 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
     let (history, history_changed) = {
         let mut s = lock_or_recover(&state);
         s.last_transcription = text.clone();
-        let changed = s.push_history(&text);
+        let changed = s.push_history(HistoryEntry {
+            text: text.clone(),
+            ts: HistoryEntry::now_ms(),
+            target: now.as_ref().map(|t| t.describe()).unwrap_or_default(),
+            lang: result.language.to_string(),
+            duration_s: audio_s as f32,
+            pasted: outcome == Outcome::Pasted,
+            hwnd: now.as_ref().map(|t| t.hwnd).unwrap_or(0),
+        });
         (s.history.clone(), changed)
     };
     if history_changed {
