@@ -62,6 +62,10 @@ pub struct Settings {
     /// User dictionary applied after filler removal.
     #[serde(default = "replacements::default_rules")]
     pub replacements: Vec<ReplacementRule>,
+    /// Put the previous clipboard content back after pasting (off = keep the
+    /// transcript in the clipboard).
+    #[serde(default = "default_true")]
+    pub restore_clipboard: bool,
     /// Set when settings.json existed but could not be read at startup. Every
     /// save is refused until a restart so a transient IO error can never turn
     /// into "defaults written over the user's file".
@@ -87,6 +91,7 @@ const KNOWN_KEYS: &[&str] = &[
     "voice_commands",
     "paste_suffix",
     "replacements",
+    "restore_clipboard",
 ];
 
 fn default_true() -> bool {
@@ -131,6 +136,7 @@ impl Default for Settings {
             voice_commands: true,
             paste_suffix: PasteSuffix::default(),
             replacements: replacements::default_rules(),
+            restore_clipboard: true,
             read_only: false,
         }
     }

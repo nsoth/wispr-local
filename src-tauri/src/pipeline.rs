@@ -21,12 +21,13 @@ use crate::events;
 use crate::overlay::{hide_overlay, show_overlay_if_enabled};
 use crate::settings::{self, Settings};
 use crate::state::{self, lock_or_recover, AppState, AppStatus, ModelState};
+use crate::system::focus::{self, PasteDecision};
 use crate::system::sounds::{SoundKind, SoundPlayer};
 use crate::system::tray::{TrayAnimator, TrayPhase};
 use crate::text::apply_paste_suffix;
 use crate::transcription::engine::{LanguageMode, TranscribeOptions, WhisperEngine};
 use crate::watchdog::{Verdict, Watchdog};
-use crate::{commands, formatting, system};
+use crate::{formatting, system};
 
 /// Counts finished recordings for the per-utterance log line.
 static UTTERANCES: AtomicU64 = AtomicU64::new(0);
@@ -676,6 +677,9 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
         s.status = AppStatus::Transcribing;
         s.preview_abort.clone()
     };
+    // The window the user was in when the key went up is where the text
+    // belongs; anything focused later (settings, another app) must not get it.
+    let origin = focus::foreground_target();
     // Whatever happens below (including a panic), the app returns to Idle.
     let guard_app = app.clone();
     let mut guard = ArmedGuard::new(move || {
@@ -709,7 +713,7 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
     let utterance = UTTERANCES.fetch_add(1, Ordering::Relaxed) + 1;
     log::info!("utt#{utterance}: transcribing {audio_s:.1}s of audio");
 
-    let (language, pipeline, paste_suffix, backend) = {
+    let (language, pipeline, paste_suffix, restore_clipboard, backend) = {
         let settings = app.state::<Mutex<Settings>>();
         let guard = lock_or_recover(&settings);
         let backend = lock_or_recover(&state).model.backend().to_string();
@@ -717,6 +721,7 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
             guard.language,
             guard.text_pipeline(),
             guard.paste_suffix,
+            guard.restore_clipboard,
             backend,
         )
     };
@@ -819,21 +824,49 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
 
     let paste_started = Instant::now();
     let to_paste = apply_paste_suffix(&text, paste_suffix);
-    let outcome = match system::text_injection::inject_text(&to_paste) {
-        Ok(_) => {
-            log::debug!("Paste shortcut sent");
-            Outcome::Pasted
+    let now = focus::foreground_target();
+    let elevated = now
+        .as_ref()
+        .map(|t| focus::is_elevated_pid(t.pid))
+        .unwrap_or(false);
+    let target_name = now
+        .as_ref()
+        .map(|t| t.describe())
+        .unwrap_or_else(|| "none".to_string());
+    let decision = focus::decide_paste(origin.as_ref(), now.as_ref(), std::process::id(), elevated);
+    let outcome = match decision {
+        PasteDecision::Paste => {
+            match system::text_injection::inject_text(&to_paste, restore_clipboard) {
+                Ok(_) => {
+                    log::debug!("Paste shortcut sent to {target_name}");
+                    Outcome::Pasted
+                }
+                Err(e) => {
+                    log::error!("Text injection failed: {}", e);
+                    let copied = system::text_injection::copy_only(&text).is_ok();
+                    let message = if copied {
+                        "Automatic paste failed; the transcript was copied to your clipboard."
+                    } else {
+                        "Automatic paste failed; open Wispr Local to copy the transcript from history."
+                    };
+                    let _ = app.emit(events::OPERATION_NOTICE, message);
+                    notify_user(app, message);
+                    Outcome::CopiedToClipboard {
+                        in_clipboard: copied,
+                    }
+                }
+            }
         }
-        Err(e) => {
-            log::error!("Text injection failed: {}", e);
-            let copied = commands::copy_text(text.clone()).is_ok();
+        PasteDecision::CopyOnly(reason) => {
+            log::warn!("Not pasting: {reason}; transcript left in the clipboard");
+            let copied = system::text_injection::copy_only(&text).is_ok();
             let message = if copied {
-                "Automatic paste failed; the transcript was copied to your clipboard."
+                format!("Not pasted ({reason}); the transcript is in your clipboard.")
             } else {
-                "Automatic paste failed; open Wispr Local to copy the transcript from history."
+                format!("Not pasted ({reason}); copy it from the history.")
             };
-            let _ = app.emit(events::OPERATION_NOTICE, message);
-            notify_user(app, message);
+            let _ = app.emit(events::OPERATION_NOTICE, &message);
+            notify_user(app, &message);
             Outcome::CopiedToClipboard {
                 in_clipboard: copied,
             }
@@ -858,7 +891,7 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
     }
     log::info!(
         "utt#{utterance} audio={audio_s:.1}s lock={lock_ms}ms detect={}ms transcribe={}ms (rtf {rtf:.2}) \
-         format={format_ms}ms paste={paste_ms}ms backend={backend} lang={} chars={} segments={} dropped={} outcome={outcome:?}",
+         format={format_ms}ms paste={paste_ms}ms backend={backend} lang={} chars={} segments={} dropped={} target={target_name} outcome={outcome:?}",
         result.detect_ms,
         result.full_ms,
         result.language,

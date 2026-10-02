@@ -59,6 +59,7 @@ interface TextSettings {
   voice_commands: boolean;
   paste_suffix: PasteSuffix;
   replacements: ReplacementRule[];
+  restore_clipboard: boolean;
 }
 
 type NoticeKind = "info" | "error";
@@ -92,8 +93,14 @@ function App() {
     voice_commands: true,
     paste_suffix: "space",
     replacements: [],
+    restore_clipboard: true,
   });
-  const textRef = useRef<TextSettings>({ voice_commands: true, paste_suffix: "space", replacements: [] });
+  const textRef = useRef<TextSettings>({
+    voice_commands: true,
+    paste_suffix: "space",
+    replacements: [],
+    restore_clipboard: true,
+  });
   const textSaveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const [modelFiles, setModelFiles] = useState<ModelFileInfo[]>([]);
   const [modelsDir, setModelsDir] = useState("");
@@ -1039,6 +1046,23 @@ function App() {
                 <option value="newline">Add a line break</option>
                 <option value="none">Nothing</option>
               </select>
+            </div>
+            <div className="setting-row">
+              <span className="setting-label" id="restore-clipboard-label">
+                Restore clipboard after paste
+              </span>
+              <label className="toggle-switch">
+                <input
+                  type="checkbox"
+                  aria-labelledby="restore-clipboard-label"
+                  checked={textSettings.restore_clipboard}
+                  onChange={(e) => updateTextSettings({ restore_clipboard: e.target.checked })}
+                />
+                <span className="toggle-slider"></span>
+              </label>
+            </div>
+            <div className="settings-note">
+              Off keeps the transcript in the clipboard for a manual Ctrl+V.
             </div>
             <div className="dict-heading">
               <span className="setting-label">Dictionary</span>

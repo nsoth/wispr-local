@@ -201,12 +201,7 @@ pub fn clear_history(
 /// Copy arbitrary text to the system clipboard (used by the history list).
 #[tauri::command]
 pub fn copy_text(text: String) -> Result<(), String> {
-    let mut clipboard =
-        arboard::Clipboard::new().map_err(|e| format!("Failed to open clipboard: {}", e))?;
-    clipboard
-        .set_text(&text)
-        .map_err(|e| format!("Failed to set clipboard text: {}", e))?;
-    Ok(())
+    crate::system::text_injection::copy_only(&text)
 }
 
 #[tauri::command]
@@ -451,6 +446,12 @@ pub struct TextSettings {
     pub voice_commands: bool,
     pub paste_suffix: crate::text::PasteSuffix,
     pub replacements: Vec<crate::transcription::replacements::ReplacementRule>,
+    #[serde(default = "default_true")]
+    pub restore_clipboard: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[tauri::command]
@@ -460,6 +461,7 @@ pub fn get_text_settings(settings: State<'_, Mutex<Settings>>) -> Result<TextSet
         voice_commands: s.voice_commands,
         paste_suffix: s.paste_suffix,
         replacements: s.replacements.clone(),
+        restore_clipboard: s.restore_clipboard,
     })
 }
 
@@ -473,6 +475,7 @@ pub fn set_text_settings(
     let previous = s.clone();
     s.voice_commands = update.voice_commands;
     s.paste_suffix = update.paste_suffix;
+    s.restore_clipboard = update.restore_clipboard;
     s.replacements = update
         .replacements
         .into_iter()
