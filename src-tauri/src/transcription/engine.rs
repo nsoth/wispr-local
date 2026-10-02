@@ -1,5 +1,12 @@
+//! whisper.cpp wrapper: model loading (CUDA with CPU fallback), constrained
+//! Russian/English language detection, decoding parameters for the preview
+//! and final passes, and hallucination filtering of the decoded segments.
+
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
 use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
 };
@@ -22,6 +29,49 @@ pub enum LanguageMode {
     /// Any value this build does not know; normalized to `Auto` after loading.
     #[serde(other, skip_serializing)]
     Unknown,
+}
+
+/// Preview ticks trade a little accuracy for speed; the final pass does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassMode {
+    Preview,
+    Final,
+}
+
+pub struct TranscribeOptions {
+    pub mode: PassMode,
+    /// Checked between decoder steps; `true` makes whisper.cpp stop early.
+    pub abort: Option<Arc<AtomicBool>>,
+}
+
+impl TranscribeOptions {
+    pub fn preview(abort: Option<Arc<AtomicBool>>) -> Self {
+        Self {
+            mode: PassMode::Preview,
+            abort,
+        }
+    }
+
+    pub fn final_pass() -> Self {
+        Self {
+            mode: PassMode::Final,
+            abort: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TranscriptionResult {
+    pub text: String,
+    /// "ru" or "en" — detected or pinned.
+    pub language: &'static str,
+    /// Auto-detection pass duration (0 when pinned or cached).
+    pub detect_ms: u128,
+    /// `whisper_full` duration.
+    pub full_ms: u128,
+    pub segments: usize,
+    /// Segments removed as silence or hallucination.
+    pub dropped: usize,
 }
 
 pub struct WhisperEngine {
@@ -94,9 +144,29 @@ impl WhisperEngine {
         }
     }
 
-    /// Transcribe audio samples (must be 16kHz, mono, f32).
-    pub fn transcribe(&self, audio: &[f32], language: LanguageMode) -> Result<String, String> {
-        self.transcribe_cached(audio, language, &mut None)
+    /// Number of decoder threads: all logical cores on the CPU path (the
+    /// hard-coded 8 left half of a 20-thread laptop idle), fewer on CUDA where
+    /// the threads only feed the GPU.
+    fn decode_threads(&self) -> i32 {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8);
+        if self.using_gpu {
+            cores.min(8) as i32
+        } else {
+            cores.min(16) as i32
+        }
+    }
+
+    /// Transcribe audio samples (must be 16kHz, mono, f32) with a fresh
+    /// language decision.
+    pub fn transcribe(
+        &self,
+        audio: &[f32],
+        language: LanguageMode,
+        options: TranscribeOptions,
+    ) -> Result<TranscriptionResult, String> {
+        self.transcribe_cached(audio, language, &mut None, options)
     }
 
     /// Like [`Self::transcribe`], but with a caller-held cache for the Auto
@@ -107,13 +177,15 @@ impl WhisperEngine {
     /// supervisor.rs), and faster previews. The trade-off: the preview's
     /// language sticks for the rest of the recording; the final transcription
     /// uses a fresh cache, so the pasted result always re-detects on the full
-    /// utterance.
+    /// utterance (more precisely, on its first 30 s: whisper's detector only
+    /// looks at one window).
     pub fn transcribe_cached(
         &self,
         audio: &[f32],
         language: LanguageMode,
         lang_cache: &mut Option<&'static str>,
-    ) -> Result<String, String> {
+        options: TranscribeOptions,
+    ) -> Result<TranscriptionResult, String> {
         let ctx = self.context.as_ref().ok_or("Whisper model not loaded")?;
 
         // Peak-normalize so quiet mics still register, without the clipping
@@ -132,13 +204,16 @@ impl WhisperEngine {
         // earlier approach) leaked into Ukrainian/Belarusian/Polish ~5-10% of
         // the time for Russian speakers, which is why Auto detection is now
         // clamped to just ru vs en (see detect_ru_or_en).
+        let mut detect_ms = 0;
         let lang = match language {
             LanguageMode::Russian => "ru",
             LanguageMode::English => "en",
             LanguageMode::Auto | LanguageMode::Unknown => match *lang_cache {
                 Some(cached) => cached,
                 None => {
+                    let started = Instant::now();
                     let detected = detect_ru_or_en(&mut state, &audio)?;
+                    detect_ms = started.elapsed().as_millis();
                     *lang_cache = Some(detected);
                     detected
                 }
@@ -155,57 +230,87 @@ impl WhisperEngine {
         // decode time. These are subtitle artifacts the model hallucinates on
         // silent/noisy stretches and they were leaking out as the final output.
         params.set_suppress_nst(true);
-        // Don't condition each 30s window on the previous window's text — a
-        // hallucination in the first (quiet) window otherwise cascades and
-        // takes over the whole transcription.
+        // whisper.cpp's default; with a fresh state per call this only matters
+        // for recordings longer than one 30 s window, where it stops a
+        // hallucination in a quiet first window from seeding the next ones.
         params.set_no_context(true);
-        params.set_n_threads(8);
+        params.set_n_threads(self.decode_threads());
         params.set_print_special(false);
         params.set_print_progress(false);
         params.set_print_realtime(false);
         params.set_print_timestamps(false);
         params.set_translate(false);
         params.set_single_segment(false);
+        if options.mode == PassMode::Preview {
+            // Preview text is replaced every two seconds: skip the temperature
+            // fallback re-decodes and use a shorter encoder context (the
+            // preview never exceeds 10 s of audio; 768 covers 15 s).
+            params.set_temperature_inc(0.0);
+            params.set_audio_ctx(768);
+        }
+        if let Some(abort) = options.abort.clone() {
+            params.set_abort_callback_safe(move || abort.load(Ordering::Relaxed));
+        }
 
+        let started = Instant::now();
         state
             .full(params, &audio)
             .map_err(|e| format!("Whisper transcription failed: {}", e))?;
+        let full_ms = started.elapsed().as_millis();
 
         let num_segments = state.full_n_segments();
+        let decoded = (0..num_segments).filter_map(|i| {
+            state
+                .get_segment(i)
+                .map(|segment| (segment.to_string(), segment.no_speech_probability()))
+        });
+        let (text, dropped) = assemble_segments(decoded);
 
-        let mut parts: Vec<String> = Vec::new();
-        for i in 0..num_segments {
-            if let Some(segment) = state.get_segment(i) {
-                let seg_text = segment.to_string();
-                let no_speech = segment.no_speech_probability();
+        Ok(TranscriptionResult {
+            text,
+            language: lang,
+            detect_ms,
+            full_ms,
+            segments: num_segments as usize,
+            dropped,
+        })
+    }
+}
 
-                // Window classified as near-certain silence — whatever the
-                // decoder produced there is noise, not dictation.
-                if no_speech > 0.85 {
-                    log::info!(
-                        "Dropping silent segment (no_speech_prob={:.2}, {} chars)",
-                        no_speech,
-                        seg_text.trim().chars().count()
-                    );
-                    continue;
-                }
-
-                // Safety net behind suppress_nst: strip bracketed meta-text
-                // and known subtitle-credit hallucinations.
-                match clean_hallucinations(&seg_text) {
-                    Some(clean) => parts.push(clean),
-                    None => {
-                        log::info!(
-                            "Dropping hallucinated segment ({} chars)",
-                            seg_text.trim().chars().count()
-                        );
-                    }
-                }
-            }
+/// Join decoded segments into the transcript, dropping windows whisper
+/// classified as silence and segments that are pure hallucination. Returns
+/// the text and the number of dropped segments.
+fn assemble_segments(segments: impl IntoIterator<Item = (String, f32)>) -> (String, usize) {
+    let mut parts: Vec<String> = Vec::new();
+    let mut dropped = 0;
+    for (seg_text, no_speech) in segments {
+        // Window classified as near-certain silence — whatever the decoder
+        // produced there is noise, not dictation. (The probability is computed
+        // once per 30 s window and copied to every segment inside it.)
+        if no_speech > 0.85 {
+            log::info!(
+                "Dropping silent segment (no_speech_prob={:.2}, {} chars)",
+                no_speech,
+                seg_text.trim().chars().count()
+            );
+            dropped += 1;
+            continue;
         }
 
-        Ok(parts.join(" ").trim().to_string())
+        // Safety net behind suppress_nst: strip bracketed meta-text
+        // and known subtitle-credit hallucinations.
+        match clean_hallucinations(&seg_text) {
+            Some(clean) => parts.push(clean),
+            None => {
+                log::info!(
+                    "Dropping hallucinated segment ({} chars)",
+                    seg_text.trim().chars().count()
+                );
+                dropped += 1;
+            }
+        }
     }
+    (parts.join(" ").trim().to_string(), dropped)
 }
 
 /// Scale audio so its peak sits at ~0.95, with the gain capped at 8x so pure
@@ -253,7 +358,8 @@ fn pick_language(p_ru: f32, p_en: f32) -> &'static str {
 /// Run Whisper's language detector but consider ONLY Russian and English —
 /// every other language's probability is discarded, so acoustically-close
 /// Slavic languages (Ukrainian, Belarusian, Polish) can never win for a Russian
-/// speaker. Costs one extra encoder pass over the audio (Auto mode only).
+/// speaker. Costs one extra encoder pass over the first 30 s window (Auto
+/// mode only).
 fn detect_ru_or_en(state: &mut WhisperState, audio: &[f32]) -> Result<&'static str, String> {
     state
         .pcm_to_mel(audio, 8)
@@ -279,19 +385,33 @@ fn detect_ru_or_en(state: &mut WhisperState, audio: &[f32]) -> Result<&'static s
 }
 
 /// Stock phrases Whisper hallucinates on silence — subtitle credits and
-/// sign-offs from its training data. A short segment that is nothing but one
-/// of these is never real dictation.
-const HALLUCINATION_PHRASES: &[&str] = &[
-    "субтитры",
-    "субтитров",
-    "редактор субтитров",
-    "корректор",
+/// sign-offs from its training data. Matched as anchored patterns so a real
+/// short sentence containing "субтитры" survives (see tests).
+const HALLUCINATION_SEGMENTS: &[&str] = &[
     "продолжение следует",
     "спасибо за просмотр",
     "thanks for watching",
     "thank you for watching",
-    "dimatorzok",
+    "субтитры",
+    "редактор субтитров",
+    "редактор субтитров а. семкин",
+    "корректор а. егорова",
 ];
+
+/// Segment prefixes that only ever come from subtitle credits.
+const HALLUCINATION_PREFIXES: &[&str] = &[
+    "субтитры сделал",
+    "субтитры создал",
+    "субтитры подготовил",
+    "субтитры добавил",
+    "редактор субтитров",
+    "корректор а.",
+    "субтитры по",
+    "subtitles by",
+];
+
+/// Tokens that never appear in real dictation.
+const HALLUCINATION_TOKENS: &[&str] = &["dimatorzok"];
 
 /// Strip bracketed meta-annotations ("[текст на русском]", "(музыка)", "♪…")
 /// from a segment and reject segments that are pure hallucination.
@@ -319,10 +439,21 @@ fn clean_hallucinations(text: &str) -> Option<String> {
         return None;
     }
 
-    // Drop short segments that are just a stock hallucination phrase.
     let lower = clean.to_lowercase();
-    let word_count = lower.split_whitespace().count();
-    if word_count <= 6 && HALLUCINATION_PHRASES.iter().any(|p| lower.contains(p)) {
+    let core = lower.trim_matches(|c: char| !c.is_alphanumeric());
+    if HALLUCINATION_SEGMENTS.contains(&core) {
+        return None;
+    }
+    if HALLUCINATION_PREFIXES
+        .iter()
+        .any(|prefix| core.starts_with(prefix))
+    {
+        return None;
+    }
+    if HALLUCINATION_TOKENS
+        .iter()
+        .any(|token| lower.contains(token))
+    {
         return None;
     }
 
@@ -331,7 +462,7 @@ fn clean_hallucinations(text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::clean_hallucinations;
+    use super::{assemble_segments, clean_hallucinations, normalize_peak};
 
     #[test]
     fn passes_normal_text_through() {
@@ -367,6 +498,25 @@ mod tests {
         assert_eq!(clean_hallucinations("Субтитры сделал DimaTorzok"), None);
         assert_eq!(clean_hallucinations("Продолжение следует..."), None);
         assert_eq!(clean_hallucinations("Спасибо за просмотр!"), None);
+        assert_eq!(clean_hallucinations("Редактор субтитров А.Семкин"), None);
+        assert_eq!(clean_hallucinations("Корректор А.Егорова"), None);
+        assert_eq!(clean_hallucinations("Субтитры"), None);
+    }
+
+    #[test]
+    fn keeps_short_real_sentences_that_mention_stock_words() {
+        assert_eq!(
+            clean_hallucinations("Добавь субтитры к видео"),
+            Some("Добавь субтитры к видео".to_string())
+        );
+        assert_eq!(
+            clean_hallucinations("Нужен корректор цвета"),
+            Some("Нужен корректор цвета".to_string())
+        );
+        assert_eq!(
+            clean_hallucinations("Спасибо за просмотр макета, продолжаем"),
+            Some("Спасибо за просмотр макета, продолжаем".to_string())
+        );
     }
 
     #[test]
@@ -379,6 +529,29 @@ mod tests {
     fn drops_punctuation_only() {
         assert_eq!(clean_hallucinations("..."), None);
         assert_eq!(clean_hallucinations(""), None);
+    }
+
+    #[test]
+    fn assemble_drops_silent_windows_and_hallucinations() {
+        let (text, dropped) = assemble_segments(vec![
+            (" Привет ".to_string(), 0.1),
+            (" [музыка] ".to_string(), 0.2),
+            (" шум ".to_string(), 0.95),
+            (" мир. ".to_string(), 0.1),
+        ]);
+        assert_eq!(text, "Привет мир.");
+        assert_eq!(dropped, 2);
+    }
+
+    #[test]
+    fn normalize_peak_caps_the_gain() {
+        let quiet = vec![0.0, 0.01, -0.01];
+        let out = normalize_peak(&quiet);
+        assert!((out[1] - 0.08).abs() < 1e-6, "8x cap: {out:?}");
+        let silent = normalize_peak(&[0.0, 0.0]);
+        assert_eq!(silent, vec![0.0, 0.0]);
+        let loud = normalize_peak(&[0.5, -1.0]);
+        assert!((loud[1].abs() - 0.95).abs() < 1e-6);
     }
 
     use super::pick_language;
@@ -429,5 +602,13 @@ mod tests {
     #[test]
     fn pick_language_zero_defaults_russian() {
         assert_eq!(pick_language(0.0, 0.0), "ru");
+    }
+
+    #[test]
+    fn pick_language_boundaries() {
+        // p_ru exactly at RU_PRESENCE_MAX is not "below": stays Russian.
+        assert_eq!(pick_language(0.15, 0.85), "ru");
+        // Clearly above the share threshold with Russian absent: English.
+        assert_eq!(pick_language(0.14, 0.22), "en");
     }
 }

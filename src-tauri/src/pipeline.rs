@@ -5,7 +5,9 @@
 //! Status changes go through [`set_status`] so the UI always receives the
 //! same serialized [`AppStatus`] payload that `get_status` returns.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::Instant;
 use tauri::{Emitter, Manager};
 
 use crate::audio::buffer::AudioBuffer;
@@ -19,8 +21,12 @@ use crate::state::{self, lock_or_recover, AppState, AppStatus, ModelState};
 use crate::system::sounds::SoundPlayer;
 use crate::system::tray::TrayAnimator;
 use crate::text::apply_paste_suffix;
-use crate::transcription::engine::WhisperEngine;
+use crate::transcription::engine::{TranscribeOptions, WhisperEngine};
+use crate::watchdog::{Verdict, Watchdog};
 use crate::{commands, formatting, system};
+
+/// Counts finished recordings for the per-utterance log line.
+static UTTERANCES: AtomicU64 = AtomicU64::new(0);
 
 /// Record the new status in [`AppState`] and tell every webview about it.
 pub fn set_status(app: &tauri::AppHandle, status: AppStatus) {
@@ -39,7 +45,7 @@ pub fn emit_status(app: &tauri::AppHandle, status: &AppStatus) {
 }
 
 pub fn start_recording_flow(app: &tauri::AppHandle) {
-    log::info!("start_recording_flow called");
+    log::debug!("start_recording_flow called");
     let state = app.state::<Mutex<AppState>>();
     let capture = app.state::<Mutex<AudioCapture>>();
     let buffer = app.state::<AudioBuffer>();
@@ -54,6 +60,7 @@ pub fn start_recording_flow(app: &tauri::AppHandle) {
             ModelState::Ready { .. } | ModelState::Loading => {
                 s.status = AppStatus::Recording;
                 s.recording_locked = false;
+                s.preview_abort.store(false, Ordering::Relaxed);
             }
             ModelState::Missing | ModelState::Failed { .. } => {}
         }
@@ -177,6 +184,21 @@ pub fn start_recording_flow(app: &tauri::AppHandle) {
     });
 }
 
+fn is_recording(app: &tauri::AppHandle) -> bool {
+    let state = app.state::<Mutex<AppState>>();
+    let s = lock_or_recover(&state);
+    s.status == AppStatus::Recording
+}
+
+/// The only consumer of the streaming preview is the main window; when it is
+/// hidden in the tray (the normal case) every preview tick would be a full
+/// GPU encoder pass for nobody.
+fn main_window_visible(app: &tauri::AppHandle) -> bool {
+    app.get_webview_window("main")
+        .map(|w| w.is_visible().unwrap_or(false) && !w.is_minimized().unwrap_or(false))
+        .unwrap_or(false)
+}
+
 async fn streaming_preview_loop(app: tauri::AppHandle) {
     use std::time::Duration;
 
@@ -186,60 +208,116 @@ async fn streaming_preview_loop(app: tauri::AppHandle) {
     // Wait 1.5s before first preview (need enough audio)
     for _ in 0..15 {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let state = app.state::<Mutex<AppState>>();
-        let still_recording = state.lock().unwrap().status == AppStatus::Recording;
-        if !still_recording {
+        if !is_recording(&app) {
             return;
         }
+    }
+
+    let (abort, on_cpu) = {
+        let state = app.state::<Mutex<AppState>>();
+        let s = lock_or_recover(&state);
+        (s.preview_abort.clone(), s.model.backend() == "CPU")
+    };
+    if on_cpu {
+        // On the CPU a preview tick takes longer than the two-second cadence
+        // and would only delay the final transcription.
+        log::info!("Streaming preview disabled on the CPU backend");
+        return;
     }
 
     // Language detected on the first preview cycle is reused for the rest of
     // this recording — see WhisperEngine::transcribe_cached for the trade-off.
     let mut lang_cache: Option<&'static str> = None;
+    let mut watchdog = Watchdog::new();
+    let mut paused_logged = false;
 
     loop {
-        let buffer = app.state::<AudioBuffer>();
-        let samples = buffer.snapshot_tail(MAX_PREVIEW_SAMPLES);
-
-        if samples.len() >= 16000 {
-            // Check if still recording right before locking the engine
-            {
-                let state = app.state::<Mutex<AppState>>();
-                if state.lock().unwrap().status != AppStatus::Recording {
-                    return;
-                }
+        if !is_recording(&app) {
+            return;
+        }
+        if !main_window_visible(&app) {
+            if !paused_logged {
+                log::debug!("Streaming preview paused: main window hidden");
+                paused_logged = true;
             }
-
-            // Try non-blocking lock — skip if final transcription holds it
-            let engine = app.state::<Mutex<WhisperEngine>>();
-            let lock_result = engine.try_lock();
-            if let Ok(eng) = lock_result {
-                let duration = samples.len() as f32 / 16000.0;
-                log::info!("Streaming preview: transcribing {:.1}s", duration);
+        } else {
+            paused_logged = false;
+            let samples = app
+                .state::<AudioBuffer>()
+                .snapshot_tail(MAX_PREVIEW_SAMPLES);
+            if samples.len() >= 16000 {
+                let audio_s = samples.len() as f64 / 16000.0;
                 let (language, pipeline) = {
                     let settings = app.state::<Mutex<Settings>>();
                     let guard = lock_or_recover(&settings);
                     (guard.language, guard.text_pipeline())
                 };
-                match eng.transcribe_cached(&samples, language, &mut lang_cache) {
-                    Ok(text) if !text.is_empty() => {
-                        let text = pipeline.preview(&text);
-                        log::info!("Streaming preview ready ({} chars)", text.chars().count());
-                        let _ = app.emit(events::STREAMING_PREVIEW, &text);
+                let blocking_app = app.clone();
+                let abort_flag = abort.clone();
+                let cache_in = lang_cache;
+                let started = Instant::now();
+                // Whisper blocks for hundreds of milliseconds; keep it off the
+                // async runtime's worker threads.
+                let outcome = tauri::async_runtime::spawn_blocking(move || {
+                    let engine = blocking_app.state::<Mutex<WhisperEngine>>();
+                    // Non-blocking: skip the tick if the final pass holds the engine.
+                    let Ok(eng) = engine.try_lock() else {
+                        return (cache_in, None);
+                    };
+                    let mut cache = cache_in;
+                    let result = eng.transcribe_cached(
+                        &samples,
+                        language,
+                        &mut cache,
+                        TranscribeOptions::preview(Some(abort_flag)),
+                    );
+                    (cache, Some(result))
+                })
+                .await;
+
+                match outcome {
+                    Ok((cache, Some(Ok(result)))) => {
+                        lang_cache = cache;
+                        let elapsed_ms = started.elapsed().as_millis() as f64;
+                        log::debug!(
+                            "Streaming preview: {audio_s:.1}s of audio in {elapsed_ms:.0} ms ({} chars)",
+                            result.text.chars().count()
+                        );
+                        if is_recording(&app) && !result.text.is_empty() {
+                            let text = pipeline.preview(&result.text);
+                            let _ = app.emit(events::STREAMING_PREVIEW, &text);
+                        }
+                        if let Verdict::Slow {
+                            elapsed_ms,
+                            threshold_ms,
+                        } = watchdog.observe(elapsed_ms, audio_s)
+                        {
+                            log::warn!(
+                                "GPU watchdog: a preview of {audio_s:.1}s took {elapsed_ms:.0} ms \
+                                 (threshold {threshold_ms:.0} ms); preview disabled for this recording"
+                            );
+                            let message =
+                                "Transcription is running very slowly: check the charger \
+                                           and the GPU power limit (nvidia-smi).";
+                            let _ = app.emit(events::OPERATION_NOTICE, message);
+                            notify_user(&app, message);
+                            return;
+                        }
                     }
-                    _ => {}
+                    Ok((cache, Some(Err(e)))) => {
+                        lang_cache = cache;
+                        log::debug!("Streaming preview skipped: {e}");
+                    }
+                    Ok((_, None)) => log::debug!("Streaming preview: engine locked, skipping"),
+                    Err(e) => log::warn!("Streaming preview task failed: {e}"),
                 }
-            } else {
-                log::info!("Streaming preview: engine locked, skipping");
             }
         }
 
         // Wait 2s before next preview, checking every 100ms if still recording
         for _ in 0..20 {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            let state = app.state::<Mutex<AppState>>();
-            let still_recording = state.lock().unwrap().status == AppStatus::Recording;
-            if !still_recording {
+            if !is_recording(&app) {
                 return;
             }
         }
@@ -418,29 +496,30 @@ fn load_first_available(app: &tauri::AppHandle, requested: &str) -> ModelState {
 }
 
 pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
-    log::info!("stop_and_transcribe_flow called");
+    log::debug!("stop_and_transcribe_flow called");
     let state = app.state::<Mutex<AppState>>();
     let capture = app.state::<Mutex<AudioCapture>>();
     let buffer = app.state::<AudioBuffer>();
-    let engine = app.state::<Mutex<WhisperEngine>>();
 
     // Claim the stop atomically. Hotkey release, tray, pin button, and the
     // recording-limit event can arrive together; only one may finalize audio.
-    {
-        let mut s = state.lock().unwrap();
+    let preview_abort = {
+        let mut s = lock_or_recover(&state);
         if s.status != AppStatus::Recording {
             return;
         }
         s.recording_locked = false;
         s.status = AppStatus::Transcribing;
-    }
+        s.preview_abort.clone()
+    };
+    // An in-flight preview tick holds the engine; make it bail out so the
+    // final pass does not queue behind it.
+    preview_abort.store(true, Ordering::Relaxed);
     let _ = app.emit(events::LOCK_CHANGED, false);
     emit_status(app, &AppStatus::Transcribing);
 
     // Stop capture
-    {
-        capture.lock().unwrap().stop();
-    }
+    lock_or_recover(&capture).stop();
     app.state::<SoundPlayer>().play_stop();
 
     // End the recording indicator as soon as the mic is released; transcription
@@ -457,34 +536,73 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
         return;
     }
 
-    log::info!(
-        "Transcribing {:.1}s of audio",
-        samples.len() as f32 / 16000.0
-    );
+    let audio_s = samples.len() as f64 / 16000.0;
+    let utterance = UTTERANCES.fetch_add(1, Ordering::Relaxed) + 1;
+    log::info!("utt#{utterance}: transcribing {audio_s:.1}s of audio");
 
-    let (language, pipeline, paste_suffix) = {
+    let (language, pipeline, paste_suffix, backend) = {
         let settings = app.state::<Mutex<Settings>>();
         let guard = lock_or_recover(&settings);
-        (guard.language, guard.text_pipeline(), guard.paste_suffix)
-    };
-    let text = {
-        let eng = engine.lock().unwrap();
-        match eng.transcribe(&samples, language) {
-            Ok(t) => t,
-            Err(e) => {
-                log::error!("Transcription failed: {}", e);
-                finish_without_result(app, "error", "Transcription failed — check logs");
-                return;
-            }
-        }
+        let backend = lock_or_recover(&state).model.backend().to_string();
+        (
+            guard.language,
+            guard.text_pipeline(),
+            guard.paste_suffix,
+            backend,
+        )
     };
 
-    if text.is_empty() {
+    // Whisper blocks for seconds; run it off the async worker threads. The
+    // engine lock waits for a preview tick (now aborting) or a model load.
+    let lock_started = Instant::now();
+    let blocking_app = app.clone();
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        let engine = blocking_app.state::<Mutex<WhisperEngine>>();
+        let eng = lock_or_recover(&engine);
+        let lock_ms = lock_started.elapsed().as_millis();
+        let result = eng.transcribe(&samples, language, TranscribeOptions::final_pass());
+        (lock_ms, result)
+    })
+    .await;
+    let (lock_ms, result) = match outcome {
+        Ok(pair) => pair,
+        Err(e) => {
+            log::error!("Transcription task failed: {e}");
+            finish_without_result(app, "error", "Transcription failed — check logs");
+            return;
+        }
+    };
+    let result = match result {
+        Ok(r) => r,
+        Err(e) => {
+            log::error!("Transcription failed: {}", e);
+            finish_without_result(app, "error", "Transcription failed — check logs");
+            return;
+        }
+    };
+    let transcribe_ms = result.detect_ms + result.full_ms;
+    let rtf = transcribe_ms as f64 / 1000.0 / audio_s;
+    if rtf > 1.0 && backend == "CUDA" {
+        log::warn!(
+            "utt#{utterance}: transcription slower than realtime ({transcribe_ms} ms for {audio_s:.1}s); \
+             the GPU may be power-capped"
+        );
+        let _ = app.emit(
+            events::OPERATION_NOTICE,
+            format!(
+                "Transcription took {:.0} s for {audio_s:.0} s of audio: check the charger and the \
+                 GPU power limit (nvidia-smi).",
+                transcribe_ms as f64 / 1000.0
+            ),
+        );
+    }
+
+    if result.text.is_empty() {
         finish_without_result(app, "no-speech", "No speech detected — try again");
         return;
     }
 
-    let text = pipeline.finalize(&text);
+    let text = pipeline.finalize(&result.text);
     log::info!("Transcription cleaned ({} chars)", text.chars().count());
 
     if text.is_empty() {
@@ -495,10 +613,11 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
     // AI formatting step
     let ai_settings = {
         let settings = app.state::<Mutex<Settings>>();
-        let guard = settings.lock().unwrap();
+        let guard = lock_or_recover(&settings);
         guard.ai.clone()
     };
 
+    let format_started = Instant::now();
     let text = if ai_settings.provider != formatting::AiProvider::None {
         set_status(app, AppStatus::Formatting);
         match formatting::format_text(&text, &ai_settings).await {
@@ -514,12 +633,21 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
     } else {
         text
     };
+    let format_ms = if ai_settings.provider != formatting::AiProvider::None {
+        format_started.elapsed().as_millis()
+    } else {
+        0
+    };
 
     set_status(app, AppStatus::Injecting);
 
+    let paste_started = Instant::now();
     let to_paste = apply_paste_suffix(&text, paste_suffix);
-    match system::text_injection::inject_text(&to_paste) {
-        Ok(_) => log::info!("Text injected successfully"),
+    let pasted = match system::text_injection::inject_text(&to_paste) {
+        Ok(_) => {
+            log::debug!("Paste shortcut sent");
+            true
+        }
         Err(e) => {
             log::error!("Text injection failed: {}", e);
             let copied = commands::copy_text(text.clone()).is_ok();
@@ -530,23 +658,37 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
             };
             let _ = app.emit(events::OPERATION_NOTICE, message);
             notify_user(app, message);
+            false
+        }
+    };
+    let paste_ms = paste_started.elapsed().as_millis();
+
+    let (history, history_changed) = {
+        let mut s = lock_or_recover(&state);
+        s.last_transcription = text.clone();
+        let changed = s.push_history(&text);
+        s.status = AppStatus::Idle;
+        (s.history.clone(), changed)
+    };
+    if history_changed {
+        if let Err(e) = state::save_history(&app.state::<AppConfig>().data_dir, &history) {
+            log::warn!("Failed to save transcription history: {e}");
+            let _ = app.emit(
+                events::OPERATION_NOTICE,
+                "History could not be saved to disk",
+            );
         }
     }
-
-    let history = {
-        let mut s = state.lock().unwrap();
-        s.last_transcription = text.clone();
-        s.push_history(&text);
-        s.status = AppStatus::Idle;
-        s.history.clone()
-    };
-    if let Err(e) = state::save_history(&app.state::<AppConfig>().data_dir, &history) {
-        log::warn!("Failed to save transcription history: {e}");
-        let _ = app.emit(
-            events::OPERATION_NOTICE,
-            "History could not be saved to disk",
-        );
-    }
+    log::info!(
+        "utt#{utterance} audio={audio_s:.1}s lock={lock_ms}ms detect={}ms transcribe={}ms (rtf {rtf:.2}) \
+         format={format_ms}ms paste={paste_ms}ms backend={backend} lang={} chars={} segments={} dropped={} pasted={pasted}",
+        result.detect_ms,
+        result.full_ms,
+        result.language,
+        text.chars().count(),
+        result.segments,
+        result.dropped
+    );
     emit_status(app, &AppStatus::Idle);
     let _ = app.emit(events::HISTORY_CHANGED, &history);
     let _ = app.emit(events::TRANSCRIPTION_COMPLETE, text);

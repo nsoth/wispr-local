@@ -3,7 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Keep this many recent transcriptions for the in-app history.
 pub const HISTORY_LIMIT: usize = 5;
@@ -108,6 +109,9 @@ pub struct AppState {
     /// The fallback microphone that was last announced, so the toast fires
     /// once per device instead of on every recording.
     pub last_fallback_device: Option<String>,
+    /// Set by the stop flow so an in-flight preview tick aborts and releases
+    /// the engine to the final transcription; cleared when a recording starts.
+    pub preview_abort: Arc<AtomicBool>,
 }
 
 impl Default for AppState {
@@ -121,6 +125,7 @@ impl Default for AppState {
             history: Vec::new(),
             diagnostics: StartupDiagnostics::default(),
             last_fallback_device: None,
+            preview_abort: Arc::new(AtomicBool::new(false)),
         }
     }
 }

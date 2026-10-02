@@ -75,9 +75,12 @@ pub fn run_supervisor() -> ! {
         command
             .args(std::env::args().skip(1))
             .env(CHILD_ENV, "1")
+            // whisper-rs mirrors every whisper.cpp line (one per preview tick)
+            // at info; keep only its warnings and errors — the CUDA error text
+            // before an abort is logged at error level.
             .env(
                 "RUST_LOG",
-                std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
+                std::env::var("RUST_LOG").unwrap_or_else(|_| "info,whisper_rs=warn".into()),
             )
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

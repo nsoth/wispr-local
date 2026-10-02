@@ -37,6 +37,7 @@ pub mod supervisor;
 pub mod system;
 pub mod text;
 pub mod transcription;
+pub mod watchdog;
 
 use std::sync::Mutex;
 use tauri::{Emitter, Listener, Manager};
@@ -144,7 +145,7 @@ pub fn run() {
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
                     use tauri_plugin_global_shortcut::ShortcutState;
-                    log::info!("Hotkey event: {:?} state={:?}", shortcut, event.state);
+                    log::debug!("Hotkey event: {:?} state={:?}", shortcut, event.state);
 
                     let (recording, locked) = {
                         let state = app.state::<Mutex<AppState>>();
@@ -156,10 +157,10 @@ pub fn run() {
                         ShortcutState::Pressed => {
                             if recording && locked {
                                 // Pinned recording: a fresh press stops it.
-                                log::info!("Hotkey PRESSED - stopping pinned recording");
+                                log::debug!("Hotkey PRESSED - stopping pinned recording");
                                 let _ = app.emit(events::REQUEST_STOP_RECORDING, ());
                             } else if !recording {
-                                log::info!("Hotkey PRESSED - starting recording");
+                                log::debug!("Hotkey PRESSED - starting recording");
                                 let _ = app.emit(events::REQUEST_START_RECORDING, ());
                             }
                             // recording && !locked: key-repeat while holding — ignore.
@@ -168,9 +169,9 @@ pub fn run() {
                             if locked {
                                 // Pinned via the overlay button: keep recording
                                 // after the key is released.
-                                log::info!("Hotkey RELEASED - recording pinned, ignoring");
+                                log::debug!("Hotkey RELEASED - recording pinned, ignoring");
                             } else {
-                                log::info!("Hotkey RELEASED - stopping recording");
+                                log::debug!("Hotkey RELEASED - stopping recording");
                                 let _ = app.emit(events::REQUEST_STOP_RECORDING, ());
                             }
                         }
