@@ -114,6 +114,16 @@ pub struct AppState {
     pub preview_abort: Arc<AtomicBool>,
     /// "ru" / "en" for the current utterance once known (pinned or detected).
     pub detected_language: String,
+    /// When the active recording started (for tap-vs-hold detection).
+    pub recording_started_at: Option<std::time::Instant>,
+    /// Whether the hotkey is believed to be physically down.
+    pub key_down: bool,
+    /// Tray → "Pause hotkey": events are ignored while set.
+    pub hotkey_paused: bool,
+    /// The Settings page is recording a new combination: ignore the live one.
+    pub capturing_hotkey: bool,
+    /// Set by a cancel request while transcribing/formatting: skip the paste.
+    pub cancel_requested: Arc<AtomicBool>,
 }
 
 impl Default for AppState {
@@ -129,6 +139,11 @@ impl Default for AppState {
             last_fallback_device: None,
             preview_abort: Arc::new(AtomicBool::new(false)),
             detected_language: String::new(),
+            recording_started_at: None,
+            key_down: false,
+            hotkey_paused: false,
+            capturing_hotkey: false,
+            cancel_requested: Arc::new(AtomicBool::new(false)),
         }
     }
 }

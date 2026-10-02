@@ -149,7 +149,9 @@ pub fn start_recording_flow(app: &tauri::AppHandle) {
                 s.status = AppStatus::Recording;
                 s.recording_locked = false;
                 s.detected_language.clear();
+                s.recording_started_at = Some(Instant::now());
                 s.preview_abort.store(false, Ordering::Relaxed);
+                s.cancel_requested.store(false, Ordering::Relaxed);
             }
             ModelState::Missing | ModelState::Failed { .. } => {}
         }
@@ -423,6 +425,50 @@ async fn streaming_preview_loop(app: tauri::AppHandle) {
     }
 }
 
+/// Discard the active recording, or — while the previous one is still being
+/// transcribed/formatted — skip its paste. Triggered by the cancel hotkey,
+/// the overlay's X button and the tray.
+pub fn cancel_recording(app: &tauri::AppHandle) {
+    let state = app.state::<Mutex<AppState>>();
+    let was_recording = {
+        let mut s = lock_or_recover(&state);
+        match s.status {
+            AppStatus::Recording => {
+                s.status = AppStatus::Idle;
+                s.recording_locked = false;
+                s.recording_started_at = None;
+                s.preview_abort.store(true, Ordering::Relaxed);
+                true
+            }
+            AppStatus::Transcribing | AppStatus::Formatting => {
+                s.cancel_requested.store(true, Ordering::Relaxed);
+                false
+            }
+            _ => return,
+        }
+    };
+    if was_recording {
+        log::info!("Recording cancelled");
+        lock_or_recover(&app.state::<Mutex<AudioCapture>>()).stop();
+        app.state::<AudioBuffer>().clear();
+        app.state::<SoundPlayer>().play(SoundKind::Cancel);
+        emit_status(app, &AppStatus::Idle);
+        let _ = app.emit(events::LOCK_CHANGED, false);
+        app.state::<TrayAnimator>().set_phase(TrayPhase::Idle);
+        emit_overlay_state(app, "result", "Cancelled", "warn");
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            if !is_recording(&app) {
+                hide_overlay(&app);
+            }
+        });
+    } else {
+        log::info!("Cancel requested while processing: the result will not be pasted");
+        emit_overlay_state(app, "processing", "Cancelling", "warn");
+    }
+}
+
 /// How a stopped recording ended; drives the overlay's result flash, the
 /// toast policy and the main-window notice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -435,11 +481,14 @@ pub enum Outcome {
     TooShort,
     NoSpeech,
     Failed,
+    /// The user cancelled while processing; the text went to history only.
+    Cancelled,
 }
 
 impl Outcome {
     fn overlay(self) -> (&'static str, &'static str, u64) {
         match self {
+            Outcome::Cancelled => ("Cancelled", "warn", 1200),
             Outcome::Pasted => ("Pasted", "ok", 1200),
             Outcome::CopiedToClipboard { in_clipboard: true } => {
                 ("Copied to clipboard", "warn", 2200)
@@ -833,6 +882,17 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
         guard.ai.clone()
     };
 
+    let cancel_requested = lock_or_recover(&state).cancel_requested.clone();
+    if cancel_requested.load(Ordering::Relaxed) {
+        log::info!("utt#{utterance}: cancelled before formatting; kept in history only");
+        lock_or_recover(&state).push_history(&text);
+        guard.disarm();
+        finish_pipeline(app, Outcome::Cancelled);
+        let history = lock_or_recover(&state).history.clone();
+        let _ = app.emit(events::HISTORY_CHANGED, &history);
+        return;
+    }
+
     let format_started = Instant::now();
     let text = if ai_settings.provider != formatting::AiProvider::None {
         set_status(app, AppStatus::Formatting);
@@ -855,6 +915,16 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
     } else {
         0
     };
+
+    if cancel_requested.load(Ordering::Relaxed) {
+        log::info!("utt#{utterance}: cancelled before pasting; kept in history only");
+        lock_or_recover(&state).push_history(&text);
+        guard.disarm();
+        finish_pipeline(app, Outcome::Cancelled);
+        let history = lock_or_recover(&state).history.clone();
+        let _ = app.emit(events::HISTORY_CHANGED, &history);
+        return;
+    }
 
     set_status(app, AppStatus::Injecting);
     emit_overlay_state(app, "processing", "Pasting", "");
@@ -1013,6 +1083,8 @@ mod tests {
     #[test]
     fn accidental_taps_never_toast() {
         assert!(Outcome::TooShort.toast().is_none());
+        assert!(Outcome::Cancelled.toast().is_none());
+        assert!(Outcome::Cancelled.empty_reason().is_none());
         assert!(Outcome::Pasted.toast().is_none());
         assert!(Outcome::NoSpeech.toast().is_some());
         assert_eq!(Outcome::TooShort.empty_reason(), Some("too-short"));

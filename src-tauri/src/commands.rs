@@ -253,8 +253,12 @@ pub fn set_hotkey(
 ) -> Result<String, String> {
     // Parse the new hotkey string
     let new_shortcut = parse_hotkey(&hotkey)?;
-    if !has_modifier(&hotkey) {
-        return Err("Use at least one modifier: Ctrl, Shift, Alt, or Win".to_string());
+    if !has_modifier(&hotkey) && !is_safe_bare_key(&hotkey) {
+        return Err(
+            "Use at least one modifier (Ctrl, Shift, Alt, Win) or a key that never types: \
+             F13-F24, Pause, ScrollLock, CapsLock"
+                .to_string(),
+        );
     }
 
     // Get the old hotkey to unregister
@@ -271,7 +275,7 @@ pub fn set_hotkey(
     // later step fails, roll back to the previous registration and setting.
     let gs = app.global_shortcut();
     gs.register(new_shortcut)
-        .map_err(|e| format!("Failed to register new hotkey: {}", e))?;
+        .map_err(|e| friendly_register_error(&e.to_string()))?;
     if let Err(e) = gs.unregister(old_shortcut) {
         let _ = gs.unregister(new_shortcut);
         return Err(format!("Failed to replace old hotkey: {e}"));
@@ -294,6 +298,145 @@ pub fn set_hotkey(
 
     log::info!("Hotkey changed to: {}", hotkey);
     Ok(hotkey)
+}
+
+/// Keys that never produce text, so they may be a hotkey on their own.
+pub fn is_safe_bare_key(hotkey: &str) -> bool {
+    let key = hotkey.trim().to_ascii_lowercase();
+    if key == "pause" || key == "scrolllock" || key == "capslock" {
+        return true;
+    }
+    key.strip_prefix('f')
+        .and_then(|n| n.parse::<u32>().ok())
+        .is_some_and(|n| (13..=24).contains(&n))
+}
+
+/// The plugin's error for a taken combination is a bare "already registered"
+/// enum name; say what to do instead.
+fn friendly_register_error(error: &str) -> String {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("already") {
+        "That combination is already used by another app; pick a different one".to_string()
+    } else {
+        format!("Could not register the hotkey: {error}")
+    }
+}
+
+/// Register the cancel shortcut. Failure is logged, never fatal.
+pub fn register_cancel_hotkey(app: &AppHandle, hotkey: &str) {
+    if hotkey.trim().is_empty() {
+        return;
+    }
+    match parse_hotkey(hotkey) {
+        Ok(shortcut) => match app.global_shortcut().register(shortcut) {
+            Ok(()) => log::info!("Cancel hotkey registered: {hotkey}"),
+            Err(e) => log::warn!("Cancel hotkey {hotkey} not registered: {e}"),
+        },
+        Err(e) => log::warn!("Cancel hotkey '{hotkey}' is invalid: {e}"),
+    }
+}
+
+#[tauri::command]
+pub fn get_hotkey_mode(
+    settings: State<'_, Mutex<Settings>>,
+) -> Result<crate::hotkey::HotkeyMode, String> {
+    Ok(settings.lock().map_err(|e| e.to_string())?.hotkey_mode)
+}
+
+#[tauri::command]
+pub fn set_hotkey_mode(
+    mode: crate::hotkey::HotkeyMode,
+    settings: State<'_, Mutex<Settings>>,
+    config: State<'_, AppConfig>,
+) -> Result<(), String> {
+    let mut s = settings.lock().map_err(|e| e.to_string())?;
+    let previous = s.hotkey_mode;
+    s.hotkey_mode = mode;
+    if let Err(e) = s.save(&config.data_dir) {
+        s.hotkey_mode = previous;
+        return Err(e);
+    }
+    log::info!("Hotkey mode set to {mode:?}");
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_cancel_hotkey(settings: State<'_, Mutex<Settings>>) -> Result<String, String> {
+    Ok(settings
+        .lock()
+        .map_err(|e| e.to_string())?
+        .cancel_hotkey
+        .clone())
+}
+
+/// Change the cancel shortcut (empty string disables it).
+#[tauri::command]
+pub fn set_cancel_hotkey(
+    app: AppHandle,
+    hotkey: String,
+    settings: State<'_, Mutex<Settings>>,
+    config: State<'_, AppConfig>,
+) -> Result<String, String> {
+    let hotkey = hotkey.trim().to_string();
+    let old = settings
+        .lock()
+        .map_err(|e| e.to_string())?
+        .cancel_hotkey
+        .clone();
+    if hotkey.eq_ignore_ascii_case(&old) {
+        return Ok(old);
+    }
+    let gs = app.global_shortcut();
+    if !hotkey.is_empty() {
+        let shortcut = parse_hotkey(&hotkey)?;
+        if !has_modifier(&hotkey) && !is_safe_bare_key(&hotkey) {
+            return Err("Use at least one modifier for the cancel key".to_string());
+        }
+        gs.register(shortcut)
+            .map_err(|e| friendly_register_error(&e.to_string()))?;
+    }
+    if let Ok(old_shortcut) = parse_hotkey(&old) {
+        let _ = gs.unregister(old_shortcut);
+    }
+    let mut s = settings.lock().map_err(|e| e.to_string())?;
+    s.cancel_hotkey = hotkey.clone();
+    if let Err(e) = s.save(&config.data_dir) {
+        s.cancel_hotkey = old.clone();
+        if let Ok(new_shortcut) = parse_hotkey(&hotkey) {
+            let _ = gs.unregister(new_shortcut);
+        }
+        if let Ok(old_shortcut) = parse_hotkey(&old) {
+            let _ = gs.register(old_shortcut);
+        }
+        return Err(e);
+    }
+    log::info!("Cancel hotkey changed to: {hotkey}");
+    Ok(hotkey)
+}
+
+/// While the Settings page records a new combination the live shortcut must
+/// not start a recording when the user presses it.
+#[tauri::command]
+pub fn begin_hotkey_capture(state: State<'_, Mutex<AppState>>) {
+    crate::state::lock_or_recover(&state).capturing_hotkey = true;
+}
+
+#[tauri::command]
+pub fn end_hotkey_capture(state: State<'_, Mutex<AppState>>) {
+    crate::state::lock_or_recover(&state).capturing_hotkey = false;
+}
+
+/// Tray → "Pause hotkey".
+#[tauri::command]
+pub fn set_hotkey_paused(paused: bool, state: State<'_, Mutex<AppState>>) {
+    crate::state::lock_or_recover(&state).hotkey_paused = paused;
+    log::info!("Hotkey {}", if paused { "paused" } else { "resumed" });
+}
+
+/// Overlay X button / tray: discard the recording or skip the paste.
+#[tauri::command]
+pub fn cancel_recording(app: AppHandle) {
+    crate::pipeline::cancel_recording(&app);
 }
 
 fn has_modifier(hotkey: &str) -> bool {
@@ -735,6 +878,39 @@ fn parse_key_code(key: &str) -> Result<Code, String> {
         "f10" => Ok(Code::F10),
         "f11" => Ok(Code::F11),
         "f12" => Ok(Code::F12),
+        "f13" => Ok(Code::F13),
+        "f14" => Ok(Code::F14),
+        "f15" => Ok(Code::F15),
+        "f16" => Ok(Code::F16),
+        "f17" => Ok(Code::F17),
+        "f18" => Ok(Code::F18),
+        "f19" => Ok(Code::F19),
+        "f20" => Ok(Code::F20),
+        "f21" => Ok(Code::F21),
+        "f22" => Ok(Code::F22),
+        "f23" => Ok(Code::F23),
+        "f24" => Ok(Code::F24),
+        "pause" => Ok(Code::Pause),
+        "scrolllock" => Ok(Code::ScrollLock),
+        "capslock" => Ok(Code::CapsLock),
+        "numlock" => Ok(Code::NumLock),
+        "printscreen" => Ok(Code::PrintScreen),
+        "numpad0" => Ok(Code::Numpad0),
+        "numpad1" => Ok(Code::Numpad1),
+        "numpad2" => Ok(Code::Numpad2),
+        "numpad3" => Ok(Code::Numpad3),
+        "numpad4" => Ok(Code::Numpad4),
+        "numpad5" => Ok(Code::Numpad5),
+        "numpad6" => Ok(Code::Numpad6),
+        "numpad7" => Ok(Code::Numpad7),
+        "numpad8" => Ok(Code::Numpad8),
+        "numpad9" => Ok(Code::Numpad9),
+        "numpadadd" => Ok(Code::NumpadAdd),
+        "numpadsubtract" => Ok(Code::NumpadSubtract),
+        "numpadmultiply" => Ok(Code::NumpadMultiply),
+        "numpaddivide" => Ok(Code::NumpadDivide),
+        "numpaddecimal" => Ok(Code::NumpadDecimal),
+        "numpadenter" => Ok(Code::NumpadEnter),
         "`" | "backquote" => Ok(Code::Backquote),
         "-" | "minus" => Ok(Code::Minus),
         "=" | "equal" => Ok(Code::Equal),
@@ -806,5 +982,29 @@ mod tests {
     fn modifier_guard_protects_normal_typing() {
         assert!(has_modifier("Ctrl+A"));
         assert!(!has_modifier("A"));
+    }
+
+    #[test]
+    fn extended_keys_parse_and_safe_bare_keys_are_allowed() {
+        use super::{is_safe_bare_key, parse_hotkey as parse};
+        use tauri_plugin_global_shortcut::{Code, Shortcut};
+        assert_eq!(parse("F13").unwrap(), Shortcut::new(None, Code::F13));
+        assert!(parse("Ctrl+NumpadAdd").is_ok());
+        assert!(parse("Pause").is_ok());
+        assert!(parse("ScrollLock").is_ok());
+        assert!(is_safe_bare_key("F13"));
+        assert!(is_safe_bare_key("f24"));
+        assert!(is_safe_bare_key("Pause"));
+        assert!(is_safe_bare_key("CapsLock"));
+        assert!(!is_safe_bare_key("F12"), "F12 types in some apps");
+        assert!(!is_safe_bare_key("Space"));
+        assert!(!is_safe_bare_key("Ctrl+F13"));
+    }
+
+    #[test]
+    fn taken_combination_error_is_actionable() {
+        let msg = super::friendly_register_error("AlreadyRegistered(Shortcut(..))");
+        assert!(msg.contains("already used"));
+        assert!(super::friendly_register_error("boom").contains("boom"));
     }
 }

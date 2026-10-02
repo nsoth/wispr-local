@@ -62,6 +62,15 @@ interface TextSettings {
   restore_clipboard: boolean;
 }
 
+type HotkeyMode = "hold" | "toggle" | "hybrid";
+type HotkeyTarget = "main" | "cancel";
+
+const HOTKEY_HINTS: Record<HotkeyMode, string> = {
+  hold: "Hold to dictate, release to paste",
+  toggle: "Press to start, press again to paste",
+  hybrid: "Hold to dictate, or tap to go hands-free",
+};
+
 type NoticeKind = "info" | "error";
 interface Notice {
   text: string;
@@ -105,8 +114,10 @@ function App() {
   const [modelFiles, setModelFiles] = useState<ModelFileInfo[]>([]);
   const [modelsDir, setModelsDir] = useState("");
   const [hotkey, setHotkey] = useState("Ctrl+Shift+Space");
-  const [isCapturingHotkey, setIsCapturingHotkey] = useState(false);
+  const [capturing, setCapturing] = useState<HotkeyTarget | null>(null);
   const [hotkeyError, setHotkeyError] = useState("");
+  const [hotkeyMode, setHotkeyMode] = useState<HotkeyMode>("hold");
+  const [cancelHotkey, setCancelHotkey] = useState("");
   const [startSound, setStartSound] = useState("");
   const [stopSound, setStopSound] = useState("");
   const [startVolume, setStartVolume] = useState(0.3);
@@ -168,6 +179,8 @@ function App() {
       }),
       load<string>("get_models_dir", setModelsDir),
       load<string>("get_hotkey", setHotkey),
+      load<HotkeyMode>("get_hotkey_mode", setHotkeyMode),
+      load<string>("get_cancel_hotkey", setCancelHotkey),
       load<string[]>("get_history", setHistory),
       load<SoundSettings>("get_sound_settings", (sound) => {
         setStartSound(sound.start_sound);
@@ -299,6 +312,16 @@ function App() {
     if (code === "Escape") return "Escape";
     if (code === "Backspace") return "Backspace";
     if (code === "Delete") return "Delete";
+    if (code === "Insert") return "Insert";
+    if (code === "Home") return "Home";
+    if (code === "End") return "End";
+    if (code === "PageUp") return "PageUp";
+    if (code === "PageDown") return "PageDown";
+    if (code === "Pause") return "Pause";
+    if (code === "ScrollLock") return "ScrollLock";
+    if (code === "CapsLock") return "CapsLock";
+    if (code === "NumLock") return "NumLock";
+    if (code.startsWith("Numpad")) return code;
     if (code.startsWith("Key")) return code.slice(3);
     if (code.startsWith("Digit")) return code.slice(5);
     if (code.startsWith("F") && /^F\d+$/.test(code)) return code;
@@ -321,21 +344,42 @@ function App() {
     return key.length === 1 ? key.toUpperCase() : null;
   };
 
+  // Keys that never type, so they may be a hotkey on their own.
+  const isSafeBareKey = (key: string) =>
+    /^F(1[3-9]|2[0-4])$/.test(key) || ["Pause", "ScrollLock", "CapsLock"].includes(key);
+
+  const stopCapture = () => {
+    setCapturing(null);
+    void invoke("end_hotkey_capture").catch(() => undefined);
+  };
+
+  const startCapture = (target: HotkeyTarget) => {
+    setHotkeyError("");
+    setCapturing(target);
+    // The live shortcut is ignored while capturing, so pressing the current
+    // combination to confirm it does not start a recording.
+    void invoke("begin_hotkey_capture").catch(() => undefined);
+  };
+
   const handleHotkeyCapture = useCallback(
     (e: KeyboardEvent) => {
       e.preventDefault();
       e.stopPropagation();
+      if (!capturing) return;
 
       const keyName = keyCodeToName(e);
       if (!keyName) return;
 
       if (keyName === "Escape" && !e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey) {
-        setIsCapturingHotkey(false);
+        stopCapture();
         return;
       }
 
-      if (!e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey) {
-        setHotkeyError("Include Ctrl, Shift, Alt, or Win to avoid capturing normal typing");
+      const hasModifier = e.ctrlKey || e.shiftKey || e.altKey || e.metaKey;
+      if (!hasModifier && !isSafeBareKey(keyName)) {
+        setHotkeyError(
+          "Include Ctrl, Shift, Alt or Win, or use a key that never types (F13–F24, Pause, ScrollLock)",
+        );
         return;
       }
 
@@ -345,25 +389,46 @@ function App() {
       if (e.altKey) parts.push("Alt");
       if (e.metaKey) parts.push("Win");
       parts.push(keyName);
-
       const newHotkey = parts.join("+");
-
-      setIsCapturingHotkey(false);
+      const target = capturing;
+      stopCapture();
       setHotkeyError("");
 
-      invoke("set_hotkey", { hotkey: newHotkey })
-        .then(() => setHotkey(newHotkey))
-        .catch((err) => setHotkeyError(String(err)));
+      if (target === "main") {
+        invoke("set_hotkey", { hotkey: newHotkey })
+          .then(() => setHotkey(newHotkey))
+          .catch((err) => setHotkeyError(String(err)));
+      } else {
+        invoke<string>("set_cancel_hotkey", { hotkey: newHotkey })
+          .then((saved) => setCancelHotkey(saved))
+          .catch((err) => setHotkeyError(String(err)));
+      }
     },
-    []
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [capturing],
   );
 
   useEffect(() => {
-    if (isCapturingHotkey) {
+    if (capturing) {
       window.addEventListener("keydown", handleHotkeyCapture, true);
       return () => window.removeEventListener("keydown", handleHotkeyCapture, true);
     }
-  }, [isCapturingHotkey, handleHotkeyCapture]);
+  }, [capturing, handleHotkeyCapture]);
+
+  const changeHotkeyMode = (mode: HotkeyMode) => {
+    const previous = hotkeyMode;
+    setHotkeyMode(mode);
+    invoke("set_hotkey_mode", { mode }).catch((error) => {
+      setHotkeyMode(previous);
+      setError(`Could not save the hotkey mode: ${String(error)}`);
+    });
+  };
+
+  const clearCancelHotkey = () => {
+    invoke<string>("set_cancel_hotkey", { hotkey: "" })
+      .then(() => setCancelHotkey(""))
+      .catch((err) => setHotkeyError(String(err)));
+  };
 
   // AI settings are saved 450 ms after the last edit, and only after an edit:
   // the initial load never writes, so a stored key can never be wiped by a
@@ -753,14 +818,10 @@ function App() {
             )}
 
             <div className="hotkey-section">
-              {isCapturingHotkey ? (
+              {capturing === "main" ? (
                 <div className="hotkey-capture">
                   <span className="hotkey-capture-text">Press new hotkey...</span>
-                  <button
-                    type="button"
-                    className="hotkey-cancel-btn"
-                    onClick={() => setIsCapturingHotkey(false)}
-                  >
+                  <button type="button" className="hotkey-cancel-btn" onClick={stopCapture}>
                     Cancel
                   </button>
                 </div>
@@ -776,16 +837,13 @@ function App() {
                     <button
                       type="button"
                       className="hotkey-change-btn"
-                      onClick={() => {
-                        setIsCapturingHotkey(true);
-                        setHotkeyError("");
-                      }}
+                      onClick={() => startCapture("main")}
                       title="Change hotkey"
                     >
                       Change
                     </button>
                   </div>
-                  <div className="hotkey-desc">Hold to dictate, release to paste</div>
+                  <div className="hotkey-desc">{HOTKEY_HINTS[hotkeyMode]}</div>
                 </>
               )}
               {hotkeyError && (
@@ -857,6 +915,47 @@ function App() {
                 />
                 <span className="toggle-slider"></span>
               </label>
+            </div>
+            <div className="setting-row">
+              <label className="setting-label" htmlFor="hotkey-mode">Hotkey mode</label>
+              <select
+                id="hotkey-mode"
+                className="setting-select"
+                value={hotkeyMode}
+                onChange={(e) => changeHotkeyMode(e.target.value as HotkeyMode)}
+              >
+                <option value="hold">Hold to talk</option>
+                <option value="toggle">Toggle (press to start / stop)</option>
+                <option value="hybrid">Hold, or tap for hands-free</option>
+              </select>
+            </div>
+            <div className="setting-row">
+              <span className="setting-label">Cancel key</span>
+              <div className="device-controls">
+                {capturing === "cancel" ? (
+                  <span className="hotkey-capture-text">Press a combination…</span>
+                ) : (
+                  <span className="sound-file" title={cancelHotkey || "disabled"}>
+                    {cancelHotkey || "Disabled"}
+                  </span>
+                )}
+                <button
+                  type="button"
+                  className="sound-btn"
+                  onClick={() => (capturing === "cancel" ? stopCapture() : startCapture("cancel"))}
+                >
+                  {capturing === "cancel" ? "Cancel" : "Change"}
+                </button>
+                {cancelHotkey && capturing !== "cancel" && (
+                  <button type="button" className="sound-btn" onClick={clearCancelHotkey}>
+                    Disable
+                  </button>
+                )}
+              </div>
+            </div>
+            <div className="settings-note">
+              Cancel discards the current recording, or skips the paste of the one being
+              transcribed. The overlay's × does the same.
             </div>
             <div className="setting-row">
               <label className="setting-label" htmlFor="language-select">Language</label>

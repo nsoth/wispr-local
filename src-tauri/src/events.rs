@@ -28,6 +28,8 @@ pub const LANGUAGE_DETECTED: &str = "language-detected";
 /// Internal (Rust → Rust) requests raised by the hotkey, tray and overlay.
 pub const REQUEST_START_RECORDING: &str = "request-start-recording";
 pub const REQUEST_STOP_RECORDING: &str = "request-stop-recording";
+/// Discard the active recording (or skip the paste of the one in progress).
+pub const REQUEST_CANCEL_RECORDING: &str = "request-cancel-recording";
 /// Emitted once by the capture callback when the 30-minute cap is reached.
 pub const RECORDING_LIMIT_REACHED: &str = "recording-limit-reached";
 /// Emitted once by the capture error callback (device disconnected etc.).

@@ -27,6 +27,7 @@ pub mod commands;
 pub mod config;
 pub mod events;
 pub mod formatting;
+pub mod hotkey;
 pub mod instance;
 pub mod overlay;
 pub mod pipeline;
@@ -45,7 +46,10 @@ use tauri::{Emitter, Listener, Manager};
 use audio::buffer::AudioBuffer;
 use audio::capture::AudioCapture;
 use config::AppConfig;
-use pipeline::{notify_user, spawn_model_loader, start_recording_flow, stop_and_transcribe_flow};
+use pipeline::{
+    cancel_recording, notify_user, spawn_model_loader, start_recording_flow,
+    stop_and_transcribe_flow,
+};
 use settings::Settings;
 use state::{AppState, AppStatus, ModelState, StartupDiagnostics};
 use system::sounds::SoundPlayer;
@@ -137,6 +141,7 @@ pub fn run() {
         ..AppState::default()
     };
     let hotkey_string = user_settings.hotkey.clone();
+    let cancel_hotkey_string = user_settings.cancel_hotkey.clone();
     let requested_model = user_settings.model_file.clone();
 
     tauri::Builder::default()
@@ -153,34 +158,58 @@ pub fn run() {
                     use tauri_plugin_global_shortcut::ShortcutState;
                     log::debug!("Hotkey event: {:?} state={:?}", shortcut, event.state);
 
-                    let (recording, locked) = {
+                    let (mode, cancel_shortcut) = {
+                        let settings = app.state::<Mutex<Settings>>();
+                        let s = state::lock_or_recover(&settings);
+                        (s.hotkey_mode, commands::parse_hotkey(&s.cancel_hotkey).ok())
+                    };
+                    if cancel_shortcut.as_ref() == Some(shortcut) {
+                        if event.state == ShortcutState::Pressed {
+                            let _ = app.emit(events::REQUEST_CANCEL_RECORDING, ());
+                        }
+                        return;
+                    }
+
+                    let hotkey_event = match event.state {
+                        ShortcutState::Pressed => hotkey::HotkeyEvent::Pressed,
+                        ShortcutState::Released => hotkey::HotkeyEvent::Released,
+                    };
+                    let action = {
                         let state = app.state::<Mutex<AppState>>();
-                        let s = state::lock_or_recover(&state);
-                        (s.status == AppStatus::Recording, s.recording_locked)
+                        let mut s = state::lock_or_recover(&state);
+                        if s.hotkey_paused || s.capturing_hotkey {
+                            return;
+                        }
+                        let ctx = hotkey::HotkeyContext {
+                            mode,
+                            recording: s.status == AppStatus::Recording,
+                            locked: s.recording_locked,
+                            held_ms: s
+                                .recording_started_at
+                                .map(|t| t.elapsed().as_millis())
+                                .unwrap_or(0),
+                            key_down: s.key_down,
+                        };
+                        let (action, key_down) = hotkey::decide(hotkey_event, ctx);
+                        s.key_down = key_down;
+                        if action == hotkey::HotkeyAction::Lock {
+                            s.recording_locked = true;
+                        }
+                        action
                     };
 
-                    match event.state {
-                        ShortcutState::Pressed => {
-                            if recording && locked {
-                                // Pinned recording: a fresh press stops it.
-                                log::debug!("Hotkey PRESSED - stopping pinned recording");
-                                let _ = app.emit(events::REQUEST_STOP_RECORDING, ());
-                            } else if !recording {
-                                log::debug!("Hotkey PRESSED - starting recording");
-                                let _ = app.emit(events::REQUEST_START_RECORDING, ());
-                            }
-                            // recording && !locked: key-repeat while holding — ignore.
+                    match action {
+                        hotkey::HotkeyAction::Start => {
+                            let _ = app.emit(events::REQUEST_START_RECORDING, ());
                         }
-                        ShortcutState::Released => {
-                            if locked {
-                                // Pinned via the overlay button: keep recording
-                                // after the key is released.
-                                log::debug!("Hotkey RELEASED - recording pinned, ignoring");
-                            } else {
-                                log::debug!("Hotkey RELEASED - stopping recording");
-                                let _ = app.emit(events::REQUEST_STOP_RECORDING, ());
-                            }
+                        hotkey::HotkeyAction::Stop => {
+                            let _ = app.emit(events::REQUEST_STOP_RECORDING, ());
                         }
+                        hotkey::HotkeyAction::Lock => {
+                            log::info!("Tap: recording continues hands-free");
+                            let _ = app.emit(events::LOCK_CHANGED, true);
+                        }
+                        hotkey::HotkeyAction::Ignore => {}
                     }
                 })
                 .build(),
@@ -219,6 +248,7 @@ pub fn run() {
             // crashing" dialog; now it is a soft error with retries, and the
             // tray, settings and hotkey editor keep working.
             register_hotkey_with_retries(app.handle().clone(), hotkey_string);
+            commands::register_cancel_hotkey(app.handle(), &cancel_hotkey_string);
 
             // Make close button hide the window instead of destroying it
             if let Some(window) = app.get_webview_window("main") {
@@ -235,6 +265,12 @@ pub fn run() {
             let app_handle = app.handle().clone();
             app.listen(events::REQUEST_START_RECORDING, move |_event| {
                 start_recording_flow(&app_handle);
+            });
+
+            // Cancel: cancel hotkey, overlay X button, tray.
+            let app_handle = app.handle().clone();
+            app.listen(events::REQUEST_CANCEL_RECORDING, move |_event| {
+                cancel_recording(&app_handle);
             });
 
             // Stop requests: hotkey release, tray, overlay pin button.
@@ -293,6 +329,14 @@ pub fn run() {
             commands::open_models_dir,
             commands::get_hotkey,
             commands::set_hotkey,
+            commands::get_hotkey_mode,
+            commands::set_hotkey_mode,
+            commands::get_cancel_hotkey,
+            commands::set_cancel_hotkey,
+            commands::begin_hotkey_capture,
+            commands::end_hotkey_capture,
+            commands::set_hotkey_paused,
+            commands::cancel_recording,
             commands::get_sound_settings,
             commands::set_sound_settings,
             commands::test_sound,

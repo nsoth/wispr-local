@@ -77,6 +77,16 @@ body,
   color: #fff;
 }
 
+.overlay-cancel {
+  width: 22px;
+  height: 22px;
+}
+
+.overlay-cancel:hover {
+  background: rgba(239, 68, 68, 0.3);
+  color: #fecaca;
+}
+
 .overlay-pin:focus-visible {
   outline: 2px solid #fbbf24;
   outline-offset: 2px;

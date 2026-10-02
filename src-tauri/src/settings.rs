@@ -8,6 +8,7 @@
 //! rewrites the file only after the key was stored encrypted.
 
 use crate::formatting::{AiProvider, AiSettings};
+use crate::hotkey::HotkeyMode;
 use crate::secrets::{self, ApiKeys};
 use crate::text::{PasteSuffix, TextPipeline};
 use crate::transcription::engine::LanguageMode;
@@ -19,6 +20,13 @@ use std::path::{Path, PathBuf};
 pub struct Settings {
     #[serde(default = "default_hotkey")]
     pub hotkey: String,
+    /// Hold (push-to-talk), Toggle (press to start/stop) or Hybrid (hold,
+    /// or tap to go hands-free).
+    #[serde(default)]
+    pub hotkey_mode: HotkeyMode,
+    /// Discards the active recording. Empty disables the shortcut.
+    #[serde(default = "default_cancel_hotkey")]
+    pub cancel_hotkey: String,
     #[serde(default)]
     pub start_sound: String,
     #[serde(default)]
@@ -77,6 +85,8 @@ pub struct Settings {
 /// like `"model"` for `model_file` is otherwise silently ignored).
 const KNOWN_KEYS: &[&str] = &[
     "hotkey",
+    "hotkey_mode",
+    "cancel_hotkey",
     "start_sound",
     "stop_sound",
     "sound_volume",
@@ -102,6 +112,10 @@ fn default_hotkey() -> String {
     "Ctrl+Shift+Space".to_string()
 }
 
+fn default_cancel_hotkey() -> String {
+    "Ctrl+Shift+Backspace".to_string()
+}
+
 fn default_volume() -> f32 {
     0.5
 }
@@ -122,6 +136,8 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             hotkey: default_hotkey(),
+            hotkey_mode: HotkeyMode::default(),
+            cancel_hotkey: default_cancel_hotkey(),
             start_sound: String::new(),
             stop_sound: String::new(),
             sound_volume: default_volume(),
