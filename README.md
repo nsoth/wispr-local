@@ -26,6 +26,8 @@ Built with Tauri 2 (Rust + React). Windows 10/11 only.
   history and the clipboard on the next start. A supervisor process restarts the app after a native CUDA abort
   and falls back to the CPU for one run.
 - **History** of the last 100 dictations with time, target app and language; search, copy, paste again.
+- **Usage card**: dictations, words, minutes and the no-result rate for today and the last 7 days
+  (one JSON line per dictation in `stats.jsonl`).
 - **Chimes** on the current Windows default output device, separate start/stop volume, custom sound files.
 - **Tray**: start/stop (hands-free), cancel, language, AI formatting on/off, pause hotkey, restart on GPU,
   settings, log folder.
@@ -124,7 +126,9 @@ Spoken commands (between pauses): *новая строка* / *new line*, *но�
 - **Text**: spoken line breaks, what follows a paste (space / line break / nothing), restore clipboard, history
   retention (nothing / 20 / 100 / 500), the dictionary (*heard as → write as*, whole word, match case).
 - **Model**: switch and reload the Whisper model.
-- **AI formatting**: provider, key (stored encrypted; *Remove* forgets it), model, prompt (*Reset to default*).
+- **AI formatting**: provider, key (stored encrypted; *Remove* forgets it), model (with suggestions), prompt
+  (*Reset to default*), *Test* sends one small bilingual request and reports the latency or the provider's error.
+  The dictionary's spellings are passed to the model as a glossary.
 
 All of this lives in `%APPDATA%\wispr-local\WisprLocal\data\settings.json`. Editing it by hand is fine
 while the app is closed; a file that cannot be parsed is moved aside as `settings.json.corrupt-<time>` and

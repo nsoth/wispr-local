@@ -39,6 +39,7 @@ pub mod pipeline;
 pub mod secrets;
 pub mod settings;
 pub mod state;
+pub mod stats;
 pub mod supervisor;
 pub mod system;
 pub mod text;
@@ -369,6 +370,8 @@ pub fn run() {
             commands::get_input_device,
             commands::set_input_device,
             commands::probe_input_device,
+            commands::test_ai_connection,
+            commands::get_stats,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

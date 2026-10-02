@@ -678,6 +678,26 @@ pub fn set_ai_settings(
     Ok(ai_settings_view(&s, &app_state))
 }
 
+/// Settings → AI Formatting → Test: one tiny request with the stored key and
+/// model, reporting the latency or the provider's error message.
+#[tauri::command]
+pub async fn test_ai_connection(
+    settings: State<'_, Mutex<Settings>>,
+) -> Result<crate::formatting::ConnectionTest, String> {
+    let ai = {
+        let s = settings.lock().map_err(|e| e.to_string())?;
+        s.ai.clone()
+    };
+    crate::formatting::test_connection(&ai).await
+}
+
+/// Usage totals since `since_ms` (unix milliseconds) for the main window's
+/// "Today / 7 days" card.
+#[tauri::command]
+pub fn get_stats(since_ms: u64, config: State<'_, AppConfig>) -> crate::stats::StatsSummary {
+    crate::stats::summarize(&config.data_dir, since_ms)
+}
+
 /// The text post-processing section of Settings.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct TextSettings {

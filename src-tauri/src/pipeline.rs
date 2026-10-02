@@ -22,6 +22,7 @@ use crate::events;
 use crate::overlay::{hide_overlay, show_overlay_if_enabled};
 use crate::settings::{self, Settings};
 use crate::state::{self, lock_or_recover, AppState, AppStatus, HistoryEntry, ModelState};
+use crate::stats;
 use crate::system::focus::{self, PasteDecision};
 use crate::system::sounds::{SoundKind, SoundPlayer};
 use crate::system::tray::{TrayAnimator, TrayPhase};
@@ -549,6 +550,18 @@ pub enum Outcome {
 }
 
 impl Outcome {
+    /// Short name used in the usage stats file.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Outcome::Pasted => "pasted",
+            Outcome::CopiedToClipboard { .. } => "copied",
+            Outcome::TooShort => "too-short",
+            Outcome::NoSpeech => "no-speech",
+            Outcome::Failed => "failed",
+            Outcome::Cancelled => "cancelled",
+        }
+    }
+
     fn overlay(self) -> (&'static str, &'static str, u64) {
         match self {
             Outcome::Cancelled => ("Cancelled", "warn", 1200),
@@ -589,6 +602,21 @@ impl Outcome {
 /// The single exit of the stop pipeline: back to Idle, result shown in the
 /// pill for a moment, tray back to idle, overlay hidden afterwards unless a
 /// new recording has started in the meantime.
+/// Append one line to the usage stats; a failure is logged, never surfaced.
+fn record_stat(app: &tauri::AppHandle, outcome: &Outcome, audio_s: f64, words: u32, lang: &str) {
+    let data_dir = app.state::<AppConfig>().data_dir.clone();
+    let record = stats::StatRecord {
+        ts: HistoryEntry::now_ms(),
+        audio_s: audio_s as f32,
+        words,
+        outcome: outcome.label().to_string(),
+        lang: lang.to_string(),
+    };
+    if let Err(e) = stats::append(&data_dir, &record) {
+        log::warn!("Could not record usage stats: {e}");
+    }
+}
+
 fn finish_pipeline(app: &tauri::AppHandle, outcome: Outcome) {
     let (message, tone, linger_ms) = outcome.overlay();
     if let Some(reason) = outcome.empty_reason() {
@@ -931,6 +959,13 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
     const MIN_SAMPLES: usize = 8000; // 0.5s at 16kHz
     if samples.len() < MIN_SAMPLES {
         guard.disarm();
+        record_stat(
+            app,
+            &Outcome::TooShort,
+            samples.len() as f64 / 16000.0,
+            0,
+            "",
+        );
         finish_pipeline(app, Outcome::TooShort);
         return;
     }
@@ -970,6 +1005,7 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
         Err(e) => {
             log::error!("Transcription task failed: {e}");
             guard.disarm();
+            record_stat(app, &Outcome::Failed, audio_s, 0, "");
             finish_pipeline(app, Outcome::Failed);
             return;
         }
@@ -979,6 +1015,7 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
         Err(e) => {
             log::error!("Transcription failed: {}", e);
             guard.disarm();
+            record_stat(app, &Outcome::Failed, audio_s, 0, "");
             finish_pipeline(app, Outcome::Failed);
             return;
         }
@@ -1003,6 +1040,13 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
 
     if result.text.is_empty() {
         guard.disarm();
+        record_stat(
+            app,
+            &Outcome::NoSpeech,
+            audio_s,
+            0,
+            &result.language.to_string(),
+        );
         finish_pipeline(app, Outcome::NoSpeech);
         return;
     }
@@ -1012,15 +1056,25 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
 
     if text.is_empty() {
         guard.disarm();
+        record_stat(
+            app,
+            &Outcome::NoSpeech,
+            audio_s,
+            0,
+            &result.language.to_string(),
+        );
         finish_pipeline(app, Outcome::NoSpeech);
         return;
     }
 
     // AI formatting step
-    let ai_settings = {
+    let (ai_settings, glossary) = {
         let settings = app.state::<Mutex<Settings>>();
         let guard = lock_or_recover(&settings);
-        guard.ai.clone()
+        (
+            guard.ai.clone(),
+            formatting::glossary_from_rules(&guard.replacements),
+        )
     };
 
     let cancel_requested = lock_or_recover(&state).cancel_requested.clone();
@@ -1039,6 +1093,13 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
             history_limit,
         );
         guard.disarm();
+        record_stat(
+            app,
+            &Outcome::Cancelled,
+            audio_s,
+            stats::count_words(&text),
+            &result.language.to_string(),
+        );
         finish_pipeline(app, Outcome::Cancelled);
         let history = lock_or_recover(&state).history.clone();
         let _ = app.emit(events::HISTORY_CHANGED, &history);
@@ -1049,7 +1110,7 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
     let text = if ai_settings.is_active() {
         set_status(app, AppStatus::Formatting);
         emit_overlay_state(app, "processing", "Formatting", "");
-        match formatting::format_text(&text, &ai_settings).await {
+        match formatting::format_text(&text, &ai_settings, &glossary).await {
             Ok(formatted) => formatted,
             Err(e) => {
                 log::error!("AI formatting failed; using raw text: {e}");
@@ -1083,6 +1144,13 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
             history_limit,
         );
         guard.disarm();
+        record_stat(
+            app,
+            &Outcome::Cancelled,
+            audio_s,
+            stats::count_words(&text),
+            &result.language.to_string(),
+        );
         finish_pipeline(app, Outcome::Cancelled);
         let history = lock_or_recover(&state).history.clone();
         let _ = app.emit(events::HISTORY_CHANGED, &history);
@@ -1195,6 +1263,13 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
         result.dropped
     );
     guard.disarm();
+    record_stat(
+        app,
+        &outcome,
+        audio_s,
+        stats::count_words(&text),
+        &result.language.to_string(),
+    );
     finish_pipeline(app, outcome);
     let _ = app.emit(events::HISTORY_CHANGED, &history);
     let _ = app.emit(events::TRANSCRIPTION_COMPLETE, text);
@@ -1205,6 +1280,19 @@ mod tests {
     use super::{model_candidates, ArmedGuard, Outcome};
     use std::cell::Cell;
     use std::rc::Rc;
+
+    #[test]
+    fn outcome_labels_match_the_stats_vocabulary() {
+        use crate::stats::is_no_result;
+        assert!(is_no_result(Outcome::TooShort.label()));
+        assert!(is_no_result(Outcome::NoSpeech.label()));
+        assert!(is_no_result(Outcome::Failed.label()));
+        assert!(!is_no_result(Outcome::Pasted.label()));
+        assert!(!is_no_result(Outcome::Cancelled.label()));
+        assert!(!is_no_result(
+            Outcome::CopiedToClipboard { in_clipboard: true }.label()
+        ));
+    }
 
     #[test]
     fn candidates_start_with_the_requested_file_and_dedupe() {

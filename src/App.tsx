@@ -16,6 +16,49 @@ interface SoundSettings {
 type AiProvider = "none" | "openai" | "claude";
 
 // What the backend shows: never the key itself, only whether one is stored.
+interface AiConnectionTest {
+  latency_ms: number;
+  model: string;
+  sample: string;
+}
+
+interface StatsSummary {
+  dictations: number;
+  words: number;
+  audio_s: number;
+  no_result: number;
+}
+
+interface UsageStats {
+  today: StatsSummary;
+  week: StatsSummary;
+}
+
+const OPENAI_MODELS = ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4o"];
+const CLAUDE_MODELS = ["claude-haiku-4-5-20251001", "claude-sonnet-5-5", "claude-opus-5-5"];
+
+function fetchStats(): Promise<UsageStats> {
+  const dayStart = new Date();
+  dayStart.setHours(0, 0, 0, 0);
+  return Promise.all([
+    invoke<StatsSummary>("get_stats", { sinceMs: dayStart.getTime() }),
+    invoke<StatsSummary>("get_stats", { sinceMs: Date.now() - 7 * 86_400_000 }),
+  ]).then(([today, week]) => ({ today, week }));
+}
+
+function describeStats(s: StatsSummary): string {
+  if (s.dictations === 0) return "no dictations";
+  const parts = [
+    `${s.dictations} ${s.dictations === 1 ? "dictation" : "dictations"}`,
+    `${s.words} words`,
+    `${(s.audio_s / 60).toFixed(s.audio_s < 600 ? 1 : 0)} min`,
+  ];
+  if (s.no_result > 0) {
+    parts.push(`${Math.round((100 * s.no_result) / s.dictations)}% no result`);
+  }
+  return parts.join(" · ");
+}
+
 interface AiSettingsView {
   provider: AiProvider;
   enabled: boolean;
@@ -122,6 +165,11 @@ function App() {
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
   const [historyFilter, setHistoryFilter] = useState("");
+  const [stats, setStats] = useState<UsageStats | null>(null);
+  const [aiTest, setAiTest] = useState<{
+    status: "idle" | "running" | "ok" | "error";
+    text: string;
+  }>({ status: "idle", text: "" });
   const [expandedIndex, setExpandedIndex] = useState<number | null>(null);
   const [clock, setClock] = useState(() => Date.now());
   const [streamingPreview, setStreamingPreview] = useState("");
@@ -202,6 +250,7 @@ function App() {
     // State is registered before the windows exist, so these should never
     // fail; if the IPC bridge is not ready yet (observed on some cold starts),
     // retry with a short backoff before telling the user to restart.
+    fetchStats().then(setStats).catch(() => {});
     const RETRY_DELAYS = [300, 1000, 3000];
     const loadAll = (attempt: number) => Promise.allSettled([
       load<ModelState>("get_model_state", setModelState),
@@ -285,6 +334,7 @@ function App() {
     const unlisten2 = listen<HistoryEntry[]>(EVENTS.historyChanged, (event) => {
       setHistory(event.payload);
       setExpandedIndex(null);
+      fetchStats().then(setStats).catch(() => {});
     });
     // Relative timestamps age without any other event arriving.
     const clockTimer = setInterval(() => setClock(Date.now()), 30_000);
@@ -294,6 +344,7 @@ function App() {
     });
 
     const unlisten4 = listen<string>(EVENTS.transcriptionEmpty, (event) => {
+      fetchStats().then(setStats).catch(() => {});
       const messages: Record<string, string> = {
         "too-short": "Recording too short — nothing captured",
         "no-speech": "No speech detected — try again",
@@ -510,6 +561,23 @@ function App() {
       .catch((error) => setError(String(error)));
   };
 
+  // Saves a key that is still only typed, then sends one tiny request.
+  const testAiConnection = () => {
+    setAiTest({ status: "running", text: "" });
+    const draft = aiRef.current.draft;
+    const unsaved = draft.openai.trim() !== "" || draft.claude.trim() !== "";
+    const ready = unsaved ? flushAiSave() : Promise.resolve();
+    ready
+      .then(() => invoke<AiConnectionTest>("test_ai_connection"))
+      .then((r) =>
+        setAiTest({
+          status: "ok",
+          text: `OK · ${r.latency_ms} ms · ${r.model} · “${r.sample.slice(0, 60)}”`,
+        }),
+      )
+      .catch((error) => setAiTest({ status: "error", text: String(error) }));
+  };
+
   const openPath = (kind: "models" | "data" | "log") => {
     invoke("open_path", { kind }).catch((error) =>
       setError(`Could not open the folder: ${String(error)}`),
@@ -535,6 +603,7 @@ function App() {
   // the initial load never writes, so a stored key can never be wiped by a
   // page that has not seen it.
   const flushAiSave = () => {
+    clearTimeout(aiSaveTimer.current);
     const { view, draft } = aiRef.current;
     const update = {
       provider: view.provider,
@@ -545,7 +614,7 @@ function App() {
       openai_api_key: draft.openai.trim() ? draft.openai.trim() : undefined,
       claude_api_key: draft.claude.trim() ? draft.claude.trim() : undefined,
     };
-    invoke<AiSettingsView>("set_ai_settings", { update })
+    return invoke<AiSettingsView>("set_ai_settings", { update })
       .then((saved) => {
         aiRef.current = { view: saved, draft: { openai: "", claude: "" } };
         setAiSettings(saved);
@@ -982,6 +1051,19 @@ function App() {
               )}
             </div>
           </div>
+
+          {stats && (stats.today.dictations > 0 || stats.week.dictations > 0) && (
+            <div className="stats-card" aria-label="Usage">
+              <div className="stats-row">
+                <span className="stats-label">Today</span>
+                <span className="stats-value">{describeStats(stats.today)}</span>
+              </div>
+              <div className="stats-row">
+                <span className="stats-label">7 days</span>
+                <span className="stats-value">{describeStats(stats.week)}</span>
+              </div>
+            </div>
+          )}
 
           {history.length > 0 && (
             <div className="transcript-card">
@@ -1515,7 +1597,13 @@ function App() {
                     }
                     placeholder="gpt-4o-mini"
                     spellCheck={false}
+                    list="openai-models"
                   />
+                  <datalist id="openai-models">
+                    {OPENAI_MODELS.map((m) => (
+                      <option value={m} key={m} />
+                    ))}
+                  </datalist>
                 </div>
               </>
             )}
@@ -1559,7 +1647,13 @@ function App() {
                     }
                     placeholder="claude-haiku-4-5-20251001"
                     spellCheck={false}
+                    list="claude-models"
                   />
+                  <datalist id="claude-models">
+                    {CLAUDE_MODELS.map((m) => (
+                      <option value={m} key={m} />
+                    ))}
+                  </datalist>
                 </div>
               </>
             )}
@@ -1577,6 +1671,27 @@ function App() {
                     />
                     <span className="toggle-slider"></span>
                   </label>
+                </div>
+                <div className="setting-row">
+                  <span className="setting-label">Connection</span>
+                  <div className="key-controls">
+                    {aiTest.text && (
+                      <span
+                        className={`ai-test-result${aiTest.status === "error" ? " error" : ""}`}
+                        title={aiTest.text}
+                      >
+                        {aiTest.text}
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      className="sound-btn"
+                      onClick={testAiConnection}
+                      disabled={aiTest.status === "running"}
+                    >
+                      {aiTest.status === "running" ? "Testing…" : "Test"}
+                    </button>
+                  </div>
                 </div>
                 <div className="setting-row prompt-row">
                   <label className="setting-label" htmlFor="formatting-prompt">Prompt</label>
