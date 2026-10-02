@@ -88,6 +88,18 @@ impl Default for WhisperEngine {
     }
 }
 
+/// The abort callback handed to whisper.cpp: true aborts the pass.
+///
+/// whisper-rs 0.15.1's `set_abort_callback_safe` stores a `Box<Box<dyn FnMut>>`
+/// but instantiates its trampoline for the closure's own type, so the C side
+/// reads the flag through the bytes of a fat pointer: previews aborted at
+/// random with the flag clear ("whisper_full_with_state: failed to encode" on
+/// every tick in v0.2.1). The raw callback with the flag's address is exact.
+unsafe extern "C" fn abort_if_flag_set(user_data: *mut std::ffi::c_void) -> bool {
+    let flag = &*(user_data as *const AtomicBool);
+    flag.load(Ordering::Relaxed)
+}
+
 /// Whether to ask whisper.cpp for the GPU: only in a build that has the CUDA
 /// backend compiled in (the default feature), and never when the user or the
 /// supervisor set `WISPR_FORCE_CPU`. A CPU-only build would otherwise report
@@ -276,8 +288,13 @@ impl WhisperEngine {
             params.set_temperature_inc(0.0);
             params.set_audio_ctx(768);
         }
-        if let Some(abort) = options.abort.clone() {
-            params.set_abort_callback_safe(move || abort.load(Ordering::Relaxed));
+        if let Some(abort) = options.abort.as_ref() {
+            // SAFETY: the pointer targets the AtomicBool inside `options.abort`,
+            // an Arc that lives until this function returns, after `full()`.
+            unsafe {
+                params.set_abort_callback(Some(abort_if_flag_set));
+                params.set_abort_callback_user_data(Arc::as_ptr(abort) as *mut std::ffi::c_void);
+            }
         }
 
         let started = Instant::now();
@@ -675,6 +692,225 @@ mod tests {
         assert_eq!(pick_language(0.15, 0.85), "ru");
         // Clearly above the share threshold with Russian absent: English.
         assert_eq!(pick_language(0.14, 0.22), "en");
+    }
+
+    /// Needs the real model (and the GPU of this machine); not part of the
+    /// default run: `cargo test --release --lib -- --ignored passes_encode`.
+    /// Regression: v0.2.1 previews failed every tick with
+    /// "whisper_full_with_state: failed to encode" while the final pass worked.
+    #[test]
+    #[ignore]
+    fn preview_and_final_passes_encode_on_this_machine() {
+        use super::{LanguageMode, TranscribeOptions, WhisperEngine};
+        let model = std::env::var("WISPR_TEST_MODEL")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from(std::env::var("APPDATA").expect("APPDATA"))
+                    .join("wispr-local/WisprLocal/data/models/ggml-large-v3-turbo.bin")
+            });
+        assert!(model.exists(), "no model at {}", model.display());
+        let mut engine = WhisperEngine::new();
+        engine.load_model(&model).expect("model loads");
+        // Three seconds of a quiet, slowly pulsing tone: nothing to transcribe,
+        // but every pass must get through the encoder.
+        let samples: Vec<f32> = (0..16000 * 3)
+            .map(|i| {
+                let t = i as f32 / 16000.0;
+                let envelope = 0.5 + 0.5 * (2.0 * std::f32::consts::PI * 0.5 * t).sin();
+                0.05 * (2.0 * std::f32::consts::PI * 220.0 * t).sin() * envelope
+            })
+            .collect();
+        let preview = engine.transcribe(
+            &samples,
+            LanguageMode::English,
+            TranscribeOptions::preview(None),
+        );
+        assert!(preview.is_ok(), "preview pass: {preview:?}");
+        let final_pass = engine.transcribe(
+            &samples,
+            LanguageMode::English,
+            TranscribeOptions::final_pass(),
+        );
+        assert!(final_pass.is_ok(), "final pass: {final_pass:?}");
+        let again = engine.transcribe(
+            &samples,
+            LanguageMode::Auto,
+            TranscribeOptions::preview(None),
+        );
+        assert!(again.is_ok(), "preview after a final pass: {again:?}");
+        // The app always passes an abort flag to previews; a clear flag must
+        // not abort, a set flag must.
+        let clear = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let with_flag = engine.transcribe(
+            &samples,
+            LanguageMode::English,
+            TranscribeOptions::preview(Some(clear.clone())),
+        );
+        assert!(
+            with_flag.is_ok(),
+            "preview with a clear abort flag: {with_flag:?}"
+        );
+        clear.store(true, std::sync::atomic::Ordering::Relaxed);
+        let aborted = engine.transcribe(
+            &samples,
+            LanguageMode::English,
+            TranscribeOptions::preview(Some(clear.clone())),
+        );
+        assert!(
+            aborted.is_err(),
+            "a set abort flag must abort the pass: {aborted:?}"
+        );
+        // and the engine must still work afterwards
+        let after = engine.transcribe(
+            &samples,
+            LanguageMode::English,
+            TranscribeOptions::final_pass(),
+        );
+        assert!(after.is_ok(), "final pass after an abort: {after:?}");
+        // The streaming preview's exact sequence on a fresh engine: Auto
+        // language with the per-recording cache, abort flag clear, ten seconds
+        // of audio, several ticks in a row.
+        let mut fresh = WhisperEngine::new();
+        fresh.load_model(&model).expect("model loads");
+        let ten_s: Vec<f32> = samples.iter().cycle().take(16000 * 10).copied().collect();
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut cache: Option<&'static str> = None;
+        for tick in 0..3 {
+            let r = fresh.transcribe_cached(
+                &ten_s,
+                LanguageMode::Auto,
+                &mut cache,
+                TranscribeOptions::preview(Some(flag.clone())),
+            );
+            assert!(r.is_ok(), "preview tick {tick} like the app: {r:?}");
+        }
+    }
+
+    /// Bisection helper for the preview failure; prints one line per case.
+    /// `cargo test --release --lib -- --ignored --nocapture preview_matrix`
+    #[test]
+    #[ignore]
+    fn preview_matrix() {
+        use super::{LanguageMode, PassMode, TranscribeOptions, WhisperEngine};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let model = std::path::PathBuf::from(std::env::var("APPDATA").expect("APPDATA"))
+            .join("wispr-local/WisprLocal/data/models/ggml-large-v3-turbo.bin");
+        let tone = |secs: usize| -> Vec<f32> {
+            (0..16000 * secs)
+                .map(|i| {
+                    let t = i as f32 / 16000.0;
+                    let envelope = 0.5 + 0.5 * (2.0 * std::f32::consts::PI * 0.5 * t).sin();
+                    0.05 * (2.0 * std::f32::consts::PI * 220.0 * t).sin() * envelope
+                })
+                .collect()
+        };
+        let cases: Vec<(&str, usize, LanguageMode, bool, bool, bool)> = vec![
+            // name, seconds, language, with_flag, warm_up_final_first, preview_mode
+            (
+                "auto 10s flag none",
+                10,
+                LanguageMode::Auto,
+                false,
+                false,
+                true,
+            ),
+            (
+                "auto 10s flag clear",
+                10,
+                LanguageMode::Auto,
+                true,
+                false,
+                true,
+            ),
+            (
+                "en 10s flag clear",
+                10,
+                LanguageMode::English,
+                true,
+                false,
+                true,
+            ),
+            (
+                "en 3s flag clear",
+                3,
+                LanguageMode::English,
+                true,
+                false,
+                true,
+            ),
+            (
+                "auto 3s flag none",
+                3,
+                LanguageMode::Auto,
+                false,
+                false,
+                true,
+            ),
+            (
+                "auto 10s flag clear after final warm-up",
+                10,
+                LanguageMode::Auto,
+                true,
+                true,
+                true,
+            ),
+            (
+                "en 10s flag none",
+                10,
+                LanguageMode::English,
+                false,
+                false,
+                true,
+            ),
+            (
+                "en 10s final pass",
+                10,
+                LanguageMode::English,
+                false,
+                false,
+                false,
+            ),
+            (
+                "auto 10s final pass",
+                10,
+                LanguageMode::Auto,
+                false,
+                false,
+                false,
+            ),
+        ];
+        for (name, secs, language, with_flag, warm, preview) in cases {
+            let mut engine = WhisperEngine::new();
+            engine.load_model(&model).expect("model loads");
+            let audio = tone(secs);
+            if warm {
+                let _ = engine.transcribe(
+                    &audio,
+                    LanguageMode::English,
+                    TranscribeOptions::final_pass(),
+                );
+            }
+            let mut cache: Option<&'static str> = None;
+            let flag = Arc::new(AtomicBool::new(false));
+            let mut outcomes = Vec::new();
+            for _ in 0..2 {
+                let opts = if preview {
+                    TranscribeOptions::preview(if with_flag { Some(flag.clone()) } else { None })
+                } else {
+                    TranscribeOptions {
+                        mode: PassMode::Final,
+                        abort: None,
+                    }
+                };
+                let r = engine.transcribe_cached(&audio, language, &mut cache, opts);
+                outcomes.push(match r {
+                    Ok(res) => format!("ok({} chars)", res.text.chars().count()),
+                    Err(e) => format!("ERR[{e}]"),
+                });
+            }
+            eprintln!("MATRIX {name}: {}", outcomes.join(" | "));
+        }
     }
 
     #[test]
