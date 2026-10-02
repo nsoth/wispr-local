@@ -21,7 +21,7 @@ tauri-plugin-global-shortcut = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
 winreg = "0.52"
-whisper-rs = { version = "0.15", features = ["cuda", "log_backend"] }
+whisper-rs = { version = "0.15", features = ["log_backend"] }
 cpal = "0.15"
 enigo = "0.2"
 arboard = "3"
@@ -53,4 +53,9 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [features]
+default = ["cuda"]
+# GPU transcription through whisper.cpp's CUDA backend (needs the NVIDIA
+# toolkit at build time). `--no-default-features` builds the CPU-only
+# variant that CI compiles and tests.
+cuda = ["whisper-rs/cuda"]
 custom-protocol = ["tauri/custom-protocol"]

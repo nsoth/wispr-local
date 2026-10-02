@@ -88,6 +88,14 @@ impl Default for WhisperEngine {
     }
 }
 
+/// Whether to ask whisper.cpp for the GPU: only in a build that has the CUDA
+/// backend compiled in (the default feature), and never when the user or the
+/// supervisor set `WISPR_FORCE_CPU`. A CPU-only build would otherwise report
+/// "CUDA" for a context that silently ran on the CPU.
+fn gpu_requested(force_cpu_env: bool) -> bool {
+    cfg!(feature = "cuda") && !force_cpu_env
+}
+
 impl WhisperEngine {
     pub fn new() -> Self {
         Self {
@@ -102,7 +110,7 @@ impl WhisperEngine {
     pub fn load_model(&mut self, model_path: &Path) -> Result<(), String> {
         log::info!("Loading Whisper model from {:?}...", model_path);
         let path = model_path.to_str().ok_or("Invalid model path")?;
-        let force_cpu = std::env::var("WISPR_FORCE_CPU").is_ok();
+        let force_cpu = !gpu_requested(std::env::var("WISPR_FORCE_CPU").is_ok());
         let mut params = WhisperContextParameters::default();
         params.use_gpu(!force_cpu);
         if !force_cpu {
@@ -667,5 +675,19 @@ mod tests {
         assert_eq!(pick_language(0.15, 0.85), "ru");
         // Clearly above the share threshold with Russian absent: English.
         assert_eq!(pick_language(0.14, 0.22), "en");
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn gpu_is_requested_unless_forced_off() {
+        assert!(super::gpu_requested(false));
+        assert!(!super::gpu_requested(true));
+    }
+
+    #[test]
+    #[cfg(not(feature = "cuda"))]
+    fn cpu_build_never_requests_the_gpu() {
+        assert!(!super::gpu_requested(false));
+        assert!(!super::gpu_requested(true));
     }
 }

@@ -62,7 +62,6 @@ pub fn remove_stale_temp_files(dir: &Path) {
     }
 }
 
-#[cfg(windows)]
 fn replace_file(source: &Path, destination: &Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -87,11 +86,6 @@ fn replace_file(source: &Path, destination: &Path) -> Result<(), String> {
     } else {
         Ok(())
     }
-}
-
-#[cfg(not(windows))]
-fn replace_file(source: &Path, destination: &Path) -> Result<(), String> {
-    std::fs::rename(source, destination).map_err(|e| e.to_string())
 }
 
 /// Move a broken state file aside as `<name>.corrupt-<YYYYMMDD-HHMMSS>` so the

@@ -1,3 +1,7 @@
+//! The Tauri IPC surface: every `#[tauri::command]` the main window and the
+//! overlay invoke, plus the hotkey parsing and registration helpers that
+//! `setup()` shares with the Settings page.
+
 use std::sync::Mutex;
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
@@ -220,18 +224,12 @@ pub fn paste_history_item(
     Ok("copied".to_string())
 }
 
-#[cfg(windows)]
 fn activate_window(hwnd: isize) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{IsWindow, SetForegroundWindow};
     unsafe {
         let handle = hwnd as *mut core::ffi::c_void;
         IsWindow(handle) != 0 && SetForegroundWindow(handle) != 0
     }
-}
-
-#[cfg(not(windows))]
-fn activate_window(_hwnd: isize) -> bool {
-    false
 }
 
 #[tauri::command]

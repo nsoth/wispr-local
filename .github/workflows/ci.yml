@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# The daily binary is a local CUDA build (see README); CI builds the CPU
+# variant so the Rust and TypeScript code is checked on every push without
+# an NVIDIA toolkit.
+jobs:
+  check:
+    runs-on: windows-latest
+    env:
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install LLVM (bindgen for whisper.cpp)
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "$env:LIBCLANG_PATH\libclang.dll")) {
+            choco install llvm --no-progress -y
+          }
+
+      - name: Frontend
+        run: |
+          npm ci
+          npm run lint
+          npm run build
+
+      - name: Format
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+
+      - name: Clippy (CPU build)
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --no-default-features --all-targets
+
+      - name: Tests (CPU build)
+        run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --lib

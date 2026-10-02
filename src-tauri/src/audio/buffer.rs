@@ -1,3 +1,6 @@
+//! The shared sample buffer: the capture callback appends 16 kHz mono f32
+//! samples, the preview and final passes take snapshots. Bounded at 30 min.
+
 use std::sync::{Arc, Mutex};
 
 /// Keep recording memory bounded even when hands-free mode is left running.

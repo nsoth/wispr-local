@@ -1,3 +1,6 @@
+//! "Start with Windows": a value under `HKCU\...\CurrentVersion\Run` that
+//! points at this executable with `--hidden`.
+
 use winreg::enums::*;
 use winreg::RegKey;
 

@@ -21,6 +21,11 @@
 //! window's first IPC calls race an as-yet unmanaged state ("state not
 //! managed" → "Some settings could not be loaded" banner on ~1 in 4 starts).
 
+#[cfg(not(windows))]
+compile_error!(
+    "wispr-local is Windows-only: it relies on Win32 window regions, WASAPI, DPAPI and toast APIs"
+);
+
 pub mod audio;
 pub mod autostart;
 pub mod commands;

@@ -11,15 +11,11 @@
 /// How long a new instance waits for a previous one to finish exiting.
 const TEARDOWN_WAIT_MS: u32 = 10_000;
 
-#[cfg(windows)]
 struct InstanceMutex(windows_sys::Win32::Foundation::HANDLE);
 
-#[cfg(windows)]
 unsafe impl Send for InstanceMutex {}
-#[cfg(windows)]
 unsafe impl Sync for InstanceMutex {}
 
-#[cfg(windows)]
 impl Drop for InstanceMutex {
     fn drop(&mut self) {
         unsafe {
@@ -31,7 +27,6 @@ impl Drop for InstanceMutex {
 /// Returns true when this process is the only running instance (and now
 /// holds the guard), false when another instance already owns it and kept
 /// it for the whole wait.
-#[cfg(windows)]
 pub fn claim_single_instance() -> bool {
     use std::os::windows::ffi::OsStrExt;
     use std::sync::OnceLock;
@@ -63,9 +58,4 @@ pub fn claim_single_instance() -> bool {
         eprintln!("Previous instance released the guard; continuing");
     }
     INSTANCE_MUTEX.set(InstanceMutex(handle)).is_ok()
-}
-
-#[cfg(not(windows))]
-pub fn claim_single_instance() -> bool {
-    true
 }

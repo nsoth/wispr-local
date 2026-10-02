@@ -82,7 +82,9 @@ def draw_mic_icon(size, padding_ratio=0.15):
 
 
 def main():
-    icons_dir = os.path.join(os.path.dirname(__file__), "src-tauri", "icons")
+    # This script lives in scripts/; the icons belong to the Tauri crate.
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    icons_dir = os.path.join(repo_root, "src-tauri", "icons")
     os.makedirs(icons_dir, exist_ok=True)
 
     # Generate multiple sizes

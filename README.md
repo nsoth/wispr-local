@@ -1,30 +1,38 @@
 # Wispr Local
 
-Local, privacy-first voice-to-text dictation tool. Hold a hotkey, speak, and text appears wherever your cursor is. Powered by [Whisper.cpp](https://github.com/ggerganov/whisper.cpp) with optional AI formatting via OpenAI or Claude.
+Local, privacy-first voice-to-text dictation for Windows. Hold a hotkey, speak, release — the
+text is pasted wherever your cursor is. Powered by [whisper.cpp](https://github.com/ggerganov/whisper.cpp)
+(CUDA, with CPU fallback), with optional AI formatting through OpenAI or Claude.
+
+Built with Tauri 2 (Rust + React). Windows 10/11 only.
 
 ## Features
 
-- **Hold-to-dictate** global hotkey (customizable, default: `Ctrl+Shift+Space`)
-- **Local Whisper.cpp** transcription — no internet required for the core dictation loop
-- **CUDA GPU acceleration** for fast transcription
-- **Real-time streaming preview** while recording
-- **AI text formatting** (paragraphs, punctuation, bullet lists) via OpenAI or Claude (optional)
-- **Automatic filler word removal** (English + Russian)
-- **Recording overlay** — small always-on-top indicator above the taskbar (toggleable)
-- **Animated tray icon** pulses while recording
-- **Run on startup** — optional Windows autostart
-- **Custom start/stop recording sounds** with volume control
-- **Microphone selection** with default-device fallback and disconnect recovery
-- **Crash recovery** — a lightweight supervisor restarts the app after native CUDA failures
-- **Automatic CPU recovery** after a native CUDA fast-fail
-- **Encrypted API keys** using Windows Data Protection API (DPAPI)
-- Built with **Tauri v2** (Rust + React)
-
-## Language support
-
-Whisper transcription defaults to **Auto (Russian / English)**. Auto mode runs a constrained two-language detection pass, biased toward Russian when Russian speech is present. This avoids accidental Ukrainian / Belarusian / Polish decoding while still handling fully English dictation. You can pin Russian or English in Settings.
-
-Use a multilingual GGML model. English-only files ending in `.en.bin` cannot transcribe Russian and are intentionally skipped by model discovery.
+- **Hotkey dictation** with three modes: hold-to-talk (default), toggle, or hold-or-tap-for-hands-free.
+  Default `Ctrl+Shift+Space`; any combination, or a key that never types (F13–F24, Pause, ScrollLock).
+- **Cancel** a recording (default `Ctrl+Shift+Backspace`, the overlay's ×, or the tray) — nothing is pasted.
+- **Local whisper.cpp transcription**, no internet needed; `large-v3-turbo` by default, model picker in Settings.
+- **Russian / English** auto-detection constrained to those two languages (no Ukrainian/Polish drift), or pinned.
+- **Floating pill overlay** on the monitor you are working on: waveform, RU/EN badge, timer, pin, cancel; it stays
+  up through *Transcribing → Pasting → Pasted ✓* (or *No speech* / *Too short* / *Copied to clipboard*).
+- **Streaming preview** in the main window while you speak (only while the window is visible).
+- **Text pipeline**: filler removal (`эм`, `um`…), spoken line breaks (*"новая строка"*, *"new paragraph"*),
+  a user dictionary for terms Whisper transliterates (*"три джей эс"* → `Three.js`), optional trailing space.
+- **Paste safety**: the text goes only to the window that was focused when you released the key; if focus moved,
+  the window is elevated or the session locked, the transcript lands in the clipboard instead. The previous
+  clipboard content (text, HTML, files, images) is restored afterwards; transit writes are hidden from
+  Clipboard History and cloud sync.
+- **Crash insurance**: the audio of a recording is spooled to disk; after a crash it is transcribed into the
+  history and the clipboard on the next start. A supervisor process restarts the app after a native CUDA abort
+  and falls back to the CPU for one run.
+- **History** of the last 100 dictations with time, target app and language; search, copy, paste again.
+- **Chimes** on the current Windows default output device, separate start/stop volume, custom sound files.
+- **Tray**: start/stop (hands-free), cancel, language, AI formatting on/off, pause hotkey, restart on GPU,
+  settings, log folder.
+- **AI formatting** (optional) via OpenAI or Claude: punctuation, paragraphs, lists. Keys are DPAPI-encrypted
+  and never shown again in the UI; the dictation is sent wrapped so it cannot be mistaken for instructions.
+- **Diagnostics**: one log line per dictation with every stage's duration, a GPU watchdog that notices a
+  power-capped card, build identity in the log, startup banner for a broken settings file (never overwritten).
 
 ## Requirements
 
@@ -32,13 +40,11 @@ Use a multilingual GGML model. English-only files ending in `.en.bin` cannot tra
 - [Rust](https://rustup.rs/) 1.77+
 - [Node.js](https://nodejs.org/) 20+
 - [CMake](https://cmake.org/) 3.5+
-- [LLVM/Clang](https://releases.llvm.org/) (for whisper.cpp compilation)
-- [Visual Studio Build Tools 2022](https://visualstudio.microsoft.com/downloads/) with "Desktop development with C++" workload
-- NVIDIA GPU with CUDA toolkit (optional, for GPU acceleration)
+- [LLVM/Clang](https://releases.llvm.org/) (bindgen for whisper.cpp)
+- [Visual Studio Build Tools 2022](https://visualstudio.microsoft.com/downloads/) with "Desktop development with C++"
+- NVIDIA GPU + CUDA toolkit for the default (CUDA) build; see *CPU build* below otherwise
 
 ## Setup
-
-### 1. Clone and install dependencies
 
 ```bash
 git clone https://github.com/nsoth/wispr-local.git
@@ -46,112 +52,116 @@ cd wispr-local
 npm install
 ```
 
-### 2. Set environment variables
-
-whisper.cpp builds from source and needs CMake and LLVM:
+Put the environment in place (paths for this machine live in `scripts/build-env.ps1`; adjust them once):
 
 ```powershell
-$env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"
-$env:CMAKE = "C:\Program Files\CMake\bin\cmake.exe"
-$env:Path = "C:\Program Files\CMake\bin;$env:Path"
+. .\scripts\build-env.ps1
 ```
 
-Or use the included helper script:
+Download a multilingual GGML model, e.g. `ggml-large-v3-turbo.bin` from
+[huggingface.co/ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp/tree/main), into
 
-```powershell
-.\run-dev.ps1
+```
+%APPDATA%\wispr-local\WisprLocal\data\models\
 ```
 
-### 3. Download a Whisper model
+English-only `.en.bin` files are skipped on purpose (the app also handles Russian). Several models can
+coexist; pick one in *Settings → Model* (no restart needed).
 
-Download a GGML model to the app's data directory:
+## Build and run
 
-```powershell
-# Create the models directory
-$modelsDir = "$env:APPDATA\wispr-local\WisprLocal\data\models"
-New-Item -ItemType Directory -Force -Path $modelsDir
-
-# Recommended: large-v3-turbo (~1.6 GB, best speed/quality balance)
-Invoke-WebRequest -Uri "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin" -OutFile "$modelsDir\ggml-large-v3-turbo.bin"
-
-# Lower-memory fallback: multilingual base model (~142 MB)
-Invoke-WebRequest -Uri "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin" -OutFile "$modelsDir\ggml-base.bin"
-```
-
-### 4. Run in development mode
+Development (hot reload):
 
 ```powershell
 .\run-dev.ps1
-# or manually:
-npm run tauri dev
 ```
 
-## Usage
-
-1. The app starts minimized in the system tray
-2. **Hold** `Ctrl+Shift+Space` (or your custom hotkey) and speak
-3. **Release** the hotkey — your speech is transcribed and pasted into the focused text field
-4. Right-click the tray icon for more options
-
-### Settings
-
-Click **Settings** in the app window to configure:
-
-- **Hotkey** — rebind the hold-to-dictate global shortcut
-- **Sounds** — custom start/stop recording sounds, volume control
-- **Overlay** — show / hide the small recording indicator above the taskbar
-- **Microphone** — use the Windows default or choose a specific input device
-- **Run on startup** — launch the app automatically when Windows starts
-- **AI Formatting** — enable AI-powered text formatting:
-  - **OpenAI** — uses GPT models, requires API key
-  - **Claude** — uses Anthropic models, requires API key
-
-  When AI formatting is off (default), transcribed text is pasted as-is after filler-word cleanup.
-
-The core dictation loop stays local. Enabling OpenAI or Claude sends the transcript to that provider for formatting. API keys are encrypted for the current Windows user with DPAPI and migrated automatically from older plaintext settings. Other settings and the five-item transcription history are stored in the app data directory; history can be cleared from the main window.
-
-## Building for production
+Release executable (what the author runs daily; there is no installer):
 
 ```powershell
-npm run tauri build
+. .\scripts\build-env.ps1
+npm run build
+npx tauri build --no-bundle
+# → src-tauri\target\release\wispr-local.exe
 ```
 
-This creates an installer in `src-tauri/target/release/bundle/`.
+After changing anything under `src/`, delete `%LOCALAPPDATA%\com.wispr-local.app\EBWebView` while the
+app is stopped: WebView2 caches the bundled UI and would keep serving the old one.
 
-Run `npm run check` for the frontend build and Rust unit tests.
+Tests (release profile, shares the whisper.cpp build with the app):
 
-## Architecture
-
-```
-wispr-local/
-├── src/                          # React frontend
-│   ├── App.tsx                   # Main window UI (settings)
-│   ├── Overlay.tsx               # Compact recording indicator
-│   └── styles/                   # global.css, overlay.css
-├── src-tauri/                    # Rust backend
-│   └── src/
-│       ├── lib.rs                # App setup, recording / transcription flow
-│       ├── audio/                # Mic capture (cpal), resampling, buffer
-│       ├── transcription/        # Whisper engine and constrained ru/en detection
-│       ├── formatting.rs         # AI formatting (OpenAI / Claude)
-│       ├── system/               # Text injection, tray + animator, sounds
-│       ├── autostart.rs          # Windows Run-key autostart
-│       ├── settings.rs           # Persistent user settings
-│       ├── secrets.rs            # DPAPI-encrypted API-key storage
-│       ├── supervisor.rs         # Native crash logging and restart watchdog
-│       └── commands.rs           # Tauri IPC commands
+```powershell
+npm test
 ```
 
-## CUDA support
+### CPU build
 
-The project is configured with the `cuda` feature for GPU acceleration. If you don't have an NVIDIA GPU, keep native logging but remove CUDA in `Cargo.toml`:
+CUDA is a default Cargo feature. Without an NVIDIA toolkit:
 
-```toml
-whisper-rs = { version = "0.15", features = ["log_backend"] }
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --lib
+npx tauri build --no-bundle -- --no-default-features
 ```
 
-If CUDA initialization returns a regular error, the same process retries the model on CPU. If whisper.cpp terminates with its native CUDA fast-fail code, the supervisor restarts Wispr Local in CPU mode for the rest of that session. A clean application restart tries CUDA again.
+The app detects the backend at load time and shows it in the footer (`Model ready · CUDA · large-v3-turbo`).
+
+## Using it
+
+1. Focus the app you want to type into.
+2. Hold the hotkey and speak. The pill at the bottom of that monitor shows the waveform and the timer.
+3. Release. The pill shows *Transcribing…* and then *Pasted ✓*.
+
+Hands-free: click the pin in the pill (or tap the hotkey in *hybrid* mode, or start from the tray / the big
+microphone button); press the hotkey again (or click the stop square) to finish. The limit is 30 minutes.
+
+Spoken commands (between pauses): *новая строка* / *new line*, *новый абзац* / *new paragraph*.
+
+## Settings worth knowing
+
+- **General**: start with Windows, overlay on/off, hotkey mode, cancel key, language (Auto / Russian / English),
+  microphone (system default follows Windows; a renamed USB mic is still recognized).
+- **Sounds**: separate start/stop volume, custom files (peak-normalized), *Test* reports the output device.
+- **Text**: spoken line breaks, what follows a paste (space / line break / nothing), restore clipboard, history
+  retention (nothing / 20 / 100 / 500), the dictionary (*heard as → write as*, whole word, match case).
+- **Model**: switch and reload the Whisper model.
+- **AI formatting**: provider, key (stored encrypted; *Remove* forgets it), model, prompt (*Reset to default*).
+
+All of this lives in `%APPDATA%\wispr-local\WisprLocal\data\settings.json`. Editing it by hand is fine
+while the app is closed; a file that cannot be parsed is moved aside as `settings.json.corrupt-<time>` and
+reported in the window — it is never silently replaced.
+
+## Logs and troubleshooting
+
+- Log: `%APPDATA%\wispr-local\WisprLocal\data\wispr.log` (rotates into `.1`–`.3`); *Tray → Open log folder*.
+  Each dictation leaves one line like
+  `utt#12 audio=8.4s lock=1ms detect=180ms transcribe=620ms (rtf 0.10) format=0ms paste=410ms backend=CUDA lang=ru …`.
+- **"Transcription is running very slowly"**: the GPU is probably power-capped (laptop unplugged → sleep →
+  replugged). Check `nvidia-smi -q -d POWER`, replug or reboot.
+- **Running on the CPU** after a crash: the supervisor retries CUDA automatically on the next run, or use
+  *Tray → Restart on GPU*.
+- **Toasts** are sent under the app's own identity; if Windows shows none, check *Settings → Notifications →
+  Wispr Local*.
+- Environment variables: `WISPR_NO_SUPERVISOR=1` runs the app without the watchdog; `WISPR_FORCE_CPU=1` forces
+  the CPU backend; `RUST_LOG=debug` adds per-tick preview and hotkey lines to the log.
+- Data folder (settings, history, keys, models, log): *Settings → About → Open data folder*.
+
+## Project layout
+
+```
+src-tauri/src/
+  lib.rs            wiring: state, plugins, hotkey handler, listeners
+  pipeline.rs       start / preview / stop-transcribe-paste flows, model loader, overlay state
+  hotkey.rs         hold / toggle / hybrid state machine
+  overlay.rs        pill window placement and OS-level clipping
+  supervisor.rs     crash watchdog + restart policy + log rotation
+  settings.rs       settings.json (load never writes), secrets.rs (DPAPI keys), state.rs (history)
+  text.rs           fillers, spoken commands, paste suffix; transcription/replacements.rs (dictionary)
+  audio/            capture (cpal), device matching, sample buffer, crash spool
+  transcription/    whisper engine, language gate, hallucination filters
+  system/           chimes, text injection, focus/paste decisions, tray, toasts
+src/                React UI (App.tsx main window, Overlay.tsx pill, ipc.ts event contract)
+```
 
 ## License
 
-[MIT](LICENSE)
+MIT

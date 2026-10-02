@@ -1,3 +1,7 @@
+//! Optional AI formatting of the transcript through the OpenAI or Claude
+//! API: provider settings, the prompt wrapper that keeps the dictation from
+//! being read as instructions, bounded requests and output validation.
+
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
