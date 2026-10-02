@@ -62,6 +62,7 @@ interface TextSettings {
   paste_suffix: PasteSuffix;
   replacements: ReplacementRule[];
   restore_clipboard: boolean;
+  history_limit: number;
 }
 
 type HotkeyMode = "hold" | "toggle" | "hybrid";
@@ -130,12 +131,14 @@ function App() {
     paste_suffix: "space",
     replacements: [],
     restore_clipboard: true,
+    history_limit: 100,
   });
   const textRef = useRef<TextSettings>({
     voice_commands: true,
     paste_suffix: "space",
     replacements: [],
     restore_clipboard: true,
+    history_limit: 100,
   });
   const textSaveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const [modelFiles, setModelFiles] = useState<ModelFileInfo[]>([]);
@@ -1329,6 +1332,20 @@ function App() {
             </div>
             <div className="settings-note">
               Off keeps the transcript in the clipboard for a manual Ctrl+V.
+            </div>
+            <div className="setting-row">
+              <label className="setting-label" htmlFor="history-limit">Keep history</label>
+              <select
+                id="history-limit"
+                className="setting-select"
+                value={String(textSettings.history_limit)}
+                onChange={(e) => updateTextSettings({ history_limit: Number(e.target.value) })}
+              >
+                <option value="0">Nothing (private)</option>
+                <option value="20">Last 20</option>
+                <option value="100">Last 100</option>
+                <option value="500">Last 500</option>
+              </select>
             </div>
             <div className="dict-heading">
               <span className="setting-label">Dictionary</span>

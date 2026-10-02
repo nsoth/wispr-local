@@ -6,8 +6,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-/// Keep this many recent transcriptions for the in-app history.
+/// Default number of recent transcriptions kept in the in-app history.
 pub const HISTORY_LIMIT: usize = 100;
+/// Hard cap regardless of settings.
+pub const HISTORY_MAX: usize = 500;
 
 fn default_true() -> bool {
     true
@@ -204,12 +206,18 @@ impl AppState {
     /// Prepend a transcription to the history, keeping it deduplicated
     /// against the most recent entry and capped at HISTORY_LIMIT. Returns
     /// whether the history changed (so callers can skip a disk write).
-    pub fn push_history(&mut self, entry: HistoryEntry) -> bool {
+    pub fn push_history(&mut self, entry: HistoryEntry, limit: usize) -> bool {
+        let limit = limit.min(HISTORY_MAX);
+        if limit == 0 {
+            let had_entries = !self.history.is_empty();
+            self.history.clear();
+            return had_entries;
+        }
         if self.history.first().map(|e| e.text.as_str()) == Some(entry.text.as_str()) {
             return false;
         }
         self.history.insert(0, entry);
-        self.history.truncate(HISTORY_LIMIT);
+        self.history.truncate(limit);
         true
     }
 }
@@ -249,7 +257,7 @@ pub fn load_history_with_report(data_dir: &Path) -> (Vec<HistoryEntry>, Option<S
                     .collect(),
             };
             history.retain(|item| !item.text.trim().is_empty());
-            history.truncate(HISTORY_LIMIT);
+            history.truncate(HISTORY_MAX);
             (history, None)
         }
         Err(e) => {
@@ -404,12 +412,12 @@ mod tests {
     #[test]
     fn push_history_reports_whether_anything_changed() {
         let mut s = AppState::default();
-        assert!(s.push_history(entry("first")));
+        assert!(s.push_history(entry("first"), 100));
         assert!(
-            !s.push_history(entry("first")),
+            !s.push_history(entry("first"), 100),
             "duplicate of the newest entry"
         );
-        assert!(s.push_history(entry("second")));
+        assert!(s.push_history(entry("second"), 100));
         let texts: Vec<&str> = s.history.iter().map(|e| e.text.as_str()).collect();
         assert_eq!(texts, vec!["second", "first"]);
     }
@@ -418,12 +426,15 @@ mod tests {
     fn history_is_capped() {
         let mut s = AppState::default();
         for i in 0..(super::HISTORY_LIMIT + 10) {
-            s.push_history(entry(&format!("item {i}")));
+            s.push_history(entry(&format!("item {i}")), super::HISTORY_LIMIT);
         }
         assert_eq!(s.history.len(), super::HISTORY_LIMIT);
         assert_eq!(
             s.history[0].text,
             format!("item {}", super::HISTORY_LIMIT + 9)
         );
+        assert!(s.push_history(entry("gone"), 0), "limit 0 clears");
+        assert!(s.history.is_empty());
+        assert!(!s.push_history(entry("still gone"), 0));
     }
 }

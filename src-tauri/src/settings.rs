@@ -74,6 +74,9 @@ pub struct Settings {
     /// transcript in the clipboard).
     #[serde(default = "default_true")]
     pub restore_clipboard: bool,
+    /// How many dictations to keep in history.json (0 = none).
+    #[serde(default = "default_history_limit")]
+    pub history_limit: usize,
     /// Set when settings.json existed but could not be read at startup. Every
     /// save is refused until a restart so a transient IO error can never turn
     /// into "defaults written over the user's file".
@@ -102,7 +105,12 @@ const KNOWN_KEYS: &[&str] = &[
     "paste_suffix",
     "replacements",
     "restore_clipboard",
+    "history_limit",
 ];
+
+fn default_history_limit() -> usize {
+    crate::state::HISTORY_LIMIT
+}
 
 fn default_true() -> bool {
     true
@@ -153,6 +161,7 @@ impl Default for Settings {
             paste_suffix: PasteSuffix::default(),
             replacements: replacements::default_rules(),
             restore_clipboard: true,
+            history_limit: crate::state::HISTORY_LIMIT,
             read_only: false,
         }
     }
@@ -404,6 +413,7 @@ fn parse_settings(text: &str) -> Result<(Settings, Vec<String>), String> {
 /// Clamp and default values from older or hand-edited files.
 fn normalize(settings: &mut Settings) {
     settings.sound_volume = settings.sound_volume.clamp(0.0, 1.0);
+    settings.history_limit = settings.history_limit.min(crate::state::HISTORY_MAX);
     if settings.model_file.trim().is_empty() {
         settings.model_file = default_model_file();
     }

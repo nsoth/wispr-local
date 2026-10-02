@@ -688,10 +688,16 @@ pub struct TextSettings {
     pub replacements: Vec<crate::transcription::replacements::ReplacementRule>,
     #[serde(default = "default_true")]
     pub restore_clipboard: bool,
+    #[serde(default = "default_history_limit")]
+    pub history_limit: usize,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_history_limit() -> usize {
+    crate::state::HISTORY_LIMIT
 }
 
 #[tauri::command]
@@ -702,6 +708,7 @@ pub fn get_text_settings(settings: State<'_, Mutex<Settings>>) -> Result<TextSet
         paste_suffix: s.paste_suffix,
         replacements: s.replacements.clone(),
         restore_clipboard: s.restore_clipboard,
+        history_limit: s.history_limit,
     })
 }
 
@@ -716,6 +723,7 @@ pub fn set_text_settings(
     s.voice_commands = update.voice_commands;
     s.paste_suffix = update.paste_suffix;
     s.restore_clipboard = update.restore_clipboard;
+    s.history_limit = update.history_limit.min(crate::state::HISTORY_MAX);
     s.replacements = update
         .replacements
         .into_iter()

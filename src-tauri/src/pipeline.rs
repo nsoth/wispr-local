@@ -802,15 +802,23 @@ fn recover_spooled_recording(app: &tauri::AppHandle) {
         let state = app.state::<Mutex<AppState>>();
         let mut s = lock_or_recover(&state);
         s.last_transcription = text.clone();
-        s.push_history(HistoryEntry {
-            text: text.clone(),
-            ts: HistoryEntry::now_ms(),
-            target: String::new(),
-            lang: String::new(),
-            duration_s: audio_s as f32,
-            pasted: false,
-            hwnd: 0,
-        });
+        let limit = {
+            let settings = app.state::<Mutex<Settings>>();
+            let guard = lock_or_recover(&settings);
+            guard.history_limit
+        };
+        s.push_history(
+            HistoryEntry {
+                text: text.clone(),
+                ts: HistoryEntry::now_ms(),
+                target: String::new(),
+                lang: String::new(),
+                duration_s: audio_s as f32,
+                pasted: false,
+                hwnd: 0,
+            },
+            limit,
+        );
         let _ = state::save_history(&data_dir, &s.history);
         s.history.clone()
     };
@@ -931,7 +939,7 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
     let utterance = UTTERANCES.fetch_add(1, Ordering::Relaxed) + 1;
     log::info!("utt#{utterance}: transcribing {audio_s:.1}s of audio");
 
-    let (language, pipeline, paste_suffix, restore_clipboard, backend) = {
+    let (language, pipeline, paste_suffix, restore_clipboard, history_limit, backend) = {
         let settings = app.state::<Mutex<Settings>>();
         let guard = lock_or_recover(&settings);
         let backend = lock_or_recover(&state).model.backend().to_string();
@@ -940,6 +948,7 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
             guard.text_pipeline(),
             guard.paste_suffix,
             guard.restore_clipboard,
+            guard.history_limit,
             backend,
         )
     };
@@ -1017,15 +1026,18 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
     let cancel_requested = lock_or_recover(&state).cancel_requested.clone();
     if cancel_requested.load(Ordering::Relaxed) {
         log::info!("utt#{utterance}: cancelled before formatting; kept in history only");
-        lock_or_recover(&state).push_history(HistoryEntry {
-            text: text.clone(),
-            ts: HistoryEntry::now_ms(),
-            target: String::new(),
-            lang: result.language.to_string(),
-            duration_s: audio_s as f32,
-            pasted: false,
-            hwnd: 0,
-        });
+        lock_or_recover(&state).push_history(
+            HistoryEntry {
+                text: text.clone(),
+                ts: HistoryEntry::now_ms(),
+                target: String::new(),
+                lang: result.language.to_string(),
+                duration_s: audio_s as f32,
+                pasted: false,
+                hwnd: 0,
+            },
+            history_limit,
+        );
         guard.disarm();
         finish_pipeline(app, Outcome::Cancelled);
         let history = lock_or_recover(&state).history.clone();
@@ -1058,15 +1070,18 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
 
     if cancel_requested.load(Ordering::Relaxed) {
         log::info!("utt#{utterance}: cancelled before pasting; kept in history only");
-        lock_or_recover(&state).push_history(HistoryEntry {
-            text: text.clone(),
-            ts: HistoryEntry::now_ms(),
-            target: String::new(),
-            lang: result.language.to_string(),
-            duration_s: audio_s as f32,
-            pasted: false,
-            hwnd: 0,
-        });
+        lock_or_recover(&state).push_history(
+            HistoryEntry {
+                text: text.clone(),
+                ts: HistoryEntry::now_ms(),
+                target: String::new(),
+                lang: result.language.to_string(),
+                duration_s: audio_s as f32,
+                pasted: false,
+                hwnd: 0,
+            },
+            history_limit,
+        );
         guard.disarm();
         finish_pipeline(app, Outcome::Cancelled);
         let history = lock_or_recover(&state).history.clone();
@@ -1142,15 +1157,18 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
     let (history, save_error) = {
         let mut s = lock_or_recover(&state);
         s.last_transcription = text.clone();
-        let changed = s.push_history(HistoryEntry {
-            text: text.clone(),
-            ts: HistoryEntry::now_ms(),
-            target: now.as_ref().map(|t| t.describe()).unwrap_or_default(),
-            lang: result.language.to_string(),
-            duration_s: audio_s as f32,
-            pasted: outcome == Outcome::Pasted,
-            hwnd: now.as_ref().map(|t| t.hwnd).unwrap_or(0),
-        });
+        let changed = s.push_history(
+            HistoryEntry {
+                text: text.clone(),
+                ts: HistoryEntry::now_ms(),
+                target: now.as_ref().map(|t| t.describe()).unwrap_or_default(),
+                lang: result.language.to_string(),
+                duration_s: audio_s as f32,
+                pasted: outcome == Outcome::Pasted,
+                hwnd: now.as_ref().map(|t| t.hwnd).unwrap_or(0),
+            },
+            history_limit,
+        );
         let error = if changed {
             state::save_history(&data_dir, &s.history).err()
         } else {
