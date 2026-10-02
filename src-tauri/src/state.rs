@@ -18,6 +18,10 @@ pub enum AppStatus {
 pub struct AppState {
     pub status: AppStatus,
     pub model_loaded: bool,
+    /// "CUDA" or "CPU" once the model finishes loading; empty until then.
+    /// Mirrored here from the engine so UI queries never block on the engine
+    /// mutex (held for the full duration of a transcription).
+    pub compute_backend: String,
     pub last_transcription: String,
     pub device_sample_rate: u32,
     /// True while a hands-free (pinned) recording is active — the hotkey
@@ -32,6 +36,7 @@ impl Default for AppState {
         Self {
             status: AppStatus::Idle,
             model_loaded: false,
+            compute_backend: String::new(),
             last_transcription: String::new(),
             device_sample_rate: 48000,
             recording_locked: false,

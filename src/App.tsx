@@ -35,6 +35,10 @@ function App() {
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
   const [streamingPreview, setStreamingPreview] = useState("");
   const [modelLoaded, setModelLoaded] = useState(false);
+  // The model loads asynchronously on the backend; until we get a definitive
+  // result (initial query returning true, or the model-state-changed event) we
+  // show "Checking model..." instead of the false "Model not loaded" help.
+  const [modelReported, setModelReported] = useState(false);
   const [computeBackend, setComputeBackend] = useState("");
   const [modelsDir, setModelsDir] = useState("");
   const [hotkey, setHotkey] = useState("Ctrl+Shift+Space");
@@ -68,7 +72,12 @@ function App() {
       if (mounted) apply(value);
     };
     const initialLoad = Promise.allSettled([
-      load<boolean>("is_model_loaded", setModelLoaded),
+      load<boolean>("is_model_loaded", (value) => {
+        setModelLoaded(value);
+        // A positive result is definitive; a negative one may just mean the
+        // async load hasn't finished, so wait for model-state-changed.
+        if (value) setModelReported(true);
+      }),
       load<string>("get_compute_backend", setComputeBackend),
       load<string>("get_models_dir", setModelsDir),
       load<string>("get_hotkey", setHotkey),
@@ -130,6 +139,17 @@ function App() {
       noticeTimer = setTimeout(() => setNotice(""), 6000);
     });
 
+    // The model loads on a background thread; this fires once it finishes (or
+    // fails), flipping the footer indicator without a restart.
+    const unlisten6 = listen<{ loaded: boolean; backend: string }>(
+      "model-state-changed",
+      (event) => {
+        setModelLoaded(event.payload.loaded);
+        setComputeBackend(event.payload.backend);
+        setModelReported(true);
+      },
+    );
+
     return () => {
       mounted = false;
       void initialLoad;
@@ -138,6 +158,7 @@ function App() {
       unlisten3.then((fn) => fn());
       unlisten4.then((fn) => fn());
       unlisten5.then((fn) => fn());
+      unlisten6.then((fn) => fn());
       clearTimeout(noticeTimer);
       clearTimeout(copiedTimerRef.current);
     };
@@ -778,15 +799,23 @@ function App() {
       )}
 
       <div className="footer">
-        <div className={`model-indicator ${isLoading ? "" : modelLoaded ? "ok" : "err"}`}>
+        <div
+          className={`model-indicator ${
+            isLoading || (!modelReported && !modelLoaded)
+              ? ""
+              : modelLoaded
+                ? "ok"
+                : "err"
+          }`}
+        >
           <span className="dot" />
-          {isLoading
+          {isLoading || (!modelReported && !modelLoaded)
             ? "Checking model..."
             : modelLoaded
               ? `Model ready${computeBackend ? ` · ${computeBackend}` : ""}`
               : "Model not loaded"}
         </div>
-        {!isLoading && !modelLoaded && (
+        {!isLoading && modelReported && !modelLoaded && (
           <div className="model-help">
             Download <code>ggml-large-v3-turbo.bin</code> to:
             <span className="model-path">{modelsDir}</span>

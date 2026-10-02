@@ -116,15 +116,19 @@ pub fn run() {
             let user_settings = Settings::load(&config.data_dir);
             log::info!("Loaded hotkey setting: {}", user_settings.hotkey);
 
-            // Initialize Whisper engine. Try the configured model first, then
-            // fall back to older models so an incomplete download doesn't
-            // leave the app without transcription.
-            let mut engine = WhisperEngine::new();
-            let mut initial_state = AppState {
+            // Initialize an empty Whisper engine; the model is loaded on a
+            // background thread after state is registered (see below). Loading
+            // synchronously here — especially the slower CPU fallback after a
+            // GPU crash — let the frontend's initial queries race an as-yet
+            // unmanaged state and stick on a false "Model not loaded" banner.
+            let engine = WhisperEngine::new();
+            let initial_state = AppState {
                 history: state::load_history(&config.data_dir),
                 ..AppState::default()
             };
 
+            // Try the configured model first, then fall back to older models so
+            // an incomplete download doesn't leave the app without transcription.
             let mut candidates = vec![user_settings.model_file.clone()];
             for fallback in [
                 settings::default_model_file(),
@@ -139,33 +143,10 @@ pub fn run() {
                     candidates.push(discovered);
                 }
             }
-
-            for model_filename in &candidates {
-                let model_path = config.model_path(model_filename);
-                if !model_path.exists() {
-                    log::warn!("Model not found at {:?}", model_path);
-                    continue;
-                }
-                match engine.load_model(&model_path) {
-                    Ok(_) => {
-                        log::info!("Model loaded from {:?}", model_path);
-                        initial_state.model_loaded = true;
-                        break;
-                    }
-                    Err(e) => log::error!("Failed to load model {}: {}", model_filename, e),
-                }
-            }
-            if !initial_state.model_loaded {
-                log::error!(
-                    "No usable Whisper model found in {:?}. Download one to enable transcription.",
-                    config.models_dir
-                );
-            } else if std::env::var("WISPR_FORCE_CPU").is_ok() {
-                notify_user(
-                    app.handle(),
-                    "Wispr Local recovered from a GPU failure and is using CPU transcription until restart.",
-                );
-            }
+            // Resolve to full paths now, before `config` is moved into state.
+            let candidate_paths: Vec<std::path::PathBuf> =
+                candidates.iter().map(|name| config.model_path(name)).collect();
+            let models_dir = config.models_dir.clone();
 
             // Sync autostart state with saved settings
             if user_settings.run_on_startup {
@@ -188,6 +169,12 @@ pub fn run() {
             app.manage(config);
             app.manage(sound_player);
             app.manage(Mutex::new(user_settings.clone()));
+
+            // Load the model off-thread now that state is managed. Commands
+            // (is_model_loaded, get_compute_backend) read the mirrored fields in
+            // AppState, so the window never races an unmanaged state; the load
+            // result is pushed to the frontend via `model-state-changed`.
+            spawn_model_loader(app.handle().clone(), candidate_paths, models_dir);
 
             // Setup system tray (also manages TrayAnimator state).
             system::tray::setup_tray(app.handle())?;
@@ -769,6 +756,69 @@ fn notify_user(app: &tauri::AppHandle, message: &str) {
         .title("Wispr Local")
         .body(message)
         .show();
+}
+
+/// Payload for the `model-state-changed` event so the frontend can flip the
+/// footer indicator the moment the async model load finishes (or fails).
+#[derive(Clone, serde::Serialize)]
+struct ModelStatePayload {
+    loaded: bool,
+    backend: String,
+}
+
+/// Load the Whisper model on a background thread and mirror the result into
+/// AppState, then notify the frontend. Must be called only after the engine and
+/// AppState mutexes are managed. Tries each candidate path in order and stops at
+/// the first that loads.
+fn spawn_model_loader(
+    app: tauri::AppHandle,
+    candidate_paths: Vec<std::path::PathBuf>,
+    models_dir: std::path::PathBuf,
+) {
+    std::thread::spawn(move || {
+        let engine = app.state::<Mutex<WhisperEngine>>();
+        let mut loaded = false;
+        for path in &candidate_paths {
+            if !path.exists() {
+                log::warn!("Model not found at {:?}", path);
+                continue;
+            }
+            let result = engine.lock().unwrap().load_model(path);
+            match result {
+                Ok(_) => {
+                    log::info!("Model loaded from {:?}", path);
+                    loaded = true;
+                    break;
+                }
+                Err(e) => log::error!("Failed to load model {:?}: {}", path, e),
+            }
+        }
+
+        let backend = if loaded {
+            engine.lock().unwrap().compute_backend().to_string()
+        } else {
+            String::new()
+        };
+        {
+            let state = app.state::<Mutex<AppState>>();
+            let mut s = state.lock().unwrap();
+            s.model_loaded = loaded;
+            s.compute_backend = backend.clone();
+        }
+        let _ = app.emit("model-state-changed", ModelStatePayload { loaded, backend });
+
+        if !loaded {
+            log::error!(
+                "No usable Whisper model found in {:?}. Download one to enable transcription.",
+                models_dir
+            );
+        } else if std::env::var("WISPR_FORCE_CPU").is_ok() {
+            notify_user(
+                &app,
+                "Wispr Local recovered from a GPU failure and is using CPU transcription until restart.",
+            );
+        }
+    });
 }
 
 async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {

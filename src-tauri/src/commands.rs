@@ -6,7 +6,6 @@ use crate::config::AppConfig;
 use crate::settings::Settings;
 use crate::state::{AppState, AppStatus};
 use crate::system::sounds::SoundPlayer;
-use crate::transcription::engine::WhisperEngine;
 
 #[tauri::command]
 pub fn get_status(state: State<'_, Mutex<AppState>>) -> Result<String, String> {
@@ -22,16 +21,21 @@ pub fn get_status(state: State<'_, Mutex<AppState>>) -> Result<String, String> {
     Ok(status)
 }
 
+// Both read from AppState rather than the engine mutex: the model loads on a
+// background thread (so it's not ready at first paint), and the engine mutex is
+// held for the entire duration of a transcription — locking it here would stall
+// the UI. lib.rs mirrors the engine's loaded/backend state into AppState and
+// emits `model-state-changed` when the load finishes.
 #[tauri::command]
-pub fn is_model_loaded(engine: State<'_, Mutex<WhisperEngine>>) -> Result<bool, String> {
-    let eng = engine.lock().map_err(|e| e.to_string())?;
-    Ok(eng.is_loaded())
+pub fn is_model_loaded(state: State<'_, Mutex<AppState>>) -> Result<bool, String> {
+    let app_state = state.lock().map_err(|e| e.to_string())?;
+    Ok(app_state.model_loaded)
 }
 
 #[tauri::command]
-pub fn get_compute_backend(engine: State<'_, Mutex<WhisperEngine>>) -> Result<String, String> {
-    let eng = engine.lock().map_err(|e| e.to_string())?;
-    Ok(eng.compute_backend().to_string())
+pub fn get_compute_backend(state: State<'_, Mutex<AppState>>) -> Result<String, String> {
+    let app_state = state.lock().map_err(|e| e.to_string())?;
+    Ok(app_state.compute_backend.clone())
 }
 
 #[tauri::command]
