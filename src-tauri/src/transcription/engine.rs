@@ -19,6 +19,9 @@ pub enum LanguageMode {
     Russian,
     #[serde(rename = "en")]
     English,
+    /// Any value this build does not know; normalized to `Auto` after loading.
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 pub struct WhisperEngine {
@@ -126,7 +129,7 @@ impl WhisperEngine {
         let lang = match language {
             LanguageMode::Russian => "ru",
             LanguageMode::English => "en",
-            LanguageMode::Auto => match *lang_cache {
+            LanguageMode::Auto | LanguageMode::Unknown => match *lang_cache {
                 Some(cached) => cached,
                 None => {
                     let detected = detect_ru_or_en(&mut state, &audio)?;

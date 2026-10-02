@@ -12,12 +12,31 @@ interface SoundSettings {
   stop_volume: number;
 }
 
-interface AiSettings {
-  provider: "none" | "openai" | "claude";
-  api_key: string;
+type AiProvider = "none" | "openai" | "claude";
+
+// What the backend shows: never the key itself, only whether one is stored.
+interface AiSettingsView {
+  provider: AiProvider;
   openai_model: string;
   claude_model: string;
   prompt: string;
+  openai_key_set: boolean;
+  claude_key_set: boolean;
+  key_error: string | null;
+}
+
+interface StartupDiagnostics {
+  settings_error: string | null;
+  settings_read_only: boolean;
+  unknown_settings_keys: string[];
+  history_error: string | null;
+  api_key_error: string | null;
+}
+
+type NoticeKind = "info" | "error";
+interface Notice {
+  text: string;
+  kind: NoticeKind;
 }
 
 interface InputDeviceInfo {
@@ -32,7 +51,9 @@ type LanguageMode = "auto" | "ru" | "en";
 function App() {
   const [status, setStatus] = useState<AppStatus>(IDLE_STATUS);
   const [isLoading, setIsLoading] = useState(true);
-  const [notice, setNotice] = useState("");
+  const [notice, setNoticeState] = useState<Notice | null>(null);
+  const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const [diagnostics, setDiagnostics] = useState<string[]>([]);
   const [history, setHistory] = useState<string[]>([]);
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
   const [streamingPreview, setStreamingPreview] = useState("");
@@ -60,15 +81,34 @@ function App() {
   const [inputDevices, setInputDevices] = useState<InputDeviceInfo[]>([]);
   const [inputDevice, setInputDevice] = useState("");
   const [refreshingDevices, setRefreshingDevices] = useState(false);
-  const [aiSettingsLoaded, setAiSettingsLoaded] = useState(false);
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  const [aiSettings, setAiSettings] = useState<AiSettings>({
+  const [aiSettings, setAiSettings] = useState<AiSettingsView>({
     provider: "none",
-    api_key: "",
     openai_model: "gpt-4o-mini",
     claude_model: "claude-haiku-4-5-20251001",
     prompt: "",
+    openai_key_set: false,
+    claude_key_set: false,
+    key_error: null,
   });
+  // Keys typed but not yet saved; cleared after a successful save.
+  const [aiKeyDraft, setAiKeyDraft] = useState({ openai: "", claude: "" });
+  const aiRef = useRef({ view: aiSettings, draft: { openai: "", claude: "" } });
+  const aiSaveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+
+  // Info notices clear themselves; errors stay until dismissed or replaced.
+  const setNotice = (text: string, kind: NoticeKind = "info") => {
+    clearTimeout(noticeTimerRef.current);
+    if (!text) {
+      setNoticeState(null);
+      return;
+    }
+    setNoticeState({ text, kind });
+    if (kind === "info") {
+      noticeTimerRef.current = setTimeout(() => setNoticeState(null), 5000);
+    }
+  };
+  const setError = (text: string) => setNotice(text, "error");
 
   useEffect(() => {
     let mounted = true;
@@ -99,9 +139,24 @@ function App() {
           stopVolume: sound.stop_volume,
         };
       }),
-      load<AiSettings>("get_ai_settings", (ai) => {
+      load<AiSettingsView>("get_ai_settings", (ai) => {
         setAiSettings(ai);
-        setAiSettingsLoaded(true);
+        aiRef.current.view = ai;
+      }),
+      load<StartupDiagnostics>("get_startup_diagnostics", (d) => {
+        const problems: string[] = [];
+        if (d.settings_error) problems.push(d.settings_error);
+        if (d.settings_read_only) {
+          problems.push("Settings cannot be saved until Wispr Local is restarted.");
+        }
+        if (d.unknown_settings_keys.length > 0) {
+          problems.push(
+            `settings.json has keys this build does not know: ${d.unknown_settings_keys.join(", ")}`,
+          );
+        }
+        if (d.history_error) problems.push(d.history_error);
+        if (d.api_key_error) problems.push(`API keys could not be decrypted: ${d.api_key_error}`);
+        setDiagnostics(problems);
       }),
       load<boolean>("get_autostart", setAutostart),
       load<boolean>("get_show_overlay", setShowOverlay),
@@ -112,7 +167,7 @@ function App() {
     ]).then((results) => {
       if (!mounted) return;
       if (results.some((result) => result.status === "rejected")) {
-        setNotice("Some settings could not be loaded. Restart Wispr Local if this persists.");
+        setError("Some settings could not be loaded. Restart Wispr Local if this persists.");
       }
       setIsLoading(false);
     });
@@ -132,7 +187,6 @@ function App() {
       setStreamingPreview(event.payload);
     });
 
-    let noticeTimer: ReturnType<typeof setTimeout> | undefined;
     const unlisten4 = listen<string>(EVENTS.transcriptionEmpty, (event) => {
       const messages: Record<string, string> = {
         "too-short": "Recording too short — nothing captured",
@@ -140,14 +194,10 @@ function App() {
         error: "Transcription failed — check logs",
       };
       setNotice(messages[event.payload] ?? "Nothing transcribed");
-      clearTimeout(noticeTimer);
-      noticeTimer = setTimeout(() => setNotice(""), 4000);
     });
 
     const unlisten5 = listen<string>(EVENTS.operationNotice, (event) => {
       setNotice(event.payload);
-      clearTimeout(noticeTimer);
-      noticeTimer = setTimeout(() => setNotice(""), 6000);
     });
 
     // The model loads on a background thread; this fires once it finishes (or
@@ -170,23 +220,14 @@ function App() {
       unlisten4.then((fn) => fn());
       unlisten5.then((fn) => fn());
       unlisten6.then((fn) => fn());
-      clearTimeout(noticeTimer);
+      clearTimeout(noticeTimerRef.current);
       clearTimeout(copiedTimerRef.current);
       clearTimeout(soundSaveTimer.current);
+      clearTimeout(aiSaveTimer.current);
     };
+    // setNotice/setError are stable closures over refs and state setters.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  // Text fields should feel immediate without rewriting settings.json on
-  // every keystroke. Provider changes are included in the same short debounce.
-  useEffect(() => {
-    if (!aiSettingsLoaded) return;
-    const timer = setTimeout(() => {
-      invoke("set_ai_settings", { ai: aiSettings }).catch((error) =>
-        setNotice(`Could not save AI settings: ${String(error)}`),
-      );
-    }, 450);
-    return () => clearTimeout(timer);
-  }, [aiSettings, aiSettingsLoaded]);
 
   const keyCodeToName = (e: KeyboardEvent): string | null => {
     const key = e.key;
@@ -266,9 +307,66 @@ function App() {
     }
   }, [isCapturingHotkey, handleHotkeyCapture]);
 
-  const updateAiSettings = (updates: Partial<AiSettings>) => {
-    const newSettings = { ...aiSettings, ...updates };
-    setAiSettings(newSettings);
+  // AI settings are saved 450 ms after the last edit, and only after an edit:
+  // the initial load never writes, so a stored key can never be wiped by a
+  // page that has not seen it.
+  const flushAiSave = () => {
+    const { view, draft } = aiRef.current;
+    const update = {
+      provider: view.provider,
+      openai_model: view.openai_model,
+      claude_model: view.claude_model,
+      prompt: view.prompt,
+      openai_api_key: draft.openai.trim() ? draft.openai.trim() : undefined,
+      claude_api_key: draft.claude.trim() ? draft.claude.trim() : undefined,
+    };
+    invoke<AiSettingsView>("set_ai_settings", { update })
+      .then((saved) => {
+        aiRef.current = { view: saved, draft: { openai: "", claude: "" } };
+        setAiSettings(saved);
+        setAiKeyDraft({ openai: "", claude: "" });
+      })
+      .catch((error) => setError(`Could not save AI settings: ${String(error)}`));
+  };
+
+  const scheduleAiSave = () => {
+    clearTimeout(aiSaveTimer.current);
+    aiSaveTimer.current = setTimeout(flushAiSave, 450);
+  };
+
+  const updateAiSettings = (updates: Partial<AiSettingsView>) => {
+    const next = { ...aiRef.current.view, ...updates };
+    aiRef.current.view = next;
+    setAiSettings(next);
+    scheduleAiSave();
+  };
+
+  const updateKeyDraft = (provider: "openai" | "claude", value: string) => {
+    const next = { ...aiRef.current.draft, [provider]: value };
+    aiRef.current.draft = next;
+    setAiKeyDraft(next);
+    scheduleAiSave();
+  };
+
+  const removeApiKey = (provider: "openai" | "claude") => {
+    clearTimeout(aiSaveTimer.current);
+    const view = aiRef.current.view;
+    const update = {
+      provider: view.provider,
+      openai_model: view.openai_model,
+      claude_model: view.claude_model,
+      prompt: view.prompt,
+      openai_api_key: provider === "openai" ? "" : undefined,
+      claude_api_key: provider === "claude" ? "" : undefined,
+    };
+    invoke<AiSettingsView>("set_ai_settings", { update })
+      .then((saved) => {
+        aiRef.current = { view: saved, draft: { openai: "", claude: "" } };
+        setAiSettings(saved);
+        setAiKeyDraft({ openai: "", claude: "" });
+        setNotice("API key removed");
+      })
+      .catch((error) => setError(`Could not remove the key: ${String(error)}`));
   };
 
   // Saves only run from explicit user edits (never from the initial load), so
@@ -291,7 +389,7 @@ function App() {
       startVolume: newStartVolume,
       stopVolume: newStopVolume,
     }).catch((error) => {
-      setNotice(`Could not save sound settings: ${String(error)}`);
+      setError(`Could not save sound settings: ${String(error)}`);
     });
   };
 
@@ -343,7 +441,7 @@ function App() {
   const testSound = (which: "start" | "stop", volume: number) => {
     invoke<string>("test_sound", { which, volume })
       .then((device) => setNotice(`Played on ${device}`))
-      .catch((error) => setNotice(`Could not play sound: ${String(error)}`));
+      .catch((error) => setError(`Could not play sound: ${String(error)}`));
   };
 
   const fileName = (path: string) => {
@@ -359,7 +457,7 @@ function App() {
         clearTimeout(copiedTimerRef.current);
         copiedTimerRef.current = setTimeout(() => setCopiedIndex(null), 1500);
       })
-      .catch((error) => setNotice(`Copy failed: ${String(error)}`));
+      .catch((error) => setError(`Copy failed: ${String(error)}`));
   };
 
   const clearHistory = async () => {
@@ -369,7 +467,7 @@ function App() {
       setHistory([]);
       setNotice("History cleared");
     } catch (error) {
-      setNotice(`Could not clear history: ${String(error)}`);
+      setError(`Could not clear history: ${String(error)}`);
     }
   };
 
@@ -382,7 +480,7 @@ function App() {
       await invoke(command, args);
     } catch (error) {
       rollback();
-      setNotice(`Could not save setting: ${String(error)}`);
+      setError(`Could not save setting: ${String(error)}`);
     }
   };
 
@@ -391,7 +489,7 @@ function App() {
     try {
       setInputDevices(await invoke<InputDeviceInfo[]>("get_input_devices"));
     } catch (error) {
-      setNotice(`Could not refresh microphones: ${String(error)}`);
+      setError(`Could not refresh microphones: ${String(error)}`);
     } finally {
       setRefreshingDevices(false);
     }
@@ -422,9 +520,26 @@ function App() {
         </button>
       </div>
 
+      {diagnostics.map((problem) => (
+        <div className="notice-banner error" role="alert" key={problem}>
+          {problem}
+        </div>
+      ))}
+
       {notice && (
-        <div className="notice-banner" role="alert">
-          {notice}
+        <div
+          className={`notice-banner ${notice.kind}`}
+          role={notice.kind === "error" ? "alert" : "status"}
+        >
+          <span>{notice.text}</span>
+          <button
+            type="button"
+            className="notice-close"
+            onClick={() => setNotice("")}
+            aria-label="Dismiss notice"
+          >
+            ×
+          </button>
         </div>
       )}
 
@@ -598,7 +713,7 @@ function App() {
                   setLanguage(lang);
                   invoke("set_language", { language: lang }).catch((error) => {
                     setLanguage(previous);
-                    setNotice(`Could not save language: ${String(error)}`);
+                    setError(`Could not save language: ${String(error)}`);
                   });
                 }}
               >
@@ -620,7 +735,7 @@ function App() {
                     setInputDevice(next);
                     invoke("set_input_device", { inputDevice: next }).catch((error) => {
                       setInputDevice(previous);
-                      setNotice(`Could not save microphone: ${String(error)}`);
+                      setError(`Could not save microphone: ${String(error)}`);
                     });
                   }}
                 >
@@ -751,7 +866,7 @@ function App() {
                 value={aiSettings.provider}
                 onChange={(e) =>
                   updateAiSettings({
-                    provider: e.target.value as AiSettings["provider"],
+                    provider: e.target.value as AiProvider,
                   })
                 }
               >
@@ -765,18 +880,28 @@ function App() {
               <>
                 <div className="setting-row">
                   <label className="setting-label" htmlFor="openai-api-key">API Key</label>
-                  <input
-                    id="openai-api-key"
-                    className="setting-input"
-                    type="password"
-                    value={aiSettings.api_key}
-                    onChange={(e) =>
-                      updateAiSettings({ api_key: e.target.value })
-                    }
-                    placeholder="sk-..."
-                    autoComplete="off"
-                    spellCheck={false}
-                  />
+                  <div className="key-controls">
+                    <input
+                      id="openai-api-key"
+                      className="setting-input"
+                      type="password"
+                      value={aiKeyDraft.openai}
+                      onChange={(e) => updateKeyDraft("openai", e.target.value)}
+                      placeholder={aiSettings.openai_key_set ? "Key stored · type to replace" : "sk-..."}
+                      autoComplete="off"
+                      spellCheck={false}
+                    />
+                    {aiSettings.openai_key_set && (
+                      <button
+                        type="button"
+                        className="sound-btn"
+                        onClick={() => removeApiKey("openai")}
+                        title="Forget the stored OpenAI key"
+                      >
+                        Remove
+                      </button>
+                    )}
+                  </div>
                 </div>
                 <div className="setting-row">
                   <label className="setting-label" htmlFor="openai-model">Model</label>
@@ -799,18 +924,28 @@ function App() {
               <>
                 <div className="setting-row">
                   <label className="setting-label" htmlFor="claude-api-key">API Key</label>
-                  <input
-                    id="claude-api-key"
-                    className="setting-input"
-                    type="password"
-                    value={aiSettings.api_key}
-                    onChange={(e) =>
-                      updateAiSettings({ api_key: e.target.value })
-                    }
-                    placeholder="sk-ant-..."
-                    autoComplete="off"
-                    spellCheck={false}
-                  />
+                  <div className="key-controls">
+                    <input
+                      id="claude-api-key"
+                      className="setting-input"
+                      type="password"
+                      value={aiKeyDraft.claude}
+                      onChange={(e) => updateKeyDraft("claude", e.target.value)}
+                      placeholder={aiSettings.claude_key_set ? "Key stored · type to replace" : "sk-ant-..."}
+                      autoComplete="off"
+                      spellCheck={false}
+                    />
+                    {aiSettings.claude_key_set && (
+                      <button
+                        type="button"
+                        className="sound-btn"
+                        onClick={() => removeApiKey("claude")}
+                        title="Forget the stored Claude key"
+                      >
+                        Remove
+                      </button>
+                    )}
+                  </div>
                 </div>
                 <div className="setting-row">
                   <label className="setting-label" htmlFor="claude-model">Model</label>
@@ -844,8 +979,14 @@ function App() {
                     placeholder="Custom formatting instructions..."
                   />
                 </div>
+                {aiSettings.key_error && (
+                  <div className="settings-note error">
+                    Stored keys could not be decrypted ({aiSettings.key_error}). Enter the key again.
+                  </div>
+                )}
                 <div className="settings-note">
-                  API key encrypted for your Windows account. Transcripts are sent only when AI formatting is enabled.
+                  Keys are encrypted for your Windows account and never shown again. Transcripts
+                  are sent only when AI formatting is enabled.
                 </div>
               </>
             )}
@@ -881,7 +1022,7 @@ function App() {
                 disabled={!modelsDir}
                 onClick={() =>
                   invoke("open_models_dir").catch((error) =>
-                    setNotice(`Could not open model folder: ${String(error)}`),
+                    setError(`Could not open model folder: ${String(error)}`),
                   )
                 }
               >

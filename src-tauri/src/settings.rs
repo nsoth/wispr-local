@@ -1,10 +1,21 @@
-use crate::formatting::AiSettings;
+//! Persisted user settings (`settings.json` in the data directory).
+//!
+//! Loading never writes the file back: a file that cannot be decoded or
+//! parsed is moved aside as `settings.json.corrupt-<timestamp>` and reported
+//! through [`SettingsLoad`], and an unreadable file leaves the in-memory
+//! defaults marked read-only so no setter can overwrite bytes we never saw.
+//! The one exception is the migration of a legacy plaintext `api_key`, which
+//! rewrites the file only after the key was stored encrypted.
+
+use crate::formatting::{AiProvider, AiSettings};
+use crate::secrets::{self, ApiKeys};
 use crate::transcription::engine::LanguageMode;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
+    #[serde(default = "default_hotkey")]
     pub hotkey: String,
     #[serde(default)]
     pub start_sound: String,
@@ -38,6 +49,32 @@ pub struct Settings {
     /// device name selected by the user.
     #[serde(default)]
     pub input_device: String,
+    /// Set when settings.json existed but could not be read at startup. Every
+    /// save is refused until a restart so a transient IO error can never turn
+    /// into "defaults written over the user's file".
+    #[serde(skip)]
+    pub read_only: bool,
+}
+
+/// Top-level keys this build understands; anything else is reported (a typo
+/// like `"model"` for `model_file` is otherwise silently ignored).
+const KNOWN_KEYS: &[&str] = &[
+    "hotkey",
+    "start_sound",
+    "stop_sound",
+    "sound_volume",
+    "start_volume",
+    "stop_volume",
+    "ai",
+    "run_on_startup",
+    "show_overlay",
+    "model_file",
+    "language",
+    "input_device",
+];
+
+fn default_hotkey() -> String {
+    "Ctrl+Shift+Space".to_string()
 }
 
 fn default_volume() -> f32 {
@@ -59,7 +96,7 @@ pub fn default_model_file() -> String {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            hotkey: "Ctrl+Shift+Space".to_string(),
+            hotkey: default_hotkey(),
             start_sound: String::new(),
             stop_sound: String::new(),
             sound_volume: default_volume(),
@@ -71,8 +108,41 @@ impl Default for Settings {
             model_file: default_model_file(),
             language: LanguageMode::default(),
             input_device: String::new(),
+            read_only: false,
         }
     }
+}
+
+/// Result of [`Settings::load_with_report`].
+#[derive(Debug)]
+pub struct SettingsLoad {
+    pub settings: Settings,
+    /// Human-readable problem with settings.json, if any.
+    pub error: Option<String>,
+    pub read_only: bool,
+    pub unknown_keys: Vec<String>,
+    /// Problem decrypting the stored API keys, if any.
+    pub api_key_error: Option<String>,
+}
+
+/// What the Settings page sends when the AI section changes. Key fields are
+/// `None` when untouched, `Some("")` to remove a key, `Some(key)` to replace.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AiSettingsUpdate {
+    pub provider: AiProvider,
+    pub openai_model: String,
+    pub claude_model: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub openai_api_key: Option<String>,
+    #[serde(default)]
+    pub claude_api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AiChange {
+    pub keys_changed: bool,
+    pub settings_changed: bool,
 }
 
 impl Settings {
@@ -108,72 +178,217 @@ impl Settings {
         }
     }
 
+    /// Apply an AI-settings update from the UI. Pure: nothing is written.
+    pub fn apply_ai_update(&mut self, update: &AiSettingsUpdate) -> AiChange {
+        let mut keys_changed = false;
+        let mut settings_changed = false;
+
+        let prompt = if update.prompt.trim().is_empty() {
+            crate::formatting::default_prompt()
+        } else {
+            update.prompt.clone()
+        };
+        if self.ai.provider != update.provider
+            || self.ai.openai_model != update.openai_model
+            || self.ai.claude_model != update.claude_model
+            || self.ai.prompt != prompt
+        {
+            settings_changed = true;
+        }
+        self.ai.provider = update.provider.clone();
+        self.ai.openai_model = update.openai_model.clone();
+        self.ai.claude_model = update.claude_model.clone();
+        self.ai.prompt = prompt;
+
+        if let Some(key) = &update.openai_api_key {
+            let key = key.trim().to_string();
+            if key != self.ai.keys.openai {
+                self.ai.keys.openai = key;
+                keys_changed = true;
+            }
+        }
+        if let Some(key) = &update.claude_api_key {
+            let key = key.trim().to_string();
+            if key != self.ai.keys.claude {
+                self.ai.keys.claude = key;
+                keys_changed = true;
+            }
+        }
+        AiChange {
+            keys_changed,
+            settings_changed,
+        }
+    }
+
     pub fn file_path(data_dir: &Path) -> PathBuf {
         data_dir.join("settings.json")
     }
 
     pub fn load(data_dir: &Path) -> Self {
+        Self::load_with_report(data_dir).settings
+    }
+
+    pub fn load_with_report(data_dir: &Path) -> SettingsLoad {
         let path = Self::file_path(data_dir);
-        if path.exists() {
-            match std::fs::read_to_string(&path) {
-                Ok(contents) => match serde_json::from_str::<Settings>(&contents) {
-                    Ok(mut settings) => {
-                        // Normalize values from older or manually edited files.
-                        settings.sound_volume = settings.sound_volume.clamp(0.0, 1.0);
-                        if settings.model_file.trim().is_empty() {
-                            settings.model_file = default_model_file();
-                        }
-                        let legacy_key = settings.ai.api_key.clone();
-                        match crate::secrets::load_api_key(data_dir) {
-                            Ok(Some(key)) => settings.ai.api_key = key,
-                            Ok(None) if !legacy_key.is_empty() => {
-                                match crate::secrets::save_api_key(data_dir, &legacy_key) {
-                                    Ok(()) => {
-                                        // `api_key` is skipped during serialization, removing
-                                        // the legacy plaintext value after successful migration.
-                                        if let Err(e) = settings.save(data_dir) {
-                                            log::warn!(
-                                                "API key was encrypted but plaintext settings migration failed: {e}"
-                                            );
-                                        }
-                                    }
-                                    Err(e) => log::warn!(
-                                        "Could not migrate API key to encrypted storage: {e}"
-                                    ),
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                log::warn!("Could not load encrypted API key: {e}");
-                                settings.ai.api_key = legacy_key;
-                            }
-                        }
-                        return settings;
+        let mut load = SettingsLoad {
+            settings: Self::default(),
+            error: None,
+            read_only: false,
+            unknown_keys: Vec::new(),
+            api_key_error: None,
+        };
+
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                load.error = Some(format!(
+                    "settings.json could not be read ({e}); using defaults for this session and \
+                     refusing to save until Wispr Local is restarted"
+                ));
+                load.read_only = true;
+                load.settings.read_only = true;
+                log::error!("{}", load.error.as_deref().unwrap_or_default());
+                return load;
+            }
+        };
+
+        if let Some(bytes) = bytes {
+            match decode_utf8(&bytes).and_then(|text| parse_settings(&text)) {
+                Ok((settings, unknown_keys)) => {
+                    if !unknown_keys.is_empty() {
+                        log::warn!(
+                            "settings.json has keys this build does not know: {}",
+                            unknown_keys.join(", ")
+                        );
                     }
-                    Err(e) => log::warn!("Failed to parse settings: {}, using defaults", e),
-                },
-                Err(e) => log::warn!("Failed to read settings: {}, using defaults", e),
+                    load.settings = settings;
+                    load.unknown_keys = unknown_keys;
+                }
+                Err(problem) => {
+                    let moved = crate::config::quarantine_file(&path);
+                    load.error = Some(match &moved {
+                        Some(p) => format!(
+                            "{problem}. The file was moved to {} and default settings are in use.",
+                            p.file_name().unwrap_or_default().to_string_lossy()
+                        ),
+                        None => format!(
+                            "{problem}. The file could not be moved aside; default settings are in \
+                             use and will not be saved."
+                        ),
+                    });
+                    if moved.is_none() {
+                        load.read_only = true;
+                        load.settings.read_only = true;
+                    }
+                    log::error!("{}", load.error.as_deref().unwrap_or_default());
+                }
             }
         }
-        Self::default()
+
+        normalize(&mut load.settings);
+
+        match secrets::load_api_keys(data_dir) {
+            Ok(keys) => load.settings.ai.keys = keys,
+            Err(e) => {
+                log::warn!("Could not load the encrypted API keys: {e}");
+                load.api_key_error = Some(e);
+            }
+        }
+        migrate_legacy_plaintext_key(&mut load, data_dir);
+        load
     }
 
     pub fn save(&self, data_dir: &Path) -> Result<(), String> {
-        if !self.ai.api_key.is_empty() {
-            let securely_stored = crate::secrets::load_api_key(data_dir)
-                .ok()
-                .flatten()
-                .is_some_and(|key| key == self.ai.api_key);
-            if !securely_stored {
-                // Do not rewrite a legacy settings file without first securing
-                // its key; otherwise a temporary DPAPI failure could erase the
-                // only recoverable copy on the next unrelated settings change.
-                crate::secrets::save_api_key(data_dir, &self.ai.api_key)?;
-            }
+        if self.read_only {
+            return Err(
+                "settings.json could not be read at startup; restart Wispr Local before changing \
+                 settings"
+                    .to_string(),
+            );
         }
         let path = Self::file_path(data_dir);
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
         crate::config::write_file_atomic(&path, json.as_bytes())
+    }
+}
+
+/// Reject UTF-16, strip a UTF-8 BOM, validate UTF-8.
+fn decode_utf8(bytes: &[u8]) -> Result<String, String> {
+    if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
+        return Err(
+            "settings.json is saved as UTF-16; save it as UTF-8 without BOM (PowerShell's Out-File \
+             defaults to UTF-16)"
+                .to_string(),
+        );
+    }
+    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    String::from_utf8(bytes.to_vec()).map_err(|e| format!("settings.json is not valid UTF-8 ({e})"))
+}
+
+fn parse_settings(text: &str) -> Result<(Settings, Vec<String>), String> {
+    let value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| format!("settings.json could not be parsed ({e})"))?;
+    let unknown_keys = value
+        .as_object()
+        .map(|map| {
+            map.keys()
+                .filter(|k| !KNOWN_KEYS.contains(&k.as_str()))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let settings: Settings = serde_json::from_value(value)
+        .map_err(|e| format!("settings.json could not be parsed ({e})"))?;
+    Ok((settings, unknown_keys))
+}
+
+/// Clamp and default values from older or hand-edited files.
+fn normalize(settings: &mut Settings) {
+    settings.sound_volume = settings.sound_volume.clamp(0.0, 1.0);
+    if settings.model_file.trim().is_empty() {
+        settings.model_file = default_model_file();
+    }
+    if settings.ai.provider == AiProvider::Unknown {
+        log::warn!("settings.json names an AI provider this build does not know; using None");
+        settings.ai.provider = AiProvider::None;
+    }
+    if settings.language == LanguageMode::Unknown {
+        log::warn!("settings.json names a language mode this build does not know; using Auto");
+        settings.language = LanguageMode::Auto;
+    }
+    if settings.ai.prompt.trim().is_empty() {
+        settings.ai.prompt = crate::formatting::default_prompt();
+    }
+}
+
+/// A pre-DPAPI settings file stored the key in plaintext. Move it into the
+/// encrypted store, then rewrite settings.json without it — the only write
+/// `load` ever performs, and only after the encrypted copy exists.
+fn migrate_legacy_plaintext_key(load: &mut SettingsLoad, data_dir: &Path) {
+    let legacy = std::mem::take(&mut load.settings.ai.legacy_api_key);
+    if legacy.is_empty() {
+        return;
+    }
+    if !load.settings.ai.keys.is_empty() {
+        log::info!("Ignoring the plaintext api_key in settings.json: encrypted keys already exist");
+    } else {
+        load.settings.ai.keys = ApiKeys {
+            openai: legacy.clone(),
+            claude: legacy.clone(),
+        };
+        if let Err(e) = secrets::save_api_keys(data_dir, &load.settings.ai.keys) {
+            log::warn!("Could not migrate the plaintext API key to encrypted storage: {e}");
+            load.api_key_error = Some(e);
+            return;
+        }
+    }
+    if load.read_only {
+        return;
+    }
+    match load.settings.save(data_dir) {
+        Ok(()) => log::info!("Removed the plaintext API key from settings.json"),
+        Err(e) => log::warn!("API key was encrypted but settings.json could not be rewritten: {e}"),
     }
 }
 
@@ -209,5 +424,214 @@ mod volume_tests {
         s.set_volumes(-1.0, 7.0);
         assert_eq!(s.start_volume(), 0.0);
         assert_eq!(s.stop_volume(), 1.0);
+    }
+}
+
+#[cfg(test)]
+mod load_tests {
+    use super::{AiSettingsUpdate, Settings};
+    use crate::config::test_dir;
+    use crate::formatting::AiProvider;
+    use crate::transcription::engine::LanguageMode;
+
+    fn write(dir: &std::path::Path, bytes: &[u8]) -> std::path::PathBuf {
+        let path = Settings::file_path(dir);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn listing(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn valid_file_is_untouched_by_load() {
+        let dir = test_dir("valid");
+        let original = br#"{
+  "hotkey": "Ctrl+Alt+Space",
+  "language": "ru",
+  "input_device": "Microphone (Wireless Mic Rx)"
+}"#;
+        let path = write(&dir, original);
+        let load = Settings::load_with_report(&dir);
+        assert!(load.error.is_none(), "{:?}", load.error);
+        assert!(!load.read_only);
+        assert_eq!(load.settings.hotkey, "Ctrl+Alt+Space");
+        assert_eq!(load.settings.language, LanguageMode::Russian);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            original,
+            "load must not rewrite the file"
+        );
+        assert_eq!(
+            listing(&dir),
+            vec!["settings.json"],
+            "no temp or backup files"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn missing_file_gives_defaults_without_error() {
+        let dir = test_dir("missing");
+        let load = Settings::load_with_report(&dir);
+        assert!(load.error.is_none());
+        assert!(!load.read_only);
+        assert_eq!(load.settings.hotkey, "Ctrl+Shift+Space");
+        assert!(listing(&dir).is_empty(), "load must not create files");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bom_prefixed_file_parses() {
+        let dir = test_dir("bom");
+        write(&dir, b"\xEF\xBB\xBF{\"hotkey\":\"Ctrl+Shift+F9\"}");
+        let load = Settings::load_with_report(&dir);
+        assert!(load.error.is_none(), "{:?}", load.error);
+        assert_eq!(load.settings.hotkey, "Ctrl+Shift+F9");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn utf16_file_is_quarantined_and_reported() {
+        let dir = test_dir("utf16");
+        let bytes = b"\xFF\xFE{\x00}\x00".to_vec();
+        write(&dir, &bytes);
+        let load = Settings::load_with_report(&dir);
+        let error = load.error.expect("error reported");
+        assert!(error.contains("UTF-16"), "{error}");
+        assert!(!load.read_only, "defaults stay editable after a quarantine");
+        let names = listing(&dir);
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert!(names[0].starts_with("settings.json.corrupt-"), "{names:?}");
+        assert_eq!(std::fs::read(dir.join(&names[0])).unwrap(), bytes);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn syntax_error_is_quarantined_with_original_bytes() {
+        let dir = test_dir("syntax");
+        let bytes = b"{\"hotkey\": \"Ctrl+Shift+Space\",}".to_vec();
+        write(&dir, &bytes);
+        let load = Settings::load_with_report(&dir);
+        let error = load.error.expect("error reported");
+        assert!(
+            error.contains("line 1"),
+            "serde position is surfaced: {error}"
+        );
+        let names = listing(&dir);
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert!(names[0].starts_with("settings.json.corrupt-"));
+        assert_eq!(std::fs::read(dir.join(&names[0])).unwrap(), bytes);
+        assert_eq!(load.settings.hotkey, "Ctrl+Shift+Space");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn missing_hotkey_uses_default() {
+        let dir = test_dir("nohotkey");
+        write(&dir, br#"{"model_file":"ggml-small.bin"}"#);
+        let load = Settings::load_with_report(&dir);
+        assert!(load.error.is_none(), "{:?}", load.error);
+        assert_eq!(load.settings.hotkey, "Ctrl+Shift+Space");
+        assert_eq!(load.settings.model_file, "ggml-small.bin");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unknown_enum_values_fall_back_and_keep_other_fields() {
+        let dir = test_dir("enums");
+        write(
+            &dir,
+            br#"{"hotkey":"Ctrl+Shift+F8","ai":{"provider":"local","openai_model":"gpt-x"},"language":"russian"}"#,
+        );
+        let load = Settings::load_with_report(&dir);
+        assert!(load.error.is_none(), "{:?}", load.error);
+        assert_eq!(load.settings.ai.provider, AiProvider::None);
+        assert_eq!(load.settings.ai.openai_model, "gpt-x");
+        assert_eq!(load.settings.language, LanguageMode::Auto);
+        assert_eq!(load.settings.hotkey, "Ctrl+Shift+F8");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unknown_top_level_keys_are_reported() {
+        let dir = test_dir("unknown");
+        write(
+            &dir,
+            br#"{"hotkey":"Ctrl+Shift+Space","model":"ggml-small.bin"}"#,
+        );
+        let load = Settings::load_with_report(&dir);
+        assert_eq!(load.unknown_keys, vec!["model".to_string()]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn apply_ai_update_without_key_fields_keeps_stored_keys() {
+        let mut s = Settings::default();
+        s.ai.keys.openai = "sk-openai".into();
+        s.ai.keys.claude = "sk-ant".into();
+        let change = s.apply_ai_update(&AiSettingsUpdate {
+            provider: AiProvider::OpenAi,
+            openai_model: "gpt-4o-mini".into(),
+            claude_model: "claude-haiku-4-5".into(),
+            prompt: "Format it".into(),
+            openai_api_key: None,
+            claude_api_key: None,
+        });
+        assert!(!change.keys_changed);
+        assert!(change.settings_changed);
+        assert_eq!(s.ai.keys.openai, "sk-openai");
+        assert_eq!(s.ai.keys.claude, "sk-ant");
+        assert_eq!(s.ai.api_key(), "sk-openai");
+    }
+
+    #[test]
+    fn apply_ai_update_with_empty_key_removes_only_that_key() {
+        let mut s = Settings::default();
+        s.ai.keys.openai = "sk-openai".into();
+        s.ai.keys.claude = "sk-ant".into();
+        let change = s.apply_ai_update(&AiSettingsUpdate {
+            provider: AiProvider::Claude,
+            openai_model: s.ai.openai_model.clone(),
+            claude_model: s.ai.claude_model.clone(),
+            prompt: s.ai.prompt.clone(),
+            openai_api_key: Some(String::new()),
+            claude_api_key: Some("  sk-new  ".into()),
+        });
+        assert!(change.keys_changed);
+        assert_eq!(s.ai.keys.openai, "");
+        assert_eq!(s.ai.keys.claude, "sk-new", "keys are trimmed");
+        assert_eq!(s.ai.api_key(), "sk-new");
+    }
+
+    #[test]
+    fn blank_prompt_falls_back_to_default() {
+        let mut s = Settings::default();
+        s.apply_ai_update(&AiSettingsUpdate {
+            provider: AiProvider::None,
+            openai_model: s.ai.openai_model.clone(),
+            claude_model: s.ai.claude_model.clone(),
+            prompt: "   ".into(),
+            openai_api_key: None,
+            claude_api_key: None,
+        });
+        assert_eq!(s.ai.prompt, crate::formatting::default_prompt());
+    }
+
+    #[test]
+    fn read_only_settings_refuse_to_save() {
+        let dir = test_dir("readonly");
+        let mut s = Settings::default();
+        s.read_only = true;
+        assert!(s.save(&dir).is_err());
+        assert!(listing(&dir).is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

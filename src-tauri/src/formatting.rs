@@ -21,20 +21,40 @@ pub enum AiProvider {
     OpenAi,
     #[serde(rename = "claude")]
     Claude,
+    /// Any provider name this build does not know (e.g. the removed "local");
+    /// normalized to `None` right after loading so it never reaches the UI.
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiSettings {
     #[serde(default)]
     pub provider: AiProvider,
-    #[serde(default, skip_serializing)]
-    pub api_key: String,
+    /// Plaintext key from pre-DPAPI settings files. Read for migration only;
+    /// never written back.
+    #[serde(default, rename = "api_key", skip_serializing)]
+    pub legacy_api_key: String,
     #[serde(default = "default_openai_model")]
     pub openai_model: String,
     #[serde(default = "default_claude_model")]
     pub claude_model: String,
     #[serde(default = "default_prompt")]
     pub prompt: String,
+    /// Per-provider keys from the encrypted store (never serialized here).
+    #[serde(skip)]
+    pub keys: crate::secrets::ApiKeys,
+}
+
+impl AiSettings {
+    /// The key for the active provider ("" when none is stored).
+    pub fn api_key(&self) -> &str {
+        match self.provider {
+            AiProvider::OpenAi => &self.keys.openai,
+            AiProvider::Claude => &self.keys.claude,
+            AiProvider::None | AiProvider::Unknown => "",
+        }
+    }
 }
 
 fn default_openai_model() -> String {
@@ -44,7 +64,7 @@ fn default_claude_model() -> String {
     // Haiku 4.5: fast and cheap — plenty for punctuation/formatting work.
     "claude-haiku-4-5-20251001".to_string()
 }
-fn default_prompt() -> String {
+pub fn default_prompt() -> String {
     DEFAULT_PROMPT.to_string()
 }
 
@@ -52,10 +72,11 @@ impl Default for AiSettings {
     fn default() -> Self {
         Self {
             provider: AiProvider::None,
-            api_key: String::new(),
+            legacy_api_key: String::new(),
             openai_model: default_openai_model(),
             claude_model: default_claude_model(),
             prompt: default_prompt(),
+            keys: crate::secrets::ApiKeys::default(),
         }
     }
 }
@@ -90,7 +111,7 @@ pub async fn format_text(text: &str, settings: &AiSettings) -> Result<String, St
     let result = match settings.provider {
         AiProvider::OpenAi => format_with_openai(text, settings).await,
         AiProvider::Claude => format_with_claude(text, settings).await,
-        AiProvider::None => return Ok(text.to_string()),
+        AiProvider::None | AiProvider::Unknown => return Ok(text.to_string()),
     };
 
     let formatted = result?;
@@ -120,7 +141,8 @@ fn validate_formatted_output(input: &str, output: &str) -> Result<(), String> {
 
 /// OpenAI Chat Completions API
 async fn format_with_openai(text: &str, settings: &AiSettings) -> Result<String, String> {
-    if settings.api_key.is_empty() {
+    let api_key = settings.api_key();
+    if api_key.is_empty() {
         return Err("OpenAI API key not set".to_string());
     }
 
@@ -135,7 +157,7 @@ async fn format_with_openai(text: &str, settings: &AiSettings) -> Result<String,
 
     let resp = http_client()?
         .post("https://api.openai.com/v1/chat/completions")
-        .header("Authorization", format!("Bearer {}", settings.api_key))
+        .header("Authorization", format!("Bearer {}", api_key))
         .json(&body)
         .send()
         .await
@@ -160,7 +182,8 @@ async fn format_with_openai(text: &str, settings: &AiSettings) -> Result<String,
 
 /// Anthropic Messages API
 async fn format_with_claude(text: &str, settings: &AiSettings) -> Result<String, String> {
-    if settings.api_key.is_empty() {
+    let api_key = settings.api_key();
+    if api_key.is_empty() {
         return Err("Claude API key not set".to_string());
     }
 
@@ -176,7 +199,7 @@ async fn format_with_claude(text: &str, settings: &AiSettings) -> Result<String,
 
     let resp = http_client()?
         .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", &settings.api_key)
+        .header("x-api-key", api_key)
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
         .json(&body)

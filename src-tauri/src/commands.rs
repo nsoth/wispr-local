@@ -264,36 +264,100 @@ pub fn test_sound(
     player.play_and_wait(kind, volume, std::time::Duration::from_secs(6))
 }
 
-#[tauri::command]
-pub fn get_ai_settings(
-    settings: State<'_, Mutex<Settings>>,
-) -> Result<crate::formatting::AiSettings, String> {
-    let s = settings.lock().map_err(|e| e.to_string())?;
-    Ok(s.ai.clone())
+/// What the Settings page shows for the AI section: no secret ever crosses
+/// into the webview, only whether a key is stored.
+#[derive(serde::Serialize)]
+pub struct AiSettingsView {
+    pub provider: crate::formatting::AiProvider,
+    pub openai_model: String,
+    pub claude_model: String,
+    pub prompt: String,
+    pub openai_key_set: bool,
+    pub claude_key_set: bool,
+    pub key_error: Option<String>,
+}
+
+fn ai_settings_view(s: &Settings, state: &AppState) -> AiSettingsView {
+    AiSettingsView {
+        provider: s.ai.provider.clone(),
+        openai_model: s.ai.openai_model.clone(),
+        claude_model: s.ai.claude_model.clone(),
+        prompt: s.ai.prompt.clone(),
+        openai_key_set: !s.ai.keys.openai.is_empty(),
+        claude_key_set: !s.ai.keys.claude.is_empty(),
+        key_error: state.diagnostics.api_key_error.clone(),
+    }
 }
 
 #[tauri::command]
-pub fn set_ai_settings(
-    ai: crate::formatting::AiSettings,
+pub fn get_ai_settings(
     settings: State<'_, Mutex<Settings>>,
+    state: State<'_, Mutex<AppState>>,
+) -> Result<AiSettingsView, String> {
+    let s = settings.lock().map_err(|e| e.to_string())?;
+    let app_state = state.lock().map_err(|e| e.to_string())?;
+    Ok(ai_settings_view(&s, &app_state))
+}
+
+/// Apply an edit from the Settings page. Keys are written to the encrypted
+/// store only when the update carries them; settings.json only when a visible
+/// field changed. Returns the refreshed view.
+#[tauri::command]
+pub fn set_ai_settings(
+    update: crate::settings::AiSettingsUpdate,
+    settings: State<'_, Mutex<Settings>>,
+    state: State<'_, Mutex<AppState>>,
     config: State<'_, AppConfig>,
-) -> Result<(), String> {
+) -> Result<AiSettingsView, String> {
     let mut s = settings.lock().map_err(|e| e.to_string())?;
-    log::info!("AI settings updated: provider={:?}", ai.provider);
-    let previous = s.ai.clone();
-    let key_changed = ai.api_key != previous.api_key;
-    if key_changed {
-        crate::secrets::save_api_key(&config.data_dir, &ai.api_key)?;
-    }
-    s.ai = ai;
-    if let Err(e) = s.save(&config.data_dir) {
-        s.ai = previous;
-        if key_changed {
-            let _ = crate::secrets::save_api_key(&config.data_dir, &s.ai.api_key);
+    let previous = s.clone();
+    let change = s.apply_ai_update(&update);
+    if change.keys_changed {
+        if let Err(e) = crate::secrets::save_api_keys(&config.data_dir, &s.ai.keys) {
+            *s = previous;
+            return Err(e);
         }
-        return Err(e);
     }
-    Ok(())
+    if change.settings_changed {
+        if let Err(e) = s.save(&config.data_dir) {
+            if change.keys_changed {
+                if let Err(e2) = crate::secrets::save_api_keys(&config.data_dir, &previous.ai.keys)
+                {
+                    log::warn!("Could not roll back the API keys after a failed save: {e2}");
+                }
+            }
+            *s = previous;
+            return Err(e);
+        }
+        log::info!("AI settings updated: provider={:?}", s.ai.provider);
+    }
+    if change.keys_changed {
+        log::info!(
+            "API keys updated (openai: {}, claude: {})",
+            if s.ai.keys.openai.is_empty() {
+                "none"
+            } else {
+                "set"
+            },
+            if s.ai.keys.claude.is_empty() {
+                "none"
+            } else {
+                "set"
+            }
+        );
+    }
+    let app_state = state.lock().map_err(|e| e.to_string())?;
+    Ok(ai_settings_view(&s, &app_state))
+}
+
+/// Problems found while loading state files at startup (settings.json moved
+/// aside, unreadable history, undecryptable keys).
+#[tauri::command]
+pub fn get_startup_diagnostics(
+    state: State<'_, Mutex<AppState>>,
+) -> Result<crate::state::StartupDiagnostics, String> {
+    let app_state = state.lock().map_err(|e| e.to_string())?;
+    Ok(app_state.diagnostics.clone())
 }
 
 #[tauri::command]

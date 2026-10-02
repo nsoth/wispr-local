@@ -134,9 +134,22 @@ pub fn run() {
             let buffer = AudioBuffer::new();
             let capture = AudioCapture::new(buffer.clone());
 
-            // Load settings (needed below for model selection)
-            let user_settings = Settings::load(&config.data_dir);
+            // Leftovers of an interrupted atomic write from a previous run.
+            config::remove_stale_temp_files(&config.data_dir);
+
+            // Load settings (needed below for model selection). A broken file
+            // is quarantined and reported, never overwritten with defaults.
+            let settings_load = Settings::load_with_report(&config.data_dir);
+            let user_settings = settings_load.settings.clone();
             log::info!("Loaded hotkey setting: {}", user_settings.hotkey);
+            let (history, history_error) = state::load_history_with_report(&config.data_dir);
+            let diagnostics = state::StartupDiagnostics {
+                settings_error: settings_load.error.clone(),
+                settings_read_only: settings_load.read_only,
+                unknown_settings_keys: settings_load.unknown_keys.clone(),
+                history_error,
+                api_key_error: settings_load.api_key_error.clone(),
+            };
 
             // Initialize an empty Whisper engine; the model is loaded on a
             // background thread after state is registered (see below). Loading
@@ -145,7 +158,8 @@ pub fn run() {
             // unmanaged state and stick on a false "Model not loaded" banner.
             let engine = WhisperEngine::new();
             let initial_state = AppState {
-                history: state::load_history(&config.data_dir),
+                history,
+                diagnostics: diagnostics.clone(),
                 ..AppState::default()
             };
 
@@ -195,6 +209,12 @@ pub fn run() {
             // AppState, so the window never races an unmanaged state; the load
             // result is pushed to the frontend via `model-state-changed`.
             spawn_model_loader(app.handle().clone(), candidate_paths, models_dir);
+
+            // The window is hidden at this point, so a quarantined settings
+            // file also gets a toast; the banner appears once the window opens.
+            if let Some(problem) = diagnostics.settings_error.as_deref() {
+                notify_user(app.handle(), &format!("Settings problem: {problem}"));
+            }
 
             // Setup system tray (also manages TrayAnimator state).
             system::tray::setup_tray(app.handle())?;
@@ -296,6 +316,7 @@ pub fn run() {
             commands::test_sound,
             commands::get_ai_settings,
             commands::set_ai_settings,
+            commands::get_startup_diagnostics,
             commands::get_autostart,
             commands::set_autostart,
             commands::get_show_overlay,
