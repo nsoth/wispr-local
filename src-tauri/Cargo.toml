@@ -1,6 +1,6 @@
 [package]
 name = "wispr-local"
-version = "0.2.2"
+version = "0.2.3"
 description = "Local, privacy-first voice-to-text dictation tool powered by Whisper.cpp"
 authors = ["nsoth"]
 license = "MIT"
