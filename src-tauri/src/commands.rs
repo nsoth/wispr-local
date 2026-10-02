@@ -267,20 +267,50 @@ pub fn get_models_dir(config: State<'_, crate::config::AppConfig>) -> Result<Str
     Ok(config.models_dir.to_string_lossy().to_string())
 }
 
+/// Open one of the app's locations in Explorer: "models", "data" or "log"
+/// (the log is selected inside its folder).
 #[tauri::command]
-pub fn open_models_dir(config: State<'_, AppConfig>) -> Result<(), String> {
-    #[cfg(windows)]
+pub fn open_path(kind: String, config: State<'_, AppConfig>) -> Result<(), String> {
     let mut command = std::process::Command::new("explorer.exe");
-    #[cfg(target_os = "macos")]
-    let mut command = std::process::Command::new("open");
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let mut command = std::process::Command::new("xdg-open");
-
+    match kind.as_str() {
+        "models" => {
+            command.arg(&config.models_dir);
+        }
+        "data" => {
+            command.arg(&config.data_dir);
+        }
+        "log" => {
+            command.arg(format!(
+                "/select,{}",
+                config.data_dir.join("wispr.log").display()
+            ));
+        }
+        other => return Err(format!("Unknown location: {other}")),
+    }
     command
-        .arg(&config.models_dir)
         .spawn()
         .map(|_| ())
-        .map_err(|e| format!("Failed to open models folder: {e}"))
+        .map_err(|e| format!("Failed to open {kind}: {e}"))
+}
+
+/// The built-in AI formatting prompt (for "Reset to default").
+#[tauri::command]
+pub fn get_default_prompt() -> String {
+    crate::formatting::default_prompt()
+}
+
+/// Main-window mic button: start a hands-free recording.
+#[tauri::command]
+pub fn start_hands_free(app: AppHandle) {
+    use tauri::Emitter;
+    let _ = app.emit(crate::events::REQUEST_START_HANDS_FREE, ());
+}
+
+/// Main-window mic button while recording: stop and paste.
+#[tauri::command]
+pub fn stop_recording(app: AppHandle) {
+    use tauri::Emitter;
+    let _ = app.emit(crate::events::REQUEST_STOP_RECORDING, ());
 }
 
 #[tauri::command]

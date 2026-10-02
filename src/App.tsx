@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { ask, open } from "@tauri-apps/plugin-dialog";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { EVENTS, IDLE_STATUS, type AppStatus, type LanguageDetected } from "./ipc";
 import "./styles/global.css";
 
@@ -139,6 +140,7 @@ function App() {
   const textSaveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const [modelFiles, setModelFiles] = useState<ModelFileInfo[]>([]);
   const [modelsDir, setModelsDir] = useState("");
+  const [appInfo, setAppInfo] = useState("");
   const [hotkey, setHotkey] = useState("Ctrl+Shift+Space");
   const [capturing, setCapturing] = useState<HotkeyTarget | null>(null);
   const [hotkeyError, setHotkeyError] = useState("");
@@ -205,6 +207,7 @@ function App() {
         textRef.current = ts;
       }),
       load<string>("get_models_dir", setModelsDir),
+      load<string>("get_app_info", setAppInfo),
       load<string>("get_hotkey", setHotkey),
       load<HotkeyMode>("get_hotkey_mode", setHotkeyMode),
       load<string>("get_cancel_hotkey", setCancelHotkey),
@@ -466,6 +469,50 @@ function App() {
       return () => window.removeEventListener("keydown", handleHotkeyCapture, true);
     }
   }, [capturing, handleHotkeyCapture]);
+
+  // Escape leaves Settings or hides the window; Ctrl+, opens Settings.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (capturing) return;
+      const target = e.target as HTMLElement | null;
+      const typing =
+        target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA");
+      if (e.key === "Escape") {
+        if (typing && target) {
+          target.blur();
+          return;
+        }
+        if (showSettings) setShowSettings(false);
+        else void getCurrentWindow().hide();
+      } else if (e.key === "," && e.ctrlKey) {
+        e.preventDefault();
+        setShowSettings(true);
+        void refreshModelFiles();
+        void refreshInputDevices();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // refreshModelFiles / refreshInputDevices are stable arrow functions.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [capturing, showSettings]);
+
+  const toggleHandsFree = () => {
+    const command = isRecording ? "stop_recording" : "start_hands_free";
+    invoke(command).catch((error) => setError(String(error)));
+  };
+
+  const resetPrompt = () => {
+    invoke<string>("get_default_prompt")
+      .then((prompt) => updateAiSettings({ prompt }))
+      .catch((error) => setError(String(error)));
+  };
+
+  const openPath = (kind: "models" | "data" | "log") => {
+    invoke("open_path", { kind }).catch((error) =>
+      setError(`Could not open the folder: ${String(error)}`),
+    );
+  };
 
   const changeHotkeyMode = (mode: HotkeyMode) => {
     const previous = hotkeyMode;
@@ -828,11 +875,19 @@ function App() {
       {!showSettings ? (
         <>
           <div className="main-section">
-            <div
+            <button
+              type="button"
               className={`mic-ring-container${
                 isRecording ? " recording" : ""
               }${isProcessing ? " processing" : ""}${hasError ? " error" : ""}`}
-              aria-hidden="true"
+              onClick={toggleHandsFree}
+              disabled={isProcessing || (!modelReady && !modelLoading)}
+              aria-label={isRecording ? "Stop and paste" : "Start hands-free dictation"}
+              title={
+                isRecording
+                  ? "Stop and paste"
+                  : "Start a hands-free recording (focus the target app first, then stop from here, the tray or the hotkey)"
+              }
             >
               <div className="mic-pulse"></div>
               <div className="mic-circle">
@@ -853,7 +908,7 @@ function App() {
                   <line x1="8" y1="23" x2="16" y2="23" />
                 </svg>
               </div>
-            </div>
+            </button>
 
             <div className={`status-label${hasError ? " error" : ""}`} role="status" aria-live="polite">
               {isLoading
@@ -1376,9 +1431,7 @@ function App() {
                 type="button"
                 className="sound-btn"
                 onClick={() =>
-                  invoke("open_models_dir").catch((error) =>
-                    setError(`Could not open model folder: ${String(error)}`),
-                  )
+                  openPath("models")
                 }
               >
                 Open folder
@@ -1522,6 +1575,11 @@ function App() {
                     placeholder="Custom formatting instructions..."
                   />
                 </div>
+                <div className="settings-note">
+                  <button type="button" className="sound-btn" onClick={resetPrompt}>
+                    Reset prompt to default
+                  </button>
+                </div>
                 {aiSettings.key_error && (
                   <div className="settings-note error">
                     Stored keys could not be decrypted ({aiSettings.key_error}). Enter the key again.
@@ -1533,6 +1591,21 @@ function App() {
                 </div>
               </>
             )}
+          </div>
+        </div>
+      )}
+
+      {showSettings && (
+        <div className="settings-group about-group">
+          <div className="settings-group-title">About</div>
+          <div className="settings-note">Wispr Local {appInfo || "(build info unavailable)"}</div>
+          <div className="about-actions">
+            <button type="button" className="sound-btn" onClick={() => openPath("data")}>
+              Open data folder
+            </button>
+            <button type="button" className="sound-btn" onClick={() => openPath("log")}>
+              Open log
+            </button>
           </div>
         </div>
       )}
@@ -1567,9 +1640,7 @@ function App() {
                 className="model-open-btn"
                 disabled={!modelsDir}
                 onClick={() =>
-                  invoke("open_models_dir").catch((error) =>
-                    setError(`Could not open model folder: ${String(error)}`),
-                  )
+                  openPath("models")
                 }
               >
                 Open folder

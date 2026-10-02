@@ -2,6 +2,19 @@
   font-family: Inter, system-ui, -apple-system, sans-serif;
   color: #d0d0dd;
   background-color: #0e0e14;
+  color-scheme: dark;
+
+  /* Text tiers measured against #0e0e14 / #131318 (WCAG AA ≥ 4.5:1 for
+     text under 18 px): primary 13:1, secondary 7.5:1, tertiary 5:1. */
+  --text-1: #e6e6f0;
+  --text-2: #a0a0b8;
+  --text-3: #80809a;
+  --accent: #a78bfa;
+  --accent-strong: #7c3aed;
+  --border: #2a2a3a;
+  --divider: #1a1a24;
+  --surface: #131318;
+  --surface-2: #18181f;
 }
 
 *,
@@ -41,7 +54,7 @@ body {
   border: 1px solid #2a2a3a;
   border-radius: 5px;
   font-size: 11px;
-  color: #6a6a7a;
+  color: var(--text-2);
   cursor: pointer;
   transition: all 0.15s ease;
 }
@@ -80,7 +93,7 @@ button:disabled {
 .app-name {
   font-size: 13px;
   font-weight: 600;
-  color: #6a6a7a;
+  color: var(--text-2);
 }
 
 /* ---- Main / Mic ---- */
@@ -125,7 +138,7 @@ button:disabled {
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #555566;
+  color: var(--text-3);
   transition: all 0.25s ease;
 }
 
@@ -285,7 +298,7 @@ button:disabled {
   font-family: inherit;
   font-size: 11px;
   font-weight: 500;
-  color: #8888a0;
+  color: var(--text-2);
 }
 
 .hotkey-plus {
@@ -299,8 +312,8 @@ button:disabled {
   background: none;
   border: 1px solid #2a2a3a;
   border-radius: 4px;
-  font-size: 10px;
-  color: #6a6a7a;
+  font-size: 11px;
+  color: var(--text-2);
   cursor: pointer;
   transition: all 0.15s ease;
 }
@@ -331,8 +344,8 @@ button:disabled {
   background: none;
   border: 1px solid #3a2a4a;
   border-radius: 4px;
-  font-size: 10px;
-  color: #6a6a7a;
+  font-size: 11px;
+  color: var(--text-2);
   cursor: pointer;
 }
 
@@ -343,13 +356,13 @@ button:disabled {
 
 .hotkey-error {
   margin-top: 4px;
-  font-size: 10px;
+  font-size: 11px;
   color: #f87171;
 }
 
 .hotkey-desc {
-  font-size: 11px;
-  color: #4a4a5a;
+  font-size: 12px;
+  color: var(--text-3);
   margin-top: 2px;
 }
 
@@ -387,14 +400,14 @@ button:disabled {
 .history-empty {
   padding: 10px;
   font-size: 11px;
-  color: #6a6a7a;
+  color: var(--text-2);
   text-align: center;
 }
 
 .transcript-label {
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 600;
-  color: #4a4a5a;
+  color: var(--text-3);
   text-transform: uppercase;
   letter-spacing: 0.6px;
 }
@@ -411,8 +424,8 @@ button:disabled {
   border: 0;
   border-radius: 4px;
   background: transparent;
-  color: #5f5f72;
-  font-size: 10px;
+  color: var(--text-3);
+  font-size: 11px;
   cursor: pointer;
 }
 
@@ -459,7 +472,7 @@ button:disabled {
   display: flex;
   align-items: center;
   gap: 5px;
-  font-size: 10px;
+  font-size: 11px;
   color: #80809a;
 }
 
@@ -543,8 +556,8 @@ button:disabled {
   display: flex;
   align-items: center;
   gap: 7px;
-  font-size: 11px;
-  color: #555566;
+  font-size: 12px;
+  color: var(--text-2);
 }
 
 .dot {
@@ -576,15 +589,15 @@ button:disabled {
   background: #2a1a22;
   padding: 1px 5px;
   border-radius: 3px;
-  font-size: 10px;
+  font-size: 11px;
 }
 
 .model-path {
   display: block;
   margin-top: 4px;
   font-family: monospace;
-  font-size: 10px;
-  color: #888898;
+  font-size: 11px;
+  color: var(--text-2);
   word-break: break-all;
   user-select: text;
 }
@@ -594,8 +607,8 @@ button:disabled {
   align-items: center;
   gap: 8px;
   margin-top: 8px;
-  color: #888898;
-  font-size: 10px;
+  color: var(--text-2);
+  font-size: 11px;
 }
 
 .model-open-btn {
@@ -611,9 +624,56 @@ button:disabled {
 
 /* ---- Settings ---- */
 .settings-section {
-  flex: 1;
+  flex: 1 1 auto;
+  min-height: 0;
   padding: 16px 0;
   overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: #2a2a3a transparent;
+}
+
+.history-list {
+  scrollbar-width: thin;
+  scrollbar-color: #2a2a3a transparent;
+}
+
+/* The status block is a real button now (hands-free start / stop). */
+button.mic-ring-container {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
+  color: inherit;
+  font: inherit;
+}
+
+button.mic-ring-container:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+button.mic-ring-container:not(:disabled):hover .mic-circle {
+  color: var(--accent);
+}
+
+.about-group {
+  flex: 0 0 auto;
+  margin-top: 0;
+}
+
+.about-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.sound-btn,
+.hotkey-change-btn,
+.history-clear-btn,
+.hotkey-cancel-btn,
+.model-open-btn,
+.dict-remove {
+  min-height: 24px;
 }
 
 .settings-group {
@@ -625,9 +685,9 @@ button:disabled {
 }
 
 .settings-group-title {
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 600;
-  color: #4a4a5a;
+  color: var(--text-3);
   text-transform: uppercase;
   letter-spacing: 0.6px;
   margin-bottom: 12px;
@@ -646,7 +706,7 @@ button:disabled {
 
 .sound-label {
   font-size: 12px;
-  color: #8888a0;
+  color: var(--text-2);
   flex-shrink: 0;
 }
 
@@ -657,7 +717,7 @@ button:disabled {
 }
 
 .sound-file {
-  font-size: 10px;
+  font-size: 11px;
   color: #a78bfa;
   max-width: 100px;
   overflow: hidden;
@@ -666,7 +726,7 @@ button:disabled {
 }
 
 .sound-file.default {
-  color: #555566;
+  color: var(--text-3);
   font-style: italic;
 }
 
@@ -675,8 +735,8 @@ button:disabled {
   background: none;
   border: 1px solid #2a2a3a;
   border-radius: 4px;
-  font-size: 10px;
-  color: #6a6a7a;
+  font-size: 11px;
+  color: var(--text-2);
   cursor: pointer;
   transition: all 0.15s ease;
 }
@@ -716,7 +776,7 @@ button:disabled {
 
 .volume-value {
   font-size: 11px;
-  color: #6a6a7a;
+  color: var(--text-2);
   min-width: 32px;
   text-align: right;
 }
@@ -735,7 +795,7 @@ button:disabled {
 
 .setting-label {
   font-size: 12px;
-  color: #8888a0;
+  color: var(--text-2);
   flex-shrink: 0;
   min-width: 65px;
 }
@@ -777,7 +837,7 @@ button:disabled {
   border: 1px solid #2a2a3a;
   border-radius: 5px;
   background: #18181f;
-  color: #8888a0;
+  color: var(--text-2);
   font-size: 15px;
   line-height: 1;
   cursor: pointer;
@@ -840,8 +900,8 @@ button:disabled {
 
 .settings-note {
   margin-top: 10px;
-  color: #5f5f72;
-  font-size: 10px;
+  color: var(--text-3);
+  font-size: 11px;
   line-height: 1.45;
 }
 
@@ -883,7 +943,7 @@ button:disabled {
   width: 14px;
   left: 3px;
   bottom: 3px;
-  background-color: #6a6a7a;
+  background-color: var(--text-2);
   border-radius: 50%;
   transition: 0.2s;
 }
@@ -948,7 +1008,7 @@ input:checked + .toggle-slider::before {
 }
 
 .dict-arrow {
-  color: #6a6a7a;
+  color: var(--text-2);
   font-size: 11px;
   flex: 0 0 auto;
 }
@@ -957,8 +1017,8 @@ input:checked + .toggle-slider::before {
   display: flex;
   align-items: center;
   gap: 2px;
-  font-size: 10px;
-  color: #8888a0;
+  font-size: 11px;
+  color: var(--text-2);
   flex: 0 0 auto;
   cursor: pointer;
 }
@@ -975,7 +1035,7 @@ input:checked + .toggle-slider::before {
   border: 1px solid #2a2a3a;
   border-radius: 4px;
   background: transparent;
-  color: #8888a0;
+  color: var(--text-2);
   font-size: 14px;
   line-height: 1;
   cursor: pointer;
