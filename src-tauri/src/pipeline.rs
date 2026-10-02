@@ -362,7 +362,7 @@ async fn streaming_preview_loop(app: tauri::AppHandle) {
                 let outcome = tauri::async_runtime::spawn_blocking(move || {
                     let engine = blocking_app.state::<Mutex<WhisperEngine>>();
                     // Non-blocking: skip the tick if the final pass holds the engine.
-                    let Ok(eng) = engine.try_lock() else {
+                    let Ok(mut eng) = engine.try_lock() else {
                         return (cache_in, None);
                     };
                     let mut cache = cache_in;
@@ -822,7 +822,7 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
     let blocking_app = app.clone();
     let outcome = tauri::async_runtime::spawn_blocking(move || {
         let engine = blocking_app.state::<Mutex<WhisperEngine>>();
-        let eng = lock_or_recover(&engine);
+        let mut eng = lock_or_recover(&engine);
         let lock_ms = lock_started.elapsed().as_millis();
         let result = eng.transcribe(&samples, language, TranscribeOptions::final_pass());
         (lock_ms, result)

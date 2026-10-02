@@ -76,6 +76,9 @@ pub struct TranscriptionResult {
 
 pub struct WhisperEngine {
     context: Option<WhisperContext>,
+    /// One decoder state reused across calls: creating it per call allocated
+    /// and freed the whole KV cache on the GPU every two seconds.
+    state: Option<WhisperState>,
     using_gpu: bool,
 }
 
@@ -89,6 +92,7 @@ impl WhisperEngine {
     pub fn new() -> Self {
         Self {
             context: None,
+            state: None,
             using_gpu: false,
         }
     }
@@ -101,6 +105,10 @@ impl WhisperEngine {
         let force_cpu = std::env::var("WISPR_FORCE_CPU").is_ok();
         let mut params = WhisperContextParameters::default();
         params.use_gpu(!force_cpu);
+        if !force_cpu {
+            // Fused attention kernels: faster and leaner on VRAM for CUDA.
+            params.flash_attn(true);
+        }
         let (ctx, using_gpu) = match WhisperContext::new_with_params(path, params) {
             Ok(ctx) => (ctx, !force_cpu),
             Err(gpu_error) if !force_cpu => {
@@ -117,6 +125,10 @@ impl WhisperEngine {
             Err(e) => return Err(format!("Failed to load Whisper model: {e}")),
         };
 
+        let state = ctx
+            .create_state()
+            .map_err(|e| format!("Failed to create Whisper state: {e}"))?;
+        self.state = Some(state);
         self.context = Some(ctx);
         self.using_gpu = using_gpu;
         log::info!(
@@ -132,6 +144,7 @@ impl WhisperEngine {
 
     /// Drop the current model (frees its VRAM) before loading another one.
     pub fn unload(&mut self) {
+        self.state = None;
         self.context = None;
         self.using_gpu = false;
     }
@@ -161,7 +174,7 @@ impl WhisperEngine {
     /// Transcribe audio samples (must be 16kHz, mono, f32) with a fresh
     /// language decision.
     pub fn transcribe(
-        &self,
+        &mut self,
         audio: &[f32],
         language: LanguageMode,
         options: TranscribeOptions,
@@ -180,22 +193,19 @@ impl WhisperEngine {
     /// utterance (more precisely, on its first 30 s: whisper's detector only
     /// looks at one window).
     pub fn transcribe_cached(
-        &self,
+        &mut self,
         audio: &[f32],
         language: LanguageMode,
         lang_cache: &mut Option<&'static str>,
         options: TranscribeOptions,
     ) -> Result<TranscriptionResult, String> {
-        let ctx = self.context.as_ref().ok_or("Whisper model not loaded")?;
+        let threads = self.decode_threads();
+        let state = self.state.as_mut().ok_or("Whisper model not loaded")?;
 
         // Peak-normalize so quiet mics still register, without the clipping
         // distortion a fixed capture-time gain caused on loud speech. The gain
         // cap keeps near-silent recordings from being blown up into noise.
         let audio = normalize_peak(audio);
-
-        let mut state = ctx
-            .create_state()
-            .map_err(|e| format!("Failed to create Whisper state: {}", e))?;
 
         // Decide the decode language before building params.
         // History: we used to hardcode `set_language(Some("ru"))`, which ran
@@ -212,7 +222,7 @@ impl WhisperEngine {
                 Some(cached) => cached,
                 None => {
                     let started = Instant::now();
-                    let detected = detect_ru_or_en(&mut state, &audio)?;
+                    let detected = detect_ru_or_en(state, &audio)?;
                     detect_ms = started.elapsed().as_millis();
                     *lang_cache = Some(detected);
                     detected
@@ -220,7 +230,17 @@ impl WhisperEngine {
             },
         };
 
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        // The final pass can afford a beam search (turbo has only four decoder
+        // layers, so decoding is cheap next to the encoder); the preview keeps
+        // the greedy decoder because its text is replaced two seconds later.
+        let strategy = match options.mode {
+            PassMode::Final => SamplingStrategy::BeamSearch {
+                beam_size: 5,
+                patience: -1.0,
+            },
+            PassMode::Preview => SamplingStrategy::Greedy { best_of: 1 },
+        };
+        let mut params = FullParams::new(strategy);
         // The medium+ models handle English code-switching (technical terms,
         // mixed phrases) inside a Russian utterance fine when the language is
         // pinned, so a ru-detected utterance keeps embedded English terms.
@@ -234,7 +254,7 @@ impl WhisperEngine {
         // for recordings longer than one 30 s window, where it stops a
         // hallucination in a quiet first window from seeding the next ones.
         params.set_no_context(true);
-        params.set_n_threads(self.decode_threads());
+        params.set_n_threads(threads);
         params.set_print_special(false);
         params.set_print_progress(false);
         params.set_print_realtime(false);
@@ -313,15 +333,32 @@ fn assemble_segments(segments: impl IntoIterator<Item = (String, f32)>) -> (Stri
     (parts.join(" ").trim().to_string(), dropped)
 }
 
-/// Scale audio so its peak sits at ~0.95, with the gain capped at 8x so pure
-/// noise-floor recordings aren't amplified into garbage.
+/// Scale audio so its loud part sits at ~0.95, with the gain capped at 8x so
+/// pure noise-floor recordings aren't amplified into garbage. The level is
+/// the 99.5th percentile of |sample| rather than the maximum, and the first
+/// 200 ms are ignored on recordings longer than a second, so one transient
+/// (the start chime leaking into the mic, a key click) cannot squash the
+/// speech to a whisper. Samples are clamped to ±0.98 after scaling.
 fn normalize_peak(audio: &[f32]) -> Vec<f32> {
-    let peak = audio.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
-    if peak <= 0.0 {
+    if audio.is_empty() {
+        return Vec::new();
+    }
+    let skip = if audio.len() > 16_000 { 3_200 } else { 0 };
+    let mut magnitudes: Vec<f32> = audio[skip..].iter().map(|s| s.abs()).collect();
+    if magnitudes.is_empty() {
         return audio.to_vec();
     }
-    let gain = (0.95 / peak).min(8.0);
-    audio.iter().map(|&s| s * gain).collect()
+    let index = ((magnitudes.len() - 1) as f64 * 0.995) as usize;
+    let (_, level, _) = magnitudes.select_nth_unstable_by(index, |a, b| a.total_cmp(b));
+    let level = *level;
+    if level <= 0.0 {
+        return audio.to_vec();
+    }
+    let gain = (0.95 / level).min(8.0);
+    audio
+        .iter()
+        .map(|&s| (s * gain).clamp(-0.98, 0.98))
+        .collect()
 }
 
 /// English must beat Russian by a comfortable margin in the two-way ru/en race
@@ -550,8 +587,28 @@ mod tests {
         assert!((out[1] - 0.08).abs() < 1e-6, "8x cap: {out:?}");
         let silent = normalize_peak(&[0.0, 0.0]);
         assert_eq!(silent, vec![0.0, 0.0]);
-        let loud = normalize_peak(&[0.5, -1.0]);
-        assert!((loud[1].abs() - 0.95).abs() < 1e-6);
+        assert!(normalize_peak(&[]).is_empty());
+    }
+
+    #[test]
+    fn normalize_peak_ignores_a_single_transient_and_the_first_200ms() {
+        // 2 s of speech at 0.2 (gain 4.75, under the 8x cap) with a start-chime
+        // spike in the first 200 ms
+        // and one click in the middle.
+        let mut audio = vec![0.2f32; 32_000];
+        audio[1_000] = 1.0;
+        audio[20_000] = 1.0;
+        let out = normalize_peak(&audio);
+        assert!(
+            (out[10_000] - 0.95).abs() < 0.02,
+            "speech level {}",
+            out[10_000]
+        );
+        assert!(
+            out[20_000] <= 0.98 && out[20_000] > 0.9,
+            "clamped transient"
+        );
+        assert!(out[1_000] <= 0.98);
     }
 
     use super::pick_language;

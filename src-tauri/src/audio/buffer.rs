@@ -3,7 +3,10 @@ use std::sync::{Arc, Mutex};
 /// Keep recording memory bounded even when hands-free mode is left running.
 /// At 16 kHz mono f32, 30 minutes is roughly 110 MiB.
 pub const MAX_RECORDING_SAMPLES: usize = 16_000 * 60 * 30;
-const INITIAL_CAPACITY: usize = 16_000 * 30;
+/// Two minutes pre-allocated (7.7 MB): the owner's recordings are mostly
+/// under a minute, so the real-time capture callback never has to grow the
+/// vector mid-dictation; longer hands-free sessions still double as needed.
+const INITIAL_CAPACITY: usize = 16_000 * 120;
 
 /// Thread-safe audio buffer that accumulates f32 samples at 16kHz.
 #[derive(Clone)]
