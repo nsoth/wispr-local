@@ -222,6 +222,23 @@ impl WhisperEngine {
         let threads = self.decode_threads();
         let state = self.state.as_mut().ok_or("Whisper model not loaded")?;
 
+        // Silence never reaches the model: it would only hallucinate on it.
+        if is_silent(audio) {
+            log::info!("Capture is near-silent; skipping transcription");
+            return Ok(TranscriptionResult {
+                text: String::new(),
+                language: match language {
+                    LanguageMode::Russian => "ru",
+                    LanguageMode::English => "en",
+                    LanguageMode::Auto | LanguageMode::Unknown => lang_cache.unwrap_or(""),
+                },
+                detect_ms: 0,
+                full_ms: 0,
+                segments: 0,
+                dropped: 0,
+            });
+        }
+
         // Peak-normalize so quiet mics still register, without the clipping
         // distortion a fixed capture-time gain caused on loud speech. The gain
         // cap keeps near-silent recordings from being blown up into noise.
@@ -364,18 +381,39 @@ fn assemble_segments(segments: impl IntoIterator<Item = (String, f32)>) -> (Stri
 /// 200 ms are ignored on recordings longer than a second, so one transient
 /// (the start chime leaking into the mic, a key click) cannot squash the
 /// speech to a whisper. Samples are clamped to ±0.98 after scaling.
-fn normalize_peak(audio: &[f32]) -> Vec<f32> {
+/// The 99.5th-percentile amplitude after the first 200 ms: what the speech
+/// in a capture peaks at, ignoring the key-press click and single transients.
+/// `None` for empty audio.
+fn speech_level(audio: &[f32]) -> Option<f32> {
     if audio.is_empty() {
-        return Vec::new();
+        return None;
     }
     let skip = if audio.len() > 16_000 { 3_200 } else { 0 };
     let mut magnitudes: Vec<f32> = audio[skip..].iter().map(|s| s.abs()).collect();
     if magnitudes.is_empty() {
-        return audio.to_vec();
+        return None;
     }
     let index = ((magnitudes.len() - 1) as f64 * 0.995) as usize;
     let (_, level, _) = magnitudes.select_nth_unstable_by(index, |a, b| a.total_cmp(b));
-    let level = *level;
+    Some(*level)
+}
+
+/// Captures whose speech level stays below this are never shown to Whisper.
+/// A muted or virtual microphone (NVIDIA Broadcast with nothing to pass)
+/// yields near-digital silence, and Whisper answers silence with "Thank
+/// you." or "You" — both were pasted on 2026-10-02. -48 dBFS is far below
+/// quiet speech on any real microphone, so a voice is never rejected here.
+const SILENCE_LEVEL: f32 = 0.004;
+
+/// True when the capture holds no usable signal (see [`SILENCE_LEVEL`]).
+pub fn is_silent(audio: &[f32]) -> bool {
+    speech_level(audio).map_or(true, |level| level < SILENCE_LEVEL)
+}
+
+fn normalize_peak(audio: &[f32]) -> Vec<f32> {
+    let Some(level) = speech_level(audio) else {
+        return audio.to_vec();
+    };
     if level <= 0.0 {
         return audio.to_vec();
     }
@@ -603,6 +641,23 @@ mod tests {
         ]);
         assert_eq!(text, "Привет мир.");
         assert_eq!(dropped, 2);
+    }
+
+    #[test]
+    fn near_silence_is_detected_without_whisper() {
+        use super::is_silent;
+        let tone = |amplitude: f32| -> Vec<f32> {
+            (0..16000 * 2)
+                .map(|i| amplitude * (i as f32 * 0.05).sin())
+                .collect()
+        };
+        assert!(is_silent(&[]), "nothing at all");
+        assert!(is_silent(&vec![0.0; 16000]), "digital silence");
+        assert!(is_silent(&tone(0.002)), "-54 dBFS hum is not speech");
+        assert!(!is_silent(&tone(0.02)), "quiet speech level must pass");
+        let mut spike = vec![0.0f32; 16000 * 2];
+        spike[20_000] = 0.9;
+        assert!(is_silent(&spike), "a single click is not speech");
     }
 
     #[test]
