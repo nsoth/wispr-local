@@ -1,6 +1,6 @@
 {
   "name": "wispr-local",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Local, privacy-first voice-to-text dictation tool powered by Whisper.cpp",
   "author": "nsoth",
   "license": "MIT",
