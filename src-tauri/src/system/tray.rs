@@ -1,4 +1,8 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+//! System tray: menu, click handling and the icon that mirrors the pipeline
+//! phase (idle, pulsing red while recording, steady amber while the previous
+//! recording is still being transcribed or pasted).
+
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,18 +15,44 @@ use tauri::{
 
 pub const TRAY_ID: &str = "main-tray";
 
-/// Shared recording flag for the tray animator thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TrayPhase {
+    Idle = 0,
+    Recording = 1,
+    Processing = 2,
+}
+
+impl TrayPhase {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => TrayPhase::Recording,
+            2 => TrayPhase::Processing,
+            _ => TrayPhase::Idle,
+        }
+    }
+
+    fn tooltip(self) -> &'static str {
+        match self {
+            TrayPhase::Idle => "Wispr Local - Idle",
+            TrayPhase::Recording => "Wispr Local - Recording",
+            TrayPhase::Processing => "Wispr Local - Transcribing",
+        }
+    }
+}
+
+/// Shared phase for the tray animator thread.
 pub struct TrayAnimator {
-    pub is_recording: Arc<AtomicBool>,
+    phase: Arc<AtomicU8>,
 }
 
 impl TrayAnimator {
-    pub fn start(&self) {
-        self.is_recording.store(true, Ordering::SeqCst);
+    pub fn set_phase(&self, phase: TrayPhase) {
+        self.phase.store(phase as u8, Ordering::SeqCst);
     }
 
-    pub fn stop(&self) {
-        self.is_recording.store(false, Ordering::SeqCst);
+    pub fn phase(&self) -> TrayPhase {
+        TrayPhase::from_u8(self.phase.load(Ordering::SeqCst))
     }
 }
 
@@ -46,7 +76,7 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         .icon(idle_icon)
         .menu(&menu)
         .show_menu_on_left_click(false)
-        .tooltip("Wispr Local - Idle")
+        .tooltip(TrayPhase::Idle.tooltip())
         .on_menu_event(|app, event| match event.id.as_ref() {
             "start_recording" => {
                 let _ = app.emit(crate::events::REQUEST_START_RECORDING, ());
@@ -82,40 +112,60 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         .build(app)?;
 
     // Spawn animator thread. Cycles through pulsing red-dot frames while
-    // recording; restores the idle icon once recording stops.
-    let is_recording = Arc::new(AtomicBool::new(false));
+    // recording, shows a steady amber dot while processing, restores the idle
+    // icon otherwise.
+    let phase = Arc::new(AtomicU8::new(TrayPhase::Idle as u8));
     app.manage(TrayAnimator {
-        is_recording: is_recording.clone(),
+        phase: phase.clone(),
     });
 
     let app_handle = app.clone();
-    std::thread::spawn(move || animator_loop(app_handle, is_recording));
+    std::thread::Builder::new()
+        .name("wispr-tray".into())
+        .spawn(move || animator_loop(app_handle, phase))?;
 
     Ok(())
 }
 
-fn animator_loop(app: AppHandle, is_recording: Arc<AtomicBool>) {
+fn animator_loop(app: AppHandle, phase: Arc<AtomicU8>) {
     let frames = recording_frames();
     let idle = idle_icon(&app);
+    let processing = dot_icon(9.0, [245, 158, 11]);
     let mut frame_idx = 0usize;
-    let mut in_idle = true;
+    let mut shown = TrayPhase::Idle;
+    let mut first = true;
 
     loop {
-        let recording = is_recording.load(Ordering::SeqCst);
+        let current = TrayPhase::from_u8(phase.load(Ordering::SeqCst));
         if let Some(tray) = app.tray_by_id(TRAY_ID) {
-            if recording {
-                let _ = tray.set_icon(Some(frames[frame_idx].clone()));
-                let _ = tray.set_tooltip(Some("Wispr Local - Recording"));
-                frame_idx = (frame_idx + 1) % frames.len();
-                in_idle = false;
-            } else if !in_idle {
-                let _ = tray.set_icon(Some(idle.clone()));
-                let _ = tray.set_tooltip(Some("Wispr Local - Idle"));
-                frame_idx = 0;
-                in_idle = true;
+            match current {
+                TrayPhase::Recording => {
+                    let _ = tray.set_icon(Some(frames[frame_idx].clone()));
+                    frame_idx = (frame_idx + 1) % frames.len();
+                }
+                TrayPhase::Processing => {
+                    if shown != TrayPhase::Processing || first {
+                        let _ = tray.set_icon(Some(processing.clone()));
+                    }
+                }
+                TrayPhase::Idle => {
+                    if shown != TrayPhase::Idle {
+                        let _ = tray.set_icon(Some(idle.clone()));
+                        frame_idx = 0;
+                    }
+                }
+            }
+            if shown != current || first {
+                let _ = tray.set_tooltip(Some(current.tooltip()));
             }
         }
-        let sleep_ms = if recording { 150 } else { 250 };
+        shown = current;
+        first = false;
+        let sleep_ms = if current == TrayPhase::Recording {
+            150
+        } else {
+            250
+        };
         std::thread::sleep(Duration::from_millis(sleep_ms));
     }
 }
@@ -138,10 +188,10 @@ fn idle_icon(app: &AppHandle) -> Image<'static> {
 fn recording_frames() -> Vec<Image<'static>> {
     // Radius grows then shrinks — gives a visible pulse even at 16×16 scale.
     let radii = [7.0_f32, 9.0, 11.0, 9.0];
-    radii.iter().map(|&r| red_dot_icon(r)).collect()
+    radii.iter().map(|&r| dot_icon(r, [239, 68, 68])).collect()
 }
 
-fn red_dot_icon(radius: f32) -> Image<'static> {
+fn dot_icon(radius: f32, rgb: [u8; 3]) -> Image<'static> {
     const SIZE: u32 = 32;
     let cx = (SIZE as f32 - 1.0) / 2.0;
     let cy = (SIZE as f32 - 1.0) / 2.0;
@@ -163,9 +213,21 @@ fn red_dot_icon(radius: f32) -> Image<'static> {
             };
 
             let a = (alpha * 255.0) as u8;
-            // Bright recording red (#ef4444-ish).
-            rgba.extend_from_slice(&[239, 68, 68, a]);
+            rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], a]);
         }
     }
     Image::new_owned(rgba, SIZE, SIZE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TrayPhase;
+
+    #[test]
+    fn phases_round_trip_through_the_atomic() {
+        for phase in [TrayPhase::Idle, TrayPhase::Recording, TrayPhase::Processing] {
+            assert_eq!(TrayPhase::from_u8(phase as u8), phase);
+        }
+        assert_eq!(TrayPhase::from_u8(42), TrayPhase::Idle);
+    }
 }

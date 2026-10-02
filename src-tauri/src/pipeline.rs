@@ -3,11 +3,14 @@
 //! background model loader and the user-notification helpers.
 //!
 //! Status changes go through [`set_status`] so the UI always receives the
-//! same serialized [`AppStatus`] payload that `get_status` returns.
+//! same serialized [`AppStatus`] payload that `get_status` returns. The
+//! overlay pill follows [`OverlayState`] events: it stays visible from the
+//! hotkey press until the outcome (pasted / no speech / failed) has been
+//! shown, instead of vanishing the moment the key is released.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager};
 
 use crate::audio::buffer::AudioBuffer;
@@ -18,10 +21,10 @@ use crate::events;
 use crate::overlay::{hide_overlay, show_overlay_if_enabled};
 use crate::settings::{self, Settings};
 use crate::state::{self, lock_or_recover, AppState, AppStatus, ModelState};
-use crate::system::sounds::SoundPlayer;
-use crate::system::tray::TrayAnimator;
+use crate::system::sounds::{SoundKind, SoundPlayer};
+use crate::system::tray::{TrayAnimator, TrayPhase};
 use crate::text::apply_paste_suffix;
-use crate::transcription::engine::{TranscribeOptions, WhisperEngine};
+use crate::transcription::engine::{LanguageMode, TranscribeOptions, WhisperEngine};
 use crate::watchdog::{Verdict, Watchdog};
 use crate::{commands, formatting, system};
 
@@ -32,9 +35,7 @@ static UTTERANCES: AtomicU64 = AtomicU64::new(0);
 pub fn set_status(app: &tauri::AppHandle, status: AppStatus) {
     {
         let state = app.state::<Mutex<AppState>>();
-        if let Ok(mut s) = state.lock() {
-            s.status = status.clone();
-        };
+        lock_or_recover(&state).status = status.clone();
     }
     emit_status(app, &status);
 }
@@ -42,6 +43,81 @@ pub fn set_status(app: &tauri::AppHandle, status: AppStatus) {
 /// Broadcast a status that was already stored (e.g. under an existing lock).
 pub fn emit_status(app: &tauri::AppHandle, status: &AppStatus) {
     let _ = app.emit(events::STATUS_CHANGED, status);
+}
+
+/// What the overlay pill shows. `phase` drives the layout (waveform vs text),
+/// `tone` the colour of a result, `language` the RU/EN badge.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OverlayState {
+    /// "recording" | "processing" | "result"
+    pub phase: &'static str,
+    pub message: String,
+    /// "" | "ok" | "warn" | "error"
+    pub tone: &'static str,
+    /// "ru" | "en" | "" (not known yet)
+    pub language: String,
+}
+
+pub fn emit_overlay_state(
+    app: &tauri::AppHandle,
+    phase: &'static str,
+    message: &str,
+    tone: &'static str,
+) {
+    let language = {
+        let state = app.state::<Mutex<AppState>>();
+        let s = lock_or_recover(&state);
+        s.detected_language.clone()
+    };
+    let _ = app.emit(
+        events::OVERLAY_STATE,
+        OverlayState {
+            phase,
+            message: message.to_string(),
+            tone,
+            language,
+        },
+    );
+}
+
+/// Remember the language used for the current utterance and tell both
+/// webviews (badge in the overlay, suffix in the main window status).
+pub fn announce_language(app: &tauri::AppHandle, language: &str, source: &'static str) {
+    {
+        let state = app.state::<Mutex<AppState>>();
+        lock_or_recover(&state).detected_language = language.to_string();
+    }
+    let _ = app.emit(
+        events::LANGUAGE_DETECTED,
+        serde_json::json!({ "language": language, "source": source }),
+    );
+}
+
+/// Runs a closure when dropped unless disarmed: the stop flow arms one right
+/// after claiming the pipeline so a panic anywhere in the flow still returns
+/// the app to Idle instead of leaving a zombie "Transcribing" state.
+pub struct ArmedGuard<F: FnOnce()> {
+    on_drop: Option<F>,
+}
+
+impl<F: FnOnce()> ArmedGuard<F> {
+    pub fn new(on_drop: F) -> Self {
+        Self {
+            on_drop: Some(on_drop),
+        }
+    }
+
+    pub fn disarm(&mut self) {
+        self.on_drop = None;
+    }
+}
+
+impl<F: FnOnce()> Drop for ArmedGuard<F> {
+    fn drop(&mut self) {
+        if let Some(f) = self.on_drop.take() {
+            f();
+        }
+    }
 }
 
 pub fn start_recording_flow(app: &tauri::AppHandle) {
@@ -53,13 +129,25 @@ pub fn start_recording_flow(app: &tauri::AppHandle) {
     let model = {
         let mut s = lock_or_recover(&state);
         if !matches!(s.status, AppStatus::Idle | AppStatus::Error { .. }) {
-            log::info!("Ignoring recording request while app is busy");
+            if s.status != AppStatus::Recording {
+                // The previous recording is still being transcribed or pasted.
+                // Say so instead of silently eating the press (the user holds
+                // the key and talks into nothing otherwise).
+                log::info!("Recording request while busy ({:?}): signalling", s.status);
+                drop(s);
+                app.state::<SoundPlayer>().play(SoundKind::Busy);
+                let _ = app.emit(
+                    events::OPERATION_NOTICE,
+                    "Still processing the previous recording; try again in a moment",
+                );
+            }
             return;
         }
         match &s.model {
             ModelState::Ready { .. } | ModelState::Loading => {
                 s.status = AppStatus::Recording;
                 s.recording_locked = false;
+                s.detected_language.clear();
                 s.preview_abort.store(false, Ordering::Relaxed);
             }
             ModelState::Missing | ModelState::Failed { .. } => {}
@@ -98,26 +186,27 @@ pub fn start_recording_flow(app: &tauri::AppHandle) {
         }
     }
 
-    {
-        buffer.clear();
+    buffer.clear();
+
+    let (preferred_device, language_mode) = {
+        let settings = app.state::<Mutex<Settings>>();
+        let guard = lock_or_recover(&settings);
+        (guard.input_device.clone(), guard.language)
+    };
+    // A pinned language is known before any audio arrives.
+    match language_mode {
+        LanguageMode::Russian => announce_language(app, "ru", "pinned"),
+        LanguageMode::English => announce_language(app, "en", "pinned"),
+        _ => {}
     }
 
-    let preferred_device = {
-        let settings = app.state::<Mutex<Settings>>();
-        settings
-            .lock()
-            .map(|s| s.input_device.clone())
-            .unwrap_or_default()
+    let start_result = {
+        let mut cap = lock_or_recover(&capture);
+        cap.start(
+            Some(app.clone()),
+            (!preferred_device.is_empty()).then_some(preferred_device.as_str()),
+        )
     };
-    let start_result = capture
-        .lock()
-        .map_err(|e| e.to_string())
-        .and_then(|mut cap| {
-            cap.start(
-                Some(app.clone()),
-                (!preferred_device.is_empty()).then_some(preferred_device.as_str()),
-            )
-        });
     match start_result {
         Ok(start) => {
             lock_or_recover(&state).device_sample_rate = start.sample_rate;
@@ -163,10 +252,17 @@ pub fn start_recording_flow(app: &tauri::AppHandle) {
             let message = format!("Microphone error: {e}");
             let _ = app.emit(events::OPERATION_NOTICE, &message);
             notify_user(app, &message);
-            app.state::<TrayAnimator>().stop();
+            app.state::<TrayAnimator>().set_phase(TrayPhase::Idle);
             hide_overlay(app);
             return;
         }
+    }
+
+    // A release that arrived while the device was opening has already claimed
+    // the stop; do not start the indicators for a recording that is over.
+    if lock_or_recover(&state).status != AppStatus::Recording {
+        log::info!("Recording was stopped while the microphone was opening");
+        return;
     }
 
     emit_status(app, &AppStatus::Recording);
@@ -174,8 +270,9 @@ pub fn start_recording_flow(app: &tauri::AppHandle) {
     app.state::<SoundPlayer>().play_start();
 
     // Kick off tray animation and reveal overlay (if user hasn't disabled it).
-    app.state::<TrayAnimator>().start();
+    app.state::<TrayAnimator>().set_phase(TrayPhase::Recording);
     show_overlay_if_enabled(app);
+    emit_overlay_state(app, "recording", "", "");
 
     // Spawn streaming preview: transcribe every ~2s while recording
     let app_clone = app.clone();
@@ -200,8 +297,6 @@ fn main_window_visible(app: &tauri::AppHandle) -> bool {
 }
 
 async fn streaming_preview_loop(app: tauri::AppHandle) {
-    use std::time::Duration;
-
     // Max audio to transcribe in preview mode (10s at 16kHz) — keeps preview fast
     const MAX_PREVIEW_SAMPLES: usize = 16000 * 10;
 
@@ -277,6 +372,9 @@ async fn streaming_preview_loop(app: tauri::AppHandle) {
 
                 match outcome {
                     Ok((cache, Some(Ok(result)))) => {
+                        if lang_cache.is_none() && cache.is_some() && is_recording(&app) {
+                            announce_language(&app, result.language, "auto");
+                        }
                         lang_cache = cache;
                         let elapsed_ms = started.elapsed().as_millis() as f64;
                         log::debug!(
@@ -324,21 +422,86 @@ async fn streaming_preview_loop(app: tauri::AppHandle) {
     }
 }
 
-/// Tell the user why nothing was pasted instead of failing silently.
-/// Emits an event for the UI and shows a system toast (the main window is
-/// usually hidden in the tray during dictation).
-fn notify_no_result(app: &tauri::AppHandle, reason: &str, message: &str) {
-    log::warn!("No transcription result: {}", reason);
-    let _ = app.emit(events::TRANSCRIPTION_EMPTY, reason);
-
-    notify_user(app, message);
+/// How a stopped recording ended; drives the overlay's result flash, the
+/// toast policy and the main-window notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Pasted,
+    /// Paste failed; the text is in the clipboard (or only in history).
+    CopiedToClipboard {
+        in_clipboard: bool,
+    },
+    TooShort,
+    NoSpeech,
+    Failed,
 }
 
-/// Return the pipeline to Idle and explain the missing result. Used by every
-/// early exit of [`stop_and_transcribe_flow`].
-fn finish_without_result(app: &tauri::AppHandle, reason: &str, message: &str) {
+impl Outcome {
+    fn overlay(self) -> (&'static str, &'static str, u64) {
+        match self {
+            Outcome::Pasted => ("Pasted", "ok", 1200),
+            Outcome::CopiedToClipboard { in_clipboard: true } => {
+                ("Copied to clipboard", "warn", 2200)
+            }
+            Outcome::CopiedToClipboard {
+                in_clipboard: false,
+            } => ("Paste failed, see history", "error", 2500),
+            Outcome::TooShort => ("Too short", "warn", 1400),
+            Outcome::NoSpeech => ("No speech", "warn", 1800),
+            Outcome::Failed => ("Transcription failed", "error", 2500),
+        }
+    }
+
+    /// `transcription-empty` reason for the main window, if any.
+    fn empty_reason(self) -> Option<&'static str> {
+        match self {
+            Outcome::TooShort => Some("too-short"),
+            Outcome::NoSpeech => Some("no-speech"),
+            Outcome::Failed => Some("error"),
+            _ => None,
+        }
+    }
+
+    /// OS toast text when the overlay is disabled (otherwise the pill tells).
+    /// An accidental tap ("too short") never deserves a toast.
+    fn toast(self) -> Option<&'static str> {
+        match self {
+            Outcome::NoSpeech => Some("No speech detected — try again"),
+            Outcome::Failed => Some("Transcription failed — check wispr.log"),
+            _ => None,
+        }
+    }
+}
+
+/// The single exit of the stop pipeline: back to Idle, result shown in the
+/// pill for a moment, tray back to idle, overlay hidden afterwards unless a
+/// new recording has started in the meantime.
+fn finish_pipeline(app: &tauri::AppHandle, outcome: Outcome) {
+    let (message, tone, linger_ms) = outcome.overlay();
+    if let Some(reason) = outcome.empty_reason() {
+        log::warn!("No transcription result: {reason}");
+        let _ = app.emit(events::TRANSCRIPTION_EMPTY, reason);
+    }
     set_status(app, AppStatus::Idle);
-    notify_no_result(app, reason, message);
+    app.state::<TrayAnimator>().set_phase(TrayPhase::Idle);
+
+    let overlay_enabled = {
+        let settings = app.state::<Mutex<Settings>>();
+        let guard = lock_or_recover(&settings);
+        guard.show_overlay
+    };
+    if overlay_enabled {
+        emit_overlay_state(app, "result", message, tone);
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(linger_ms)).await;
+            if !is_recording(&app) {
+                hide_overlay(&app);
+            }
+        });
+    } else if let Some(text) = outcome.toast() {
+        notify_user(app, text);
+    }
 }
 
 pub fn notify_user(app: &tauri::AppHandle, message: &str) {
@@ -418,7 +581,8 @@ pub fn spawn_model_loader(app: tauri::AppHandle, requested: String) {
                     }
                     if backend != "CUDA" {
                         let message = if std::env::var("WISPR_FORCE_CPU").is_ok() {
-                            "Wispr Local recovered from a GPU failure and is using CPU                              transcription until restart."
+                            "Wispr Local recovered from a GPU failure and is using CPU \
+                             transcription until restart."
                         } else {
                             "CUDA is unavailable; transcription runs on the CPU and will be slow."
                         };
@@ -462,7 +626,7 @@ fn load_first_available(app: &tauri::AppHandle, requested: &str) -> ModelState {
             continue;
         }
         any_present = true;
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let result = {
             let mut eng = lock_or_recover(&engine);
             eng.unload();
@@ -512,27 +676,32 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
         s.status = AppStatus::Transcribing;
         s.preview_abort.clone()
     };
+    // Whatever happens below (including a panic), the app returns to Idle.
+    let guard_app = app.clone();
+    let mut guard = ArmedGuard::new(move || {
+        log::error!("Stop pipeline aborted unexpectedly; resetting to Idle");
+        finish_pipeline(&guard_app, Outcome::Failed);
+    });
+
     // An in-flight preview tick holds the engine; make it bail out so the
     // final pass does not queue behind it.
     preview_abort.store(true, Ordering::Relaxed);
     let _ = app.emit(events::LOCK_CHANGED, false);
     emit_status(app, &AppStatus::Transcribing);
+    app.state::<TrayAnimator>().set_phase(TrayPhase::Processing);
+    emit_overlay_state(app, "processing", "Transcribing", "");
 
     // Stop capture
     lock_or_recover(&capture).stop();
     app.state::<SoundPlayer>().play_stop();
-
-    // End the recording indicator as soon as the mic is released; transcription
-    // runs afterwards and doesn't need the red pulse.
-    app.state::<TrayAnimator>().stop();
-    hide_overlay(app);
 
     let samples = buffer.take_samples();
     // Under ~0.5s is an accidental hotkey tap — not enough audio for even one
     // word, and short buffers are prime hallucination bait for Whisper.
     const MIN_SAMPLES: usize = 8000; // 0.5s at 16kHz
     if samples.len() < MIN_SAMPLES {
-        finish_without_result(app, "too-short", "Recording too short — nothing captured");
+        guard.disarm();
+        finish_pipeline(app, Outcome::TooShort);
         return;
     }
 
@@ -568,7 +737,8 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
         Ok(pair) => pair,
         Err(e) => {
             log::error!("Transcription task failed: {e}");
-            finish_without_result(app, "error", "Transcription failed — check logs");
+            guard.disarm();
+            finish_pipeline(app, Outcome::Failed);
             return;
         }
     };
@@ -576,10 +746,12 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
         Ok(r) => r,
         Err(e) => {
             log::error!("Transcription failed: {}", e);
-            finish_without_result(app, "error", "Transcription failed — check logs");
+            guard.disarm();
+            finish_pipeline(app, Outcome::Failed);
             return;
         }
     };
+    announce_language(app, result.language, "auto");
     let transcribe_ms = result.detect_ms + result.full_ms;
     let rtf = transcribe_ms as f64 / 1000.0 / audio_s;
     if rtf > 1.0 && backend == "CUDA" {
@@ -598,7 +770,8 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
     }
 
     if result.text.is_empty() {
-        finish_without_result(app, "no-speech", "No speech detected — try again");
+        guard.disarm();
+        finish_pipeline(app, Outcome::NoSpeech);
         return;
     }
 
@@ -606,7 +779,8 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
     log::info!("Transcription cleaned ({} chars)", text.chars().count());
 
     if text.is_empty() {
-        finish_without_result(app, "no-speech", "No speech detected — try again");
+        guard.disarm();
+        finish_pipeline(app, Outcome::NoSpeech);
         return;
     }
 
@@ -620,6 +794,7 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
     let format_started = Instant::now();
     let text = if ai_settings.provider != formatting::AiProvider::None {
         set_status(app, AppStatus::Formatting);
+        emit_overlay_state(app, "processing", "Formatting", "");
         match formatting::format_text(&text, &ai_settings).await {
             Ok(formatted) => formatted,
             Err(e) => {
@@ -640,13 +815,14 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
     };
 
     set_status(app, AppStatus::Injecting);
+    emit_overlay_state(app, "processing", "Pasting", "");
 
     let paste_started = Instant::now();
     let to_paste = apply_paste_suffix(&text, paste_suffix);
-    let pasted = match system::text_injection::inject_text(&to_paste) {
+    let outcome = match system::text_injection::inject_text(&to_paste) {
         Ok(_) => {
             log::debug!("Paste shortcut sent");
-            true
+            Outcome::Pasted
         }
         Err(e) => {
             log::error!("Text injection failed: {}", e);
@@ -658,7 +834,9 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
             };
             let _ = app.emit(events::OPERATION_NOTICE, message);
             notify_user(app, message);
-            false
+            Outcome::CopiedToClipboard {
+                in_clipboard: copied,
+            }
         }
     };
     let paste_ms = paste_started.elapsed().as_millis();
@@ -667,7 +845,6 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
         let mut s = lock_or_recover(&state);
         s.last_transcription = text.clone();
         let changed = s.push_history(&text);
-        s.status = AppStatus::Idle;
         (s.history.clone(), changed)
     };
     if history_changed {
@@ -681,7 +858,7 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
     }
     log::info!(
         "utt#{utterance} audio={audio_s:.1}s lock={lock_ms}ms detect={}ms transcribe={}ms (rtf {rtf:.2}) \
-         format={format_ms}ms paste={paste_ms}ms backend={backend} lang={} chars={} segments={} dropped={} pasted={pasted}",
+         format={format_ms}ms paste={paste_ms}ms backend={backend} lang={} chars={} segments={} dropped={} outcome={outcome:?}",
         result.detect_ms,
         result.full_ms,
         result.language,
@@ -689,14 +866,17 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
         result.segments,
         result.dropped
     );
-    emit_status(app, &AppStatus::Idle);
+    guard.disarm();
+    finish_pipeline(app, outcome);
     let _ = app.emit(events::HISTORY_CHANGED, &history);
     let _ = app.emit(events::TRANSCRIPTION_COMPLETE, text);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::model_candidates;
+    use super::{model_candidates, ArmedGuard, Outcome};
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     #[test]
     fn candidates_start_with_the_requested_file_and_dedupe() {
@@ -722,5 +902,29 @@ mod tests {
             model_candidates("  ", &[]),
             vec!["ggml-large-v3-turbo.bin", "ggml-medium.bin"]
         );
+    }
+
+    #[test]
+    fn armed_guard_fires_on_drop_unless_disarmed() {
+        let fired = Rc::new(Cell::new(0));
+        {
+            let f = Rc::clone(&fired);
+            let _guard = ArmedGuard::new(move || f.set(f.get() + 1));
+        }
+        assert_eq!(fired.get(), 1, "armed guard fires");
+        {
+            let f = Rc::clone(&fired);
+            let mut guard = ArmedGuard::new(move || f.set(f.get() + 1));
+            guard.disarm();
+        }
+        assert_eq!(fired.get(), 1, "disarmed guard stays quiet");
+    }
+
+    #[test]
+    fn accidental_taps_never_toast() {
+        assert!(Outcome::TooShort.toast().is_none());
+        assert!(Outcome::Pasted.toast().is_none());
+        assert!(Outcome::NoSpeech.toast().is_some());
+        assert_eq!(Outcome::TooShort.empty_reason(), Some("too-short"));
     }
 }

@@ -9,6 +9,7 @@ body,
   overflow: hidden;
   user-select: none;
   -webkit-user-select: none;
+  color-scheme: dark;
 }
 
 .overlay-pill {
@@ -17,23 +18,42 @@ body,
   height: 100%;
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   padding: 8px 10px 8px 14px;
   /* Solid color: the window itself is opaque and clipped to a pill shape at
      the OS level (SetWindowRgn in lib.rs) — WebView2 transparency proved
-     unreliable, so the page never needs to be see-through. */
+     unreliable, so the page never needs to be see-through. A clearly visible
+     border keeps the pill readable over dark apps (VS Code, Telegram). */
   background: rgb(17, 24, 39);
-  border: 1px solid rgba(148, 163, 184, 0.18);
+  border: 1.5px solid rgba(148, 163, 184, 0.4);
   border-radius: 999px;
+  color: rgba(226, 232, 240, 0.92);
+  font: 500 12px/1 Inter, system-ui, -apple-system, sans-serif;
   transition: border-color 0.15s ease;
 }
 
 .overlay-pill.recording {
-  border-color: rgba(239, 68, 68, 0.45);
+  border-color: rgba(239, 68, 68, 0.85);
 }
 
 .overlay-pill.locked {
-  border-color: rgba(245, 158, 11, 0.55);
+  border-color: rgba(245, 158, 11, 0.85);
+}
+
+.overlay-pill.phase-processing {
+  border-color: rgba(245, 158, 11, 0.6);
+}
+
+.overlay-pill.tone-ok {
+  border-color: rgba(52, 211, 153, 0.8);
+}
+
+.overlay-pill.tone-warn {
+  border-color: rgba(245, 158, 11, 0.8);
+}
+
+.overlay-pill.tone-error {
+  border-color: rgba(239, 68, 68, 0.85);
 }
 
 .overlay-pin {
@@ -87,6 +107,24 @@ body,
   animation: overlay-pulse 1.2s ease-out infinite;
 }
 
+.overlay-pill.phase-processing .overlay-dot {
+  background: #f59e0b;
+  animation: overlay-spin 0.9s linear infinite;
+  border-radius: 2px;
+}
+
+.overlay-pill.tone-ok .overlay-dot {
+  background: #34d399;
+}
+
+.overlay-pill.tone-warn .overlay-dot {
+  background: #f59e0b;
+}
+
+.overlay-pill.tone-error .overlay-dot {
+  background: #ef4444;
+}
+
 @keyframes overlay-pulse {
   0% {
     box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.55);
@@ -99,6 +137,15 @@ body,
   }
 }
 
+@keyframes overlay-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .overlay-canvas {
   /* flex-basis 0 + min-width 0: a canvas has an intrinsic width of 300px and
      refuses to shrink below it under `flex: 1 1 auto`, which pushed the pin
@@ -107,6 +154,39 @@ body,
   min-width: 0;
   height: 100%;
   display: block;
+}
+
+.overlay-text {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.overlay-lang {
+  flex: 0 0 auto;
+  padding: 2px 5px;
+  border-radius: 4px;
+  background: rgba(148, 163, 184, 0.18);
+  color: rgba(226, 232, 240, 0.9);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+}
+
+.overlay-timer {
+  flex: 0 0 auto;
+  min-width: 30px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: rgba(203, 213, 225, 0.8);
+}
+
+.overlay-check {
+  flex: 0 0 auto;
+  color: #34d399;
 }
 
 @media (prefers-reduced-motion: reduce) {

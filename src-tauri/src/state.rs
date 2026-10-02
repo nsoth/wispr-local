@@ -112,6 +112,8 @@ pub struct AppState {
     /// Set by the stop flow so an in-flight preview tick aborts and releases
     /// the engine to the final transcription; cleared when a recording starts.
     pub preview_abort: Arc<AtomicBool>,
+    /// "ru" / "en" for the current utterance once known (pinned or detected).
+    pub detected_language: String,
 }
 
 impl Default for AppState {
@@ -126,6 +128,7 @@ impl Default for AppState {
             diagnostics: StartupDiagnostics::default(),
             last_fallback_device: None,
             preview_abort: Arc::new(AtomicBool::new(false)),
+            detected_language: String::new(),
         }
     }
 }

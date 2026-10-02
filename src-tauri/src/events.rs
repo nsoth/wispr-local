@@ -18,8 +18,12 @@ pub const TRANSCRIPTION_COMPLETE: &str = "transcription-complete";
 pub const OPERATION_NOTICE: &str = "operation-notice";
 /// Payload: `Vec<String>` — the whole history, newest first.
 pub const HISTORY_CHANGED: &str = "history-changed";
-/// Payload: [`crate::pipeline::ModelStatePayload`].
+/// Payload: serialized [`crate::state::ModelState`].
 pub const MODEL_STATE_CHANGED: &str = "model-state-changed";
+/// Payload: [`crate::pipeline::OverlayState`] — what the pill shows.
+pub const OVERLAY_STATE: &str = "overlay-state";
+/// Payload: `{ language: "ru" | "en", source: "auto" | "pinned" }`.
+pub const LANGUAGE_DETECTED: &str = "language-detected";
 
 /// Internal (Rust → Rust) requests raised by the hotkey, tray and overlay.
 pub const REQUEST_START_RECORDING: &str = "request-start-recording";

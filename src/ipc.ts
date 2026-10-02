@@ -11,7 +11,25 @@ export const EVENTS = {
   operationNotice: "operation-notice",
   historyChanged: "history-changed",
   modelStateChanged: "model-state-changed",
+  overlayState: "overlay-state",
+  languageDetected: "language-detected",
 } as const;
+
+export type OverlayPhase = "recording" | "processing" | "result";
+export type OverlayTone = "" | "ok" | "warn" | "error";
+
+/** What the overlay pill shows (see pipeline.rs OverlayState). */
+export interface OverlayState {
+  phase: OverlayPhase;
+  message: string;
+  tone: OverlayTone;
+  language: string;
+}
+
+export interface LanguageDetected {
+  language: string;
+  source: "auto" | "pinned";
+}
 
 export type AppStatusState =
   | "idle"

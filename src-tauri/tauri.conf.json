@@ -24,6 +24,7 @@
       },
       {
         "label": "overlay",
+        "title": "Wispr Local Overlay",
         "url": "index.html#overlay",
         "width": 312,
         "height": 52,

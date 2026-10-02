@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import { EVENTS, IDLE_STATUS, type AppStatus } from "./ipc";
+import { EVENTS, IDLE_STATUS, type AppStatus, type LanguageDetected } from "./ipc";
 import "./styles/global.css";
 
 interface SoundSettings {
@@ -79,6 +79,7 @@ type LanguageMode = "auto" | "ru" | "en";
 
 function App() {
   const [status, setStatus] = useState<AppStatus>(IDLE_STATUS);
+  const [activeLanguage, setActiveLanguage] = useState("");
   const [isLoading, setIsLoading] = useState(true);
   const [notice, setNoticeState] = useState<Notice | null>(null);
   const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -255,6 +256,10 @@ function App() {
       setModelState(event.payload);
     });
 
+    const unlisten7 = listen<LanguageDetected>(EVENTS.languageDetected, (event) => {
+      setActiveLanguage(event.payload.language.toUpperCase());
+    });
+
     return () => {
       mounted = false;
       void initialLoad;
@@ -264,6 +269,7 @@ function App() {
       unlisten4.then((fn) => fn());
       unlisten5.then((fn) => fn());
       unlisten6.then((fn) => fn());
+      unlisten7.then((fn) => fn());
       clearTimeout(noticeTimerRef.current);
       clearTimeout(copiedTimerRef.current);
       clearTimeout(soundSaveTimer.current);
@@ -707,9 +713,9 @@ function App() {
               {isLoading
                 ? "Loading..."
                 : isRecording
-                ? "Listening..."
+                ? `Listening...${activeLanguage ? ` ${activeLanguage}` : ""}`
                 : isTranscribing
-                ? "Transcribing..."
+                ? `Transcribing...${activeLanguage ? ` ${activeLanguage}` : ""}`
                 : isFormatting
                 ? "Formatting..."
                 : isInjecting
