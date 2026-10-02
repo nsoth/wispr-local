@@ -46,6 +46,21 @@ interface ModelFileInfo {
   loaded: boolean;
 }
 
+type PasteSuffix = "space" | "newline" | "none";
+
+interface ReplacementRule {
+  from: string;
+  to: string;
+  whole_word: boolean;
+  case_insensitive: boolean;
+}
+
+interface TextSettings {
+  voice_commands: boolean;
+  paste_suffix: PasteSuffix;
+  replacements: ReplacementRule[];
+}
+
 type NoticeKind = "info" | "error";
 interface Notice {
   text: string;
@@ -71,6 +86,13 @@ function App() {
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
   const [streamingPreview, setStreamingPreview] = useState("");
   const [modelState, setModelState] = useState<ModelState>({ state: "loading" });
+  const [textSettings, setTextSettings] = useState<TextSettings>({
+    voice_commands: true,
+    paste_suffix: "space",
+    replacements: [],
+  });
+  const textRef = useRef<TextSettings>({ voice_commands: true, paste_suffix: "space", replacements: [] });
+  const textSaveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const [modelFiles, setModelFiles] = useState<ModelFileInfo[]>([]);
   const [modelsDir, setModelsDir] = useState("");
   const [hotkey, setHotkey] = useState("Ctrl+Shift+Space");
@@ -131,6 +153,10 @@ function App() {
     const RETRY_DELAYS = [300, 1000, 3000];
     const loadAll = (attempt: number) => Promise.allSettled([
       load<ModelState>("get_model_state", setModelState),
+      load<TextSettings>("get_text_settings", (ts) => {
+        setTextSettings(ts);
+        textRef.current = ts;
+      }),
       load<string>("get_models_dir", setModelsDir),
       load<string>("get_hotkey", setHotkey),
       load<string[]>("get_history", setHistory),
@@ -241,6 +267,7 @@ function App() {
       clearTimeout(copiedTimerRef.current);
       clearTimeout(soundSaveTimer.current);
       clearTimeout(aiSaveTimer.current);
+      clearTimeout(textSaveTimer.current);
     };
     // setNotice/setError are stable closures over refs and state setters.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -499,6 +526,41 @@ function App() {
       rollback();
       setError(`Could not save setting: ${String(error)}`);
     }
+  };
+
+  // Text post-processing settings: saved 400 ms after the last edit.
+  const updateTextSettings = (updates: Partial<TextSettings>) => {
+    const next = { ...textRef.current, ...updates };
+    textRef.current = next;
+    setTextSettings(next);
+    clearTimeout(textSaveTimer.current);
+    textSaveTimer.current = setTimeout(() => {
+      invoke("set_text_settings", { update: textRef.current }).catch((error) =>
+        setError(`Could not save text settings: ${String(error)}`),
+      );
+    }, 400);
+  };
+
+  const updateRule = (index: number, changes: Partial<ReplacementRule>) => {
+    const replacements = textRef.current.replacements.map((r, i) =>
+      i === index ? { ...r, ...changes } : r,
+    );
+    updateTextSettings({ replacements });
+  };
+
+  const addRule = () => {
+    updateTextSettings({
+      replacements: [
+        ...textRef.current.replacements,
+        { from: "", to: "", whole_word: true, case_insensitive: true },
+      ],
+    });
+  };
+
+  const removeRule = (index: number) => {
+    updateTextSettings({
+      replacements: textRef.current.replacements.filter((_, i) => i !== index),
+    });
   };
 
   const refreshModelFiles = async () => {
@@ -902,6 +964,98 @@ function App() {
             <div className="settings-note">
               Chimes play on the current Windows default output device.
             </div>
+          </div>
+
+          <div className="settings-group">
+            <div className="settings-group-title">Text</div>
+            <div className="setting-row">
+              <span className="setting-label" id="voice-commands-label">
+                Spoken line breaks
+              </span>
+              <label className="toggle-switch">
+                <input
+                  type="checkbox"
+                  aria-labelledby="voice-commands-label"
+                  checked={textSettings.voice_commands}
+                  onChange={(e) => updateTextSettings({ voice_commands: e.target.checked })}
+                />
+                <span className="toggle-slider"></span>
+              </label>
+            </div>
+            <div className="settings-note">
+              Say "новая строка" / "new line" or "новый абзац" / "new paragraph" between pauses.
+            </div>
+            <div className="setting-row">
+              <label className="setting-label" htmlFor="paste-suffix">After paste</label>
+              <select
+                id="paste-suffix"
+                className="setting-select"
+                value={textSettings.paste_suffix}
+                onChange={(e) => updateTextSettings({ paste_suffix: e.target.value as PasteSuffix })}
+              >
+                <option value="space">Add a space</option>
+                <option value="newline">Add a line break</option>
+                <option value="none">Nothing</option>
+              </select>
+            </div>
+            <div className="dict-heading">
+              <span className="setting-label">Dictionary</span>
+              <button type="button" className="sound-btn" onClick={addRule}>
+                Add rule
+              </button>
+            </div>
+            <div className="settings-note">
+              Replace how Whisper spells a term with how you write it. W = whole words only, Aa =
+              match case.
+            </div>
+            {textSettings.replacements.map((rule, index) => (
+              <div className="dict-row" key={index}>
+                <input
+                  className="setting-input"
+                  type="text"
+                  value={rule.from}
+                  placeholder="heard as…"
+                  aria-label="Text to replace"
+                  spellCheck={false}
+                  onChange={(e) => updateRule(index, { from: e.target.value })}
+                />
+                <span className="dict-arrow">→</span>
+                <input
+                  className="setting-input"
+                  type="text"
+                  value={rule.to}
+                  placeholder="write as…"
+                  aria-label="Replacement"
+                  spellCheck={false}
+                  onChange={(e) => updateRule(index, { to: e.target.value })}
+                />
+                <label className="dict-flag" title="Whole words only">
+                  <input
+                    type="checkbox"
+                    checked={rule.whole_word}
+                    onChange={(e) => updateRule(index, { whole_word: e.target.checked })}
+                  />
+                  W
+                </label>
+                <label className="dict-flag" title="Match case">
+                  <input
+                    type="checkbox"
+                    checked={!rule.case_insensitive}
+                    onChange={(e) => updateRule(index, { case_insensitive: !e.target.checked })}
+                  />
+                  Aa
+                </label>
+                <button
+                  type="button"
+                  className="dict-remove"
+                  onClick={() => removeRule(index)}
+                  aria-label="Remove rule"
+                  title="Remove rule"
+                >
+                  ×
+                </button>
+              </div>
+            ))}
           </div>
 
           <div className="settings-group">

@@ -17,7 +17,7 @@ use crate::settings::{self, Settings};
 use crate::state::{self, lock_or_recover, AppState, AppStatus, ModelState};
 use crate::system::sounds::SoundPlayer;
 use crate::system::tray::TrayAnimator;
-use crate::text::remove_fillers;
+use crate::text::apply_paste_suffix;
 use crate::transcription::engine::WhisperEngine;
 use crate::{commands, formatting, system};
 
@@ -195,13 +195,14 @@ async fn streaming_preview_loop(app: tauri::AppHandle) {
             if let Ok(eng) = lock_result {
                 let duration = samples.len() as f32 / 16000.0;
                 log::info!("Streaming preview: transcribing {:.1}s", duration);
-                let language = {
+                let (language, pipeline) = {
                     let settings = app.state::<Mutex<Settings>>();
-                    let guard = settings.lock().unwrap();
-                    guard.language
+                    let guard = lock_or_recover(&settings);
+                    (guard.language, guard.text_pipeline())
                 };
                 match eng.transcribe_cached(&samples, language, &mut lang_cache) {
                     Ok(text) if !text.is_empty() => {
+                        let text = pipeline.preview(&text);
                         log::info!("Streaming preview ready ({} chars)", text.chars().count());
                         let _ = app.emit(events::STREAMING_PREVIEW, &text);
                     }
@@ -440,10 +441,10 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
         samples.len() as f32 / 16000.0
     );
 
-    let language = {
+    let (language, pipeline, paste_suffix) = {
         let settings = app.state::<Mutex<Settings>>();
-        let guard = settings.lock().unwrap();
-        guard.language
+        let guard = lock_or_recover(&settings);
+        (guard.language, guard.text_pipeline(), guard.paste_suffix)
     };
     let text = {
         let eng = engine.lock().unwrap();
@@ -462,7 +463,7 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
         return;
     }
 
-    let text = remove_fillers(&text);
+    let text = pipeline.finalize(&text);
     log::info!("Transcription cleaned ({} chars)", text.chars().count());
 
     if text.is_empty() {
@@ -495,7 +496,8 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
 
     set_status(app, AppStatus::Injecting);
 
-    match system::text_injection::inject_text(&text) {
+    let to_paste = apply_paste_suffix(&text, paste_suffix);
+    match system::text_injection::inject_text(&to_paste) {
         Ok(_) => log::info!("Text injected successfully"),
         Err(e) => {
             log::error!("Text injection failed: {}", e);

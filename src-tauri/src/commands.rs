@@ -445,6 +445,51 @@ pub fn set_ai_settings(
     Ok(ai_settings_view(&s, &app_state))
 }
 
+/// The text post-processing section of Settings.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct TextSettings {
+    pub voice_commands: bool,
+    pub paste_suffix: crate::text::PasteSuffix,
+    pub replacements: Vec<crate::transcription::replacements::ReplacementRule>,
+}
+
+#[tauri::command]
+pub fn get_text_settings(settings: State<'_, Mutex<Settings>>) -> Result<TextSettings, String> {
+    let s = settings.lock().map_err(|e| e.to_string())?;
+    Ok(TextSettings {
+        voice_commands: s.voice_commands,
+        paste_suffix: s.paste_suffix,
+        replacements: s.replacements.clone(),
+    })
+}
+
+#[tauri::command]
+pub fn set_text_settings(
+    update: TextSettings,
+    settings: State<'_, Mutex<Settings>>,
+    config: State<'_, AppConfig>,
+) -> Result<(), String> {
+    let mut s = settings.lock().map_err(|e| e.to_string())?;
+    let previous = s.clone();
+    s.voice_commands = update.voice_commands;
+    s.paste_suffix = update.paste_suffix;
+    s.replacements = update
+        .replacements
+        .into_iter()
+        .filter(|r| !r.from.trim().is_empty())
+        .collect();
+    if let Err(e) = s.save(&config.data_dir) {
+        *s = previous;
+        return Err(e);
+    }
+    log::info!(
+        "Text settings updated ({} dictionary rules, voice commands {})",
+        s.replacements.len(),
+        if s.voice_commands { "on" } else { "off" }
+    );
+    Ok(())
+}
+
 /// Problems found while loading state files at startup (settings.json moved
 /// aside, unreadable history, undecryptable keys).
 #[tauri::command]

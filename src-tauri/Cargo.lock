@@ -6452,6 +6452,7 @@ dependencies = [
  "hound",
  "humantime",
  "log",
+ "regex",
  "reqwest 0.12.28",
  "ringbuf",
  "rodio",

@@ -9,7 +9,9 @@
 
 use crate::formatting::{AiProvider, AiSettings};
 use crate::secrets::{self, ApiKeys};
+use crate::text::{PasteSuffix, TextPipeline};
 use crate::transcription::engine::LanguageMode;
+use crate::transcription::replacements::{self, ReplacementRule, Vocabulary};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -49,6 +51,17 @@ pub struct Settings {
     /// device name selected by the user.
     #[serde(default)]
     pub input_device: String,
+    /// Turn "новая строка" / "new paragraph" (spoken between pauses) into
+    /// line breaks.
+    #[serde(default = "default_true")]
+    pub voice_commands: bool,
+    /// What follows a pasted transcript so the next dictation does not glue
+    /// onto it.
+    #[serde(default)]
+    pub paste_suffix: PasteSuffix,
+    /// User dictionary applied after filler removal.
+    #[serde(default = "replacements::default_rules")]
+    pub replacements: Vec<ReplacementRule>,
     /// Set when settings.json existed but could not be read at startup. Every
     /// save is refused until a restart so a transient IO error can never turn
     /// into "defaults written over the user's file".
@@ -71,7 +84,14 @@ const KNOWN_KEYS: &[&str] = &[
     "model_file",
     "language",
     "input_device",
+    "voice_commands",
+    "paste_suffix",
+    "replacements",
 ];
+
+fn default_true() -> bool {
+    true
+}
 
 fn default_hotkey() -> String {
     "Ctrl+Shift+Space".to_string()
@@ -108,6 +128,9 @@ impl Default for Settings {
             model_file: default_model_file(),
             language: LanguageMode::default(),
             input_device: String::new(),
+            voice_commands: true,
+            paste_suffix: PasteSuffix::default(),
+            replacements: replacements::default_rules(),
             read_only: false,
         }
     }
@@ -167,6 +190,15 @@ impl Settings {
         self.start_volume = Some(start);
         self.stop_volume = Some(stop);
         self.sound_volume = stop;
+    }
+
+    /// Post-processing steps for one utterance, compiled from the current
+    /// dictionary (a few dozen small regexes; cheap per dictation).
+    pub fn text_pipeline(&self) -> TextPipeline {
+        TextPipeline {
+            voice_commands: self.voice_commands,
+            vocabulary: Vocabulary::compile(&self.replacements),
+        }
     }
 
     pub fn sound_config(&self) -> crate::system::sounds::SoundConfig {

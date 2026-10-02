@@ -296,6 +296,8 @@ pub fn run() {
             commands::get_ai_settings,
             commands::set_ai_settings,
             commands::get_startup_diagnostics,
+            commands::get_text_settings,
+            commands::set_text_settings,
             commands::get_autostart,
             commands::set_autostart,
             commands::get_show_overlay,

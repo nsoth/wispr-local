@@ -837,3 +837,65 @@ input:checked + .toggle-slider::before {
     transition-duration: 0.001ms !important;
   }
 }
+
+/* ---- Dictionary ---- */
+.dict-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 0 2px;
+  border-top: 1px solid #1a1a24;
+  margin-top: 6px;
+}
+
+.dict-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 0;
+}
+
+.dict-row .setting-input {
+  flex: 1 1 0;
+  min-width: 0;
+  max-width: none;
+}
+
+.dict-arrow {
+  color: #6a6a7a;
+  font-size: 11px;
+  flex: 0 0 auto;
+}
+
+.dict-flag {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  font-size: 10px;
+  color: #8888a0;
+  flex: 0 0 auto;
+  cursor: pointer;
+}
+
+.dict-flag input {
+  margin: 0;
+}
+
+.dict-remove {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid #2a2a3a;
+  border-radius: 4px;
+  background: transparent;
+  color: #8888a0;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.dict-remove:hover {
+  border-color: #ef4444;
+  color: #f87171;
+}

@@ -35,6 +35,7 @@ rodio = "0.19"
 log = "0.4"
 env_logger = "0.11"
 humantime = "2"
+regex = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
