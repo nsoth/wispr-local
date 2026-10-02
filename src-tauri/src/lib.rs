@@ -83,6 +83,7 @@ pub fn run() {
     }
 
     env_logger::init();
+    log::info!("wispr-local {} starting", supervisor::build_identity());
     // Route whisper.cpp/GGML native log output through the `log` crate →
     // env_logger → stderr → supervisor pipe → wispr.log. Without this the
     // CUDA error text printed right before a GGML abort was lost with the
@@ -213,17 +214,11 @@ pub fn run() {
                 let _ = overlay_window.set_focusable(false);
             }
 
-            // Register global hotkey from settings
-            {
-                use tauri_plugin_global_shortcut::GlobalShortcutExt;
-                let shortcut = commands::parse_hotkey(&hotkey_string)
-                    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-                app.global_shortcut().register(shortcut)?;
-                log::info!(
-                    "Global hotkey registered: {} (hold to dictate)",
-                    hotkey_string
-                );
-            }
+            // Register the global hotkey. A conflict with another app used to
+            // panic setup → exit 101 → three supervisor restarts → "keeps
+            // crashing" dialog; now it is a soft error with retries, and the
+            // tray, settings and hotkey editor keep working.
+            register_hotkey_with_retries(app.handle().clone(), hotkey_string);
 
             // Make close button hide the window instead of destroying it
             if let Some(window) = app.get_webview_window("main") {
@@ -287,6 +282,8 @@ pub fn run() {
             commands::set_model_file,
             commands::reload_model,
             commands::log_frontend_error,
+            commands::get_app_info,
+            commands::restart_on_gpu,
             commands::get_last_transcription,
             commands::toggle_recording_lock,
             commands::get_history,
@@ -315,6 +312,78 @@ pub fn run() {
             commands::set_input_device,
             commands::probe_input_device,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| match event {
+            tauri::RunEvent::ExitRequested { code, .. } => {
+                log_exit_line(app, &format!("exit requested (code {code:?})"));
+            }
+            tauri::RunEvent::Exit => {
+                log_exit_line(app, "exiting (quit or session end)");
+            }
+            _ => {}
+        });
+}
+
+/// Write an exit marker straight into wispr.log: at logoff the pipe to the
+/// supervisor may already be gone, so `log::info!` alone leaves no trace.
+fn log_exit_line(app: &tauri::AppHandle, message: &str) {
+    log::info!("{message}");
+    use std::io::Write;
+    let path = app.state::<AppConfig>().data_dir.join("wispr.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let ts = humantime::format_rfc3339_seconds(std::time::SystemTime::now());
+        let _ = writeln!(f, "[{ts} child] {message}");
+    }
+}
+
+/// Register the hotkey now; on failure retry a few times in the background
+/// (another app may still be starting at logon), then surface the problem
+/// instead of crashing.
+fn register_hotkey_with_retries(app: tauri::AppHandle, hotkey: String) {
+    use tauri_plugin_global_shortcut::GlobalShortcutExt;
+    let shortcut = match commands::parse_hotkey(&hotkey) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("Saved hotkey '{hotkey}' is invalid ({e}); use Settings to set a new one");
+            pipeline::set_status(
+                &app,
+                AppStatus::error("hotkey", format!("Saved hotkey '{hotkey}' is invalid: {e}")),
+            );
+            return;
+        }
+    };
+    match app.global_shortcut().register(shortcut) {
+        Ok(()) => {
+            log::info!("Global hotkey registered: {hotkey} (hold to dictate)");
+            return;
+        }
+        Err(e) => log::warn!("Hotkey {hotkey} could not be registered ({e}); retrying"),
+    }
+    std::thread::spawn(move || {
+        for attempt in 1..=3 {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            match app.global_shortcut().register(shortcut) {
+                Ok(()) => {
+                    log::info!("Global hotkey registered on retry {attempt}: {hotkey}");
+                    return;
+                }
+                Err(e) => log::warn!("Hotkey retry {attempt} failed: {e}"),
+            }
+        }
+        let message =
+            format!("Hotkey {hotkey} is used by another app; choose a different one in Settings");
+        log::error!("{message}");
+        pipeline::set_status(&app, AppStatus::error("hotkey", message.clone()));
+        let _ = app.emit(events::OPERATION_NOTICE, &message);
+        pipeline::notify_user_long(&app, &message);
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    });
 }

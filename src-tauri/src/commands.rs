@@ -120,6 +120,19 @@ fn ensure_model_reload_allowed(state: &Mutex<AppState>) -> Result<(), String> {
     Ok(())
 }
 
+/// Version and build identity for the footer/About line.
+#[tauri::command]
+pub fn get_app_info() -> String {
+    crate::supervisor::build_identity()
+}
+
+/// Ask the supervisor to respawn the app on CUDA (after a CPU fallback).
+#[tauri::command]
+pub fn restart_on_gpu(app: AppHandle) {
+    log::info!("Restart on GPU requested");
+    app.exit(crate::supervisor::RESTART_ON_GPU_CODE);
+}
+
 /// Let the webview put its own failures into wispr.log, next to the backend's.
 #[tauri::command]
 pub fn log_frontend_error(command: String, message: String) {

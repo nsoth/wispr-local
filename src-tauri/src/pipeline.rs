@@ -545,13 +545,27 @@ pub fn set_model_state(app: &tauri::AppHandle, model: ModelState) {
 
 /// Model files to try, in order: the configured one, the shipped defaults,
 /// then anything else discovered in the models directory. Deduplicated.
-pub fn model_candidates(requested: &str, discovered: &[String]) -> Vec<String> {
+/// With `prefer_small` (CPU backend) the small/base models go first: the
+/// 1.5 GB turbo model takes minutes per utterance on the CPU.
+pub fn model_candidates(requested: &str, discovered: &[String], prefer_small: bool) -> Vec<String> {
     let mut candidates: Vec<String> = Vec::new();
     let mut push = |name: &str| {
         if !name.trim().is_empty() && !candidates.iter().any(|c| c == name) {
             candidates.push(name.to_string());
         }
     };
+    if prefer_small {
+        let mut small: Vec<&String> = discovered
+            .iter()
+            .filter(|n| n.contains("small") || n.contains("base") || n.contains("tiny"))
+            .collect();
+        // Quantized first, then by name (tiny < base < small sorts the wrong
+        // way; a stable preference list is simpler than ranking by size).
+        small.sort_by_key(|n| (!n.contains("q5"), (*n).clone()));
+        for name in small {
+            push(name);
+        }
+    }
     push(requested);
     push(&settings::default_model_file());
     push("ggml-medium.bin");
@@ -634,7 +648,11 @@ pub fn spawn_model_loader(app: tauri::AppHandle, requested: String) {
 fn load_first_available(app: &tauri::AppHandle, requested: &str) -> ModelState {
     let config = app.state::<AppConfig>();
     let discovered = config.available_model_files();
-    let candidates = model_candidates(requested, &discovered);
+    let prefer_small = std::env::var("WISPR_FORCE_CPU").is_ok();
+    if prefer_small {
+        log::info!("CPU backend forced by the supervisor: preferring small models");
+    }
+    let candidates = model_candidates(requested, &discovered, prefer_small);
     let engine = app.state::<Mutex<WhisperEngine>>();
 
     let mut any_present = false;
@@ -938,7 +956,7 @@ mod tests {
             "ggml-small-q5_1.bin".to_string(),
         ];
         assert_eq!(
-            model_candidates("ggml-small-q5_1.bin", &discovered),
+            model_candidates("ggml-small-q5_1.bin", &discovered, false),
             vec![
                 "ggml-small-q5_1.bin",
                 "ggml-large-v3-turbo.bin",
@@ -951,8 +969,28 @@ mod tests {
     #[test]
     fn empty_request_falls_back_to_defaults() {
         assert_eq!(
-            model_candidates("  ", &[]),
+            model_candidates("  ", &[], false),
             vec!["ggml-large-v3-turbo.bin", "ggml-medium.bin"]
+        );
+    }
+
+    #[test]
+    fn cpu_backend_prefers_small_models_first() {
+        let discovered = vec![
+            "ggml-base.bin".to_string(),
+            "ggml-large-v3-turbo.bin".to_string(),
+            "ggml-small-q5_1.bin".to_string(),
+            "ggml-small.bin".to_string(),
+        ];
+        assert_eq!(
+            model_candidates("ggml-large-v3-turbo.bin", &discovered, true),
+            vec![
+                "ggml-small-q5_1.bin",
+                "ggml-base.bin",
+                "ggml-small.bin",
+                "ggml-large-v3-turbo.bin",
+                "ggml-medium.bin",
+            ]
         );
     }
 
