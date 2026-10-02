@@ -49,10 +49,10 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         .tooltip("Wispr Local - Idle")
         .on_menu_event(|app, event| match event.id.as_ref() {
             "start_recording" => {
-                let _ = app.emit("tray-start-recording", ());
+                let _ = app.emit(crate::events::REQUEST_START_RECORDING, ());
             }
             "stop_recording" => {
-                let _ = app.emit("tray-stop-recording", ());
+                let _ = app.emit(crate::events::REQUEST_STOP_RECORDING, ());
             }
             "show_window" => {
                 if let Some(window) = app.get_webview_window("main") {

@@ -10,8 +10,16 @@ pub struct Settings {
     pub start_sound: String,
     #[serde(default)]
     pub stop_sound: String,
+    /// Legacy master volume. Still written (as the stop volume) so an older
+    /// build reading this file keeps a sensible level.
     #[serde(default = "default_volume")]
     pub sound_volume: f32,
+    /// Explicit chime volumes. `None` resolves from `sound_volume`: the start
+    /// chime at [`START_VOLUME_FACTOR`] of it, the stop chime at it exactly.
+    #[serde(default)]
+    pub start_volume: Option<f32>,
+    #[serde(default)]
+    pub stop_volume: Option<f32>,
     #[serde(default)]
     pub ai: AiSettings,
     #[serde(default)]
@@ -36,6 +44,10 @@ fn default_volume() -> f32 {
     0.5
 }
 
+/// Default start-chime level relative to the stop chime: the start cue is a
+/// private "I'm listening" signal, the stop cue confirms a paste.
+pub const START_VOLUME_FACTOR: f32 = 0.6;
+
 fn default_show_overlay() -> bool {
     true
 }
@@ -51,6 +63,8 @@ impl Default for Settings {
             start_sound: String::new(),
             stop_sound: String::new(),
             sound_volume: default_volume(),
+            start_volume: None,
+            stop_volume: None,
             ai: AiSettings::default(),
             run_on_startup: false,
             show_overlay: true,
@@ -62,6 +76,38 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// Effective start-chime volume in 0..=1.
+    pub fn start_volume(&self) -> f32 {
+        self.start_volume
+            .unwrap_or(self.sound_volume * START_VOLUME_FACTOR)
+            .clamp(0.0, 1.0)
+    }
+
+    /// Effective stop-chime volume in 0..=1.
+    pub fn stop_volume(&self) -> f32 {
+        self.stop_volume
+            .unwrap_or(self.sound_volume)
+            .clamp(0.0, 1.0)
+    }
+
+    /// Store explicit chime volumes; keeps the legacy master in sync.
+    pub fn set_volumes(&mut self, start: f32, stop: f32) {
+        let start = start.clamp(0.0, 1.0);
+        let stop = stop.clamp(0.0, 1.0);
+        self.start_volume = Some(start);
+        self.stop_volume = Some(stop);
+        self.sound_volume = stop;
+    }
+
+    pub fn sound_config(&self) -> crate::system::sounds::SoundConfig {
+        crate::system::sounds::SoundConfig {
+            start_sound: self.start_sound.clone(),
+            stop_sound: self.stop_sound.clone(),
+            start_volume: self.start_volume(),
+            stop_volume: self.stop_volume(),
+        }
+    }
+
     pub fn file_path(data_dir: &Path) -> PathBuf {
         data_dir.join("settings.json")
     }
@@ -128,5 +174,40 @@ impl Settings {
         let path = Self::file_path(data_dir);
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
         crate::config::write_file_atomic(&path, json.as_bytes())
+    }
+}
+
+#[cfg(test)]
+mod volume_tests {
+    use super::Settings;
+
+    #[test]
+    fn legacy_single_volume_resolves_to_quieter_start() {
+        let s: Settings =
+            serde_json::from_str(r#"{"hotkey":"Ctrl+Shift+Space","sound_volume":0.77}"#).unwrap();
+        assert!(
+            (s.start_volume() - 0.462).abs() < 1e-3,
+            "start = 0.6 x master"
+        );
+        assert!((s.stop_volume() - 0.77).abs() < 1e-6, "stop = master");
+    }
+
+    #[test]
+    fn explicit_volumes_round_trip_and_keep_master_for_older_builds() {
+        let mut s = Settings::default();
+        s.set_volumes(0.3, 0.9);
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert!((back.start_volume() - 0.3).abs() < 1e-6);
+        assert!((back.stop_volume() - 0.9).abs() < 1e-6);
+        assert!((back.sound_volume - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn volumes_are_clamped() {
+        let mut s = Settings::default();
+        s.set_volumes(-1.0, 7.0);
+        assert_eq!(s.start_volume(), 0.0);
+        assert_eq!(s.stop_volume(), 1.0);
     }
 }

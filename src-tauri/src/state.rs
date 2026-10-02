@@ -4,7 +4,11 @@ use std::path::{Path, PathBuf};
 /// Keep this many recent transcriptions for the in-app history.
 pub const HISTORY_LIMIT: usize = 5;
 
+/// Pipeline state as seen by the UI. Serializes as `{"state": "idle"}` or
+/// `{"state": "error", "message": "..."}` so both webviews branch on `state`
+/// instead of parsing free-form strings.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "message", rename_all = "lowercase")]
 pub enum AppStatus {
     #[default]
     Idle,
@@ -77,4 +81,26 @@ pub fn save_history(data_dir: &Path, history: &[String]) -> Result<(), String> {
     let path = history_path(data_dir);
     let json = serde_json::to_string_pretty(history).map_err(|e| e.to_string())?;
     crate::config::write_file_atomic(&path, json.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppStatus;
+    use serde_json::json;
+
+    #[test]
+    fn status_serializes_as_tagged_state_object() {
+        assert_eq!(
+            serde_json::to_value(AppStatus::Idle).unwrap(),
+            json!({ "state": "idle" })
+        );
+        assert_eq!(
+            serde_json::to_value(AppStatus::Transcribing).unwrap(),
+            json!({ "state": "transcribing" })
+        );
+        assert_eq!(
+            serde_json::to_value(AppStatus::Error("mic gone".to_string())).unwrap(),
+            json!({ "state": "error", "message": "mic gone" })
+        );
+    }
 }

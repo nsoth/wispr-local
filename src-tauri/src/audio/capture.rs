@@ -78,12 +78,15 @@ impl AudioCapture {
                             if let Some(ref h) = app_cb {
                                 if limit_reached && !limit_emitted {
                                     limit_emitted = true;
-                                    let _ = h.emit("recording-limit-reached", ());
+                                    let _ = h.emit(crate::events::RECORDING_LIMIT_REACHED, ());
                                 }
                                 let now = Instant::now();
                                 if now.duration_since(last_emit) >= LEVEL_INTERVAL {
                                     last_emit = now;
-                                    let _ = h.emit("audio-level", rms(&resampled) * LEVEL_GAIN);
+                                    let _ = h.emit(
+                                        crate::events::AUDIO_LEVEL,
+                                        rms(&resampled) * LEVEL_GAIN,
+                                    );
                                 }
                             }
                         },
@@ -92,7 +95,8 @@ impl AudioCapture {
                             if !error_emitted {
                                 error_emitted = true;
                                 if let Some(ref h) = error_app {
-                                    let _ = h.emit("audio-stream-error", err.to_string());
+                                    let _ =
+                                        h.emit(crate::events::AUDIO_STREAM_ERROR, err.to_string());
                                 }
                             }
                         },
@@ -120,12 +124,15 @@ impl AudioCapture {
                             if let Some(ref h) = app_cb {
                                 if limit_reached && !limit_emitted {
                                     limit_emitted = true;
-                                    let _ = h.emit("recording-limit-reached", ());
+                                    let _ = h.emit(crate::events::RECORDING_LIMIT_REACHED, ());
                                 }
                                 let now = Instant::now();
                                 if now.duration_since(last_emit) >= LEVEL_INTERVAL {
                                     last_emit = now;
-                                    let _ = h.emit("audio-level", rms(&resampled) * LEVEL_GAIN);
+                                    let _ = h.emit(
+                                        crate::events::AUDIO_LEVEL,
+                                        rms(&resampled) * LEVEL_GAIN,
+                                    );
                                 }
                             }
                         },
@@ -134,7 +141,8 @@ impl AudioCapture {
                             if !error_emitted {
                                 error_emitted = true;
                                 if let Some(ref h) = error_app {
-                                    let _ = h.emit("audio-stream-error", err.to_string());
+                                    let _ =
+                                        h.emit(crate::events::AUDIO_STREAM_ERROR, err.to_string());
                                 }
                             }
                         },

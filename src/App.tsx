@@ -2,12 +2,14 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import { EVENTS, IDLE_STATUS, type AppStatus } from "./ipc";
 import "./styles/global.css";
 
 interface SoundSettings {
   start_sound: string;
   stop_sound: string;
-  sound_volume: number;
+  start_volume: number;
+  stop_volume: number;
 }
 
 interface AiSettings {
@@ -28,7 +30,7 @@ interface InputDeviceInfo {
 type LanguageMode = "auto" | "ru" | "en";
 
 function App() {
-  const [status, setStatus] = useState("Idle");
+  const [status, setStatus] = useState<AppStatus>(IDLE_STATUS);
   const [isLoading, setIsLoading] = useState(true);
   const [notice, setNotice] = useState("");
   const [history, setHistory] = useState<string[]>([]);
@@ -46,7 +48,11 @@ function App() {
   const [hotkeyError, setHotkeyError] = useState("");
   const [startSound, setStartSound] = useState("");
   const [stopSound, setStopSound] = useState("");
-  const [soundVolume, setSoundVolume] = useState(0.5);
+  const [startVolume, setStartVolume] = useState(0.3);
+  const [stopVolume, setStopVolume] = useState(0.5);
+  // Latest sound values for the debounced save (avoids stale closures).
+  const soundRef = useRef({ start: "", stop: "", startVolume: 0.3, stopVolume: 0.5 });
+  const soundSaveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const [showSettings, setShowSettings] = useState(false);
   const [autostart, setAutostart] = useState(false);
   const [showOverlay, setShowOverlay] = useState(true);
@@ -55,7 +61,6 @@ function App() {
   const [inputDevice, setInputDevice] = useState("");
   const [refreshingDevices, setRefreshingDevices] = useState(false);
   const [aiSettingsLoaded, setAiSettingsLoaded] = useState(false);
-  const [soundSettingsLoaded, setSoundSettingsLoaded] = useState(false);
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const [aiSettings, setAiSettings] = useState<AiSettings>({
     provider: "none",
@@ -85,8 +90,14 @@ function App() {
       load<SoundSettings>("get_sound_settings", (sound) => {
         setStartSound(sound.start_sound);
         setStopSound(sound.stop_sound);
-        setSoundVolume(sound.sound_volume);
-        setSoundSettingsLoaded(true);
+        setStartVolume(sound.start_volume);
+        setStopVolume(sound.stop_volume);
+        soundRef.current = {
+          start: sound.start_sound,
+          stop: sound.stop_sound,
+          startVolume: sound.start_volume,
+          stopVolume: sound.stop_volume,
+        };
       }),
       load<AiSettings>("get_ai_settings", (ai) => {
         setAiSettings(ai);
@@ -97,7 +108,7 @@ function App() {
       load<LanguageMode>("get_language", setLanguage),
       load<InputDeviceInfo[]>("get_input_devices", setInputDevices),
       load<string>("get_input_device", setInputDevice),
-      load<string>("get_status", setStatus),
+      load<AppStatus>("get_status", setStatus),
     ]).then((results) => {
       if (!mounted) return;
       if (results.some((result) => result.status === "rejected")) {
@@ -106,23 +117,23 @@ function App() {
       setIsLoading(false);
     });
 
-    const unlisten1 = listen<string>("status-changed", (event) => {
+    const unlisten1 = listen<AppStatus>(EVENTS.statusChanged, (event) => {
       setStatus(event.payload);
-      if (event.payload !== "Recording") {
+      if (event.payload.state !== "recording") {
         setStreamingPreview("");
       }
     });
 
-    const unlisten2 = listen<string[]>("history-changed", (event) => {
+    const unlisten2 = listen<string[]>(EVENTS.historyChanged, (event) => {
       setHistory(event.payload);
     });
 
-    const unlisten3 = listen<string>("streaming-preview", (event) => {
+    const unlisten3 = listen<string>(EVENTS.streamingPreview, (event) => {
       setStreamingPreview(event.payload);
     });
 
     let noticeTimer: ReturnType<typeof setTimeout> | undefined;
-    const unlisten4 = listen<string>("transcription-empty", (event) => {
+    const unlisten4 = listen<string>(EVENTS.transcriptionEmpty, (event) => {
       const messages: Record<string, string> = {
         "too-short": "Recording too short — nothing captured",
         "no-speech": "No speech detected — try again",
@@ -133,7 +144,7 @@ function App() {
       noticeTimer = setTimeout(() => setNotice(""), 4000);
     });
 
-    const unlisten5 = listen<string>("operation-notice", (event) => {
+    const unlisten5 = listen<string>(EVENTS.operationNotice, (event) => {
       setNotice(event.payload);
       clearTimeout(noticeTimer);
       noticeTimer = setTimeout(() => setNotice(""), 6000);
@@ -142,7 +153,7 @@ function App() {
     // The model loads on a background thread; this fires once it finishes (or
     // fails), flipping the footer indicator without a restart.
     const unlisten6 = listen<{ loaded: boolean; backend: string }>(
-      "model-state-changed",
+      EVENTS.modelStateChanged,
       (event) => {
         setModelLoaded(event.payload.loaded);
         setComputeBackend(event.payload.backend);
@@ -161,6 +172,7 @@ function App() {
       unlisten6.then((fn) => fn());
       clearTimeout(noticeTimer);
       clearTimeout(copiedTimerRef.current);
+      clearTimeout(soundSaveTimer.current);
     };
   }, []);
 
@@ -175,17 +187,6 @@ function App() {
     }, 450);
     return () => clearTimeout(timer);
   }, [aiSettings, aiSettingsLoaded]);
-
-  useEffect(() => {
-    if (!soundSettingsLoaded) return;
-    const timer = setTimeout(() => {
-      void saveSoundSettings(startSound, stopSound, soundVolume);
-    }, 250);
-    return () => clearTimeout(timer);
-    // Sound paths are saved immediately by their own controls; this debounce
-    // intentionally follows only the frequently-changing volume value.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [soundVolume, soundSettingsLoaded]);
 
   const keyCodeToName = (e: KeyboardEvent): string | null => {
     const key = e.key;
@@ -270,14 +271,44 @@ function App() {
     setAiSettings(newSettings);
   };
 
-  const saveSoundSettings = (newStart: string, newStop: string, newVol: number) => {
+  // Saves only run from explicit user edits (never from the initial load), so
+  // a fresh start can never rewrite settings.json with whatever it read.
+  const saveSoundSettings = (
+    newStart: string,
+    newStop: string,
+    newStartVolume: number,
+    newStopVolume: number,
+  ) => {
+    soundRef.current = {
+      start: newStart,
+      stop: newStop,
+      startVolume: newStartVolume,
+      stopVolume: newStopVolume,
+    };
     return invoke("set_sound_settings", {
       startSound: newStart,
       stopSound: newStop,
-      soundVolume: newVol,
+      startVolume: newStartVolume,
+      stopVolume: newStopVolume,
     }).catch((error) => {
       setNotice(`Could not save sound settings: ${String(error)}`);
     });
+  };
+
+  // Sliders fire continuously; persist 250 ms after the last change.
+  const scheduleVolumeSave = (which: "start" | "stop", value: number) => {
+    if (which === "start") {
+      setStartVolume(value);
+      soundRef.current.startVolume = value;
+    } else {
+      setStopVolume(value);
+      soundRef.current.stopVolume = value;
+    }
+    clearTimeout(soundSaveTimer.current);
+    soundSaveTimer.current = setTimeout(() => {
+      const s = soundRef.current;
+      void saveSoundSettings(s.start, s.stop, s.startVolume, s.stopVolume);
+    }, 250);
   };
 
   const pickSoundFile = async (which: "start" | "stop") => {
@@ -287,34 +318,32 @@ function App() {
     });
     if (typeof file === "string") {
       const path = file;
+      const s = soundRef.current;
       if (which === "start") {
         setStartSound(path);
-        void saveSoundSettings(path, stopSound, soundVolume);
+        void saveSoundSettings(path, s.stop, s.startVolume, s.stopVolume);
       } else {
         setStopSound(path);
-        void saveSoundSettings(startSound, path, soundVolume);
+        void saveSoundSettings(s.start, path, s.startVolume, s.stopVolume);
       }
     }
   };
 
   const clearSound = (which: "start" | "stop") => {
+    const s = soundRef.current;
     if (which === "start") {
       setStartSound("");
-      void saveSoundSettings("", stopSound, soundVolume);
+      void saveSoundSettings("", s.stop, s.startVolume, s.stopVolume);
     } else {
       setStopSound("");
-      void saveSoundSettings(startSound, "", soundVolume);
+      void saveSoundSettings(s.start, "", s.startVolume, s.stopVolume);
     }
   };
 
-  const handleVolumeChange = (vol: number) => {
-    setSoundVolume(vol);
-  };
-
-  const testSound = (which: string) => {
-    invoke("test_sound", { which }).catch((error) =>
-      setNotice(`Could not play sound: ${String(error)}`),
-    );
+  const testSound = (which: "start" | "stop", volume: number) => {
+    invoke<string>("test_sound", { which, volume })
+      .then((device) => setNotice(`Played on ${device}`))
+      .catch((error) => setNotice(`Could not play sound: ${String(error)}`));
   };
 
   const fileName = (path: string) => {
@@ -369,12 +398,13 @@ function App() {
   };
 
   const hotkeyParts = hotkey.split("+");
-  const isRecording = status === "Recording";
-  const isTranscribing = status === "Transcribing";
-  const isFormatting = status === "Formatting";
-  const isInjecting = status === "Injecting";
+  const isRecording = status.state === "recording";
+  const isTranscribing = status.state === "transcribing";
+  const isFormatting = status.state === "formatting";
+  const isInjecting = status.state === "injecting";
   const isProcessing = isTranscribing || isFormatting || isInjecting;
-  const hasError = status.startsWith("Error") || status.startsWith("Microphone error");
+  const hasError = status.state === "error";
+  const errorText = status.message || "Something went wrong";
 
   return (
     <div className="app">
@@ -440,7 +470,7 @@ function App() {
                 : isInjecting
                 ? "Pasting..."
                 : hasError
-                ? status
+                ? errorText
                 : "Ready"}
             </div>
 
@@ -639,7 +669,11 @@ function App() {
                 <button type="button" className="sound-btn" onClick={() => pickSoundFile("start")}>
                   Browse
                 </button>
-                <button type="button" className="sound-btn" onClick={() => testSound("start")}>
+                <button
+                  type="button"
+                  className="sound-btn"
+                  onClick={() => testSound("start", startVolume)}
+                >
                   Test
                 </button>
               </div>
@@ -663,25 +697,46 @@ function App() {
                 <button type="button" className="sound-btn" onClick={() => pickSoundFile("stop")}>
                   Browse
                 </button>
-                <button type="button" className="sound-btn" onClick={() => testSound("stop")}>
+                <button
+                  type="button"
+                  className="sound-btn"
+                  onClick={() => testSound("stop", stopVolume)}
+                >
                   Test
                 </button>
               </div>
             </div>
 
             <div className="volume-row">
-              <span className="sound-label">Volume</span>
+              <span className="sound-label">Start volume</span>
               <input
                 type="range"
                 min="0"
                 max="100"
-                value={Math.round(soundVolume * 100)}
-                aria-label="Sound volume"
-                aria-valuetext={`${Math.round(soundVolume * 100)} percent`}
-                onChange={(e) => handleVolumeChange(Number(e.target.value) / 100)}
+                value={Math.round(startVolume * 100)}
+                aria-label="Start chime volume"
+                aria-valuetext={`${Math.round(startVolume * 100)} percent`}
+                onChange={(e) => scheduleVolumeSave("start", Number(e.target.value) / 100)}
                 className="volume-slider"
               />
-              <span className="volume-value">{Math.round(soundVolume * 100)}%</span>
+              <span className="volume-value">{Math.round(startVolume * 100)}%</span>
+            </div>
+            <div className="volume-row">
+              <span className="sound-label">Stop volume</span>
+              <input
+                type="range"
+                min="0"
+                max="100"
+                value={Math.round(stopVolume * 100)}
+                aria-label="Stop chime volume"
+                aria-valuetext={`${Math.round(stopVolume * 100)} percent`}
+                onChange={(e) => scheduleVolumeSave("stop", Number(e.target.value) / 100)}
+                className="volume-slider"
+              />
+              <span className="volume-value">{Math.round(stopVolume * 100)}%</span>
+            </div>
+            <div className="settings-note">
+              Chimes play on the current Windows default output device.
             </div>
           </div>
 

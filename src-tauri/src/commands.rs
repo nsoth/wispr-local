@@ -7,18 +7,11 @@ use crate::settings::Settings;
 use crate::state::{AppState, AppStatus};
 use crate::system::sounds::SoundPlayer;
 
+/// Current pipeline status, in the same shape as the `status-changed` event.
 #[tauri::command]
-pub fn get_status(state: State<'_, Mutex<AppState>>) -> Result<String, String> {
+pub fn get_status(state: State<'_, Mutex<AppState>>) -> Result<AppStatus, String> {
     let app_state = state.lock().map_err(|e| e.to_string())?;
-    let status = match &app_state.status {
-        AppStatus::Idle => "Idle".to_string(),
-        AppStatus::Recording => "Recording".to_string(),
-        AppStatus::Transcribing => "Transcribing".to_string(),
-        AppStatus::Formatting => "Formatting".to_string(),
-        AppStatus::Injecting => "Injecting".to_string(),
-        AppStatus::Error(e) => format!("Error: {}", e),
-    };
-    Ok(status)
+    Ok(app_state.status.clone())
 }
 
 // Both read from AppState rather than the engine mutex: the model loads on a
@@ -71,12 +64,12 @@ pub fn toggle_recording_lock(
     match action {
         "lock" => {
             log::info!("Recording pinned via overlay button");
-            let _ = app.emit("lock-changed", true);
+            let _ = app.emit(crate::events::LOCK_CHANGED, true);
             Ok(true)
         }
         _ => {
             log::info!("Pinned recording stopped via overlay button");
-            let _ = app.emit("hotkey-stop-recording", ());
+            let _ = app.emit(crate::events::REQUEST_STOP_RECORDING, ());
             Ok(false)
         }
     }
@@ -105,7 +98,7 @@ pub fn clear_history(
         }
     }
     let history: Vec<String> = Vec::new();
-    app.emit("history-changed", &history)
+    app.emit(crate::events::HISTORY_CHANGED, &history)
         .map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -213,7 +206,8 @@ fn has_modifier(hotkey: &str) -> bool {
 pub struct SoundSettings {
     pub start_sound: String,
     pub stop_sound: String,
-    pub sound_volume: f32,
+    pub start_volume: f32,
+    pub stop_volume: f32,
 }
 
 #[tauri::command]
@@ -222,7 +216,8 @@ pub fn get_sound_settings(settings: State<'_, Mutex<Settings>>) -> Result<SoundS
     Ok(SoundSettings {
         start_sound: s.start_sound.clone(),
         stop_sound: s.stop_sound.clone(),
-        sound_volume: s.sound_volume,
+        start_volume: s.start_volume(),
+        stop_volume: s.stop_volume(),
     })
 }
 
@@ -230,40 +225,43 @@ pub fn get_sound_settings(settings: State<'_, Mutex<Settings>>) -> Result<SoundS
 pub fn set_sound_settings(
     start_sound: String,
     stop_sound: String,
-    sound_volume: f32,
+    start_volume: f32,
+    stop_volume: f32,
     settings: State<'_, Mutex<Settings>>,
     config: State<'_, AppConfig>,
     player: State<'_, SoundPlayer>,
 ) -> Result<(), String> {
-    let volume = sound_volume.clamp(0.0, 1.0);
-
     // Persist first; don't leave runtime behavior different from the UI if the
     // settings file is temporarily unavailable.
-    let (runtime_start, runtime_stop) = {
+    let runtime_config = {
         let mut s = settings.lock().map_err(|e| e.to_string())?;
-        let previous = (s.start_sound.clone(), s.stop_sound.clone(), s.sound_volume);
+        let previous = s.clone();
         s.start_sound = start_sound;
         s.stop_sound = stop_sound;
-        s.sound_volume = volume;
+        s.set_volumes(start_volume, stop_volume);
         if let Err(e) = s.save(&config.data_dir) {
-            (s.start_sound, s.stop_sound, s.sound_volume) = previous;
+            *s = previous;
             return Err(e);
         }
-        (s.start_sound.clone(), s.stop_sound.clone())
+        s.sound_config()
     };
-    player.update_config(runtime_start, runtime_stop, volume);
+    player.update_config(runtime_config);
 
     Ok(())
 }
 
+/// Play a chime now and report which output device it went to. `volume`
+/// overrides the saved level so the Settings slider can be auditioned before
+/// its debounced save lands.
 #[tauri::command]
-pub fn test_sound(which: String, player: State<'_, SoundPlayer>) -> Result<(), String> {
-    match which.as_str() {
-        "start" => player.play_start(),
-        "stop" => player.play_stop(),
-        _ => return Err("Unknown sound: use 'start' or 'stop'".to_string()),
-    }
-    Ok(())
+pub fn test_sound(
+    which: String,
+    volume: Option<f32>,
+    player: State<'_, SoundPlayer>,
+) -> Result<String, String> {
+    let kind = crate::system::sounds::SoundKind::parse(&which)
+        .ok_or_else(|| "Unknown sound: use 'start', 'stop', 'busy' or 'cancel'".to_string())?;
+    player.play_and_wait(kind, volume, std::time::Duration::from_secs(6))
 }
 
 #[tauri::command]

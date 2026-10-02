@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import { EVENTS, type AppStatus } from "./ipc";
 import "./styles/overlay.css";
 
 const BAR_COUNT = 28;
@@ -14,17 +15,17 @@ export default function Overlay() {
   const [isLocked, setIsLocked] = useState(false);
 
   useEffect(() => {
-    const unStatus = listen<string>("status-changed", (e) => {
-      const recording = e.payload === "Recording";
+    const unStatus = listen<AppStatus>(EVENTS.statusChanged, (e) => {
+      const recording = e.payload.state === "recording";
       setIsRecording(recording);
       if (!recording) setIsLocked(false);
     });
 
-    const unLock = listen<boolean>("lock-changed", (e) => {
+    const unLock = listen<boolean>(EVENTS.lockChanged, (e) => {
       setIsLocked(e.payload);
     });
 
-    const unLevel = listen<number>("audio-level", (e) => {
+    const unLevel = listen<number>(EVENTS.audioLevel, (e) => {
       // Shift the ring buffer and push the new sample at the right edge.
       const arr = levelsRef.current;
       arr.shift();
