@@ -111,7 +111,7 @@ pub fn reload_model(
 
 fn ensure_model_reload_allowed(state: &Mutex<AppState>) -> Result<(), String> {
     let s = crate::state::lock_or_recover(state);
-    if !matches!(s.status, AppStatus::Idle | AppStatus::Error(_)) {
+    if !matches!(s.status, AppStatus::Idle | AppStatus::Error { .. }) {
         return Err("Finish the current dictation before reloading the model".to_string());
     }
     if s.model == ModelState::Loading {
@@ -592,6 +592,42 @@ pub fn set_input_device(
         return Err(e);
     }
     Ok(())
+}
+
+/// Check that the configured microphone (or the system default) can be
+/// resolved right now; clears a standing microphone error. Returns the name
+/// of the device that would be used.
+#[tauri::command]
+pub fn probe_input_device(
+    app: AppHandle,
+    settings: State<'_, Mutex<Settings>>,
+    state: State<'_, Mutex<AppState>>,
+) -> Result<String, String> {
+    let preferred = settings
+        .lock()
+        .map_err(|e| e.to_string())?
+        .input_device
+        .clone();
+    let selected = crate::audio::devices::select_input_device(
+        (!preferred.is_empty()).then_some(preferred.as_str()),
+    )?;
+    let cleared = {
+        let mut s = crate::state::lock_or_recover(&state);
+        if matches!(&s.status, AppStatus::Error { code, .. } if code == "mic") {
+            s.status = AppStatus::Idle;
+            true
+        } else {
+            false
+        }
+    };
+    if cleared {
+        crate::pipeline::emit_status(&app, &AppStatus::Idle);
+    }
+    Ok(if selected.used_fallback {
+        format!("{} (fallback)", selected.name)
+    } else {
+        selected.name
+    })
 }
 
 #[tauri::command]

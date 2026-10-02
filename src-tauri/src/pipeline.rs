@@ -10,6 +10,7 @@ use tauri::{Emitter, Manager};
 
 use crate::audio::buffer::AudioBuffer;
 use crate::audio::capture::AudioCapture;
+use crate::audio::devices;
 use crate::config::AppConfig;
 use crate::events;
 use crate::overlay::{hide_overlay, show_overlay_if_enabled};
@@ -45,7 +46,7 @@ pub fn start_recording_flow(app: &tauri::AppHandle) {
 
     let model = {
         let mut s = lock_or_recover(&state);
-        if !matches!(s.status, AppStatus::Idle | AppStatus::Error(_)) {
+        if !matches!(s.status, AppStatus::Idle | AppStatus::Error { .. }) {
             log::info!("Ignoring recording request while app is busy");
             return;
         }
@@ -112,27 +113,47 @@ pub fn start_recording_flow(app: &tauri::AppHandle) {
         });
     match start_result {
         Ok(start) => {
-            if let Ok(mut s) = state.lock() {
-                s.device_sample_rate = start.sample_rate;
-            }
+            lock_or_recover(&state).device_sample_rate = start.sample_rate;
             log::info!(
-                "Recording started at {} Hz with input device {}",
+                "Recording started at {} Hz, {} ch, input device {}",
                 start.sample_rate,
+                start.channels,
                 start.device_name
             );
             if start.used_fallback {
-                let message = format!(
-                    "Selected microphone is unavailable; using {}.",
+                log::warn!(
+                    "Preferred microphone unavailable ({}); using {}",
+                    start.fallback_reason.as_deref().unwrap_or("not found"),
                     start.device_name
                 );
-                let _ = app.emit(events::OPERATION_NOTICE, &message);
-                notify_user(app, &message);
+                // Announce once per fallback device, not on every recording.
+                let announce = {
+                    let mut s = lock_or_recover(&state);
+                    let yes = devices::should_announce_fallback(
+                        s.last_fallback_device.as_deref(),
+                        &start.device_name,
+                    );
+                    if yes {
+                        s.last_fallback_device = Some(start.device_name.clone());
+                    }
+                    yes
+                };
+                if announce {
+                    let message = format!(
+                        "Selected microphone is unavailable; using {} until it is back.",
+                        start.device_name
+                    );
+                    let _ = app.emit(events::OPERATION_NOTICE, &message);
+                    notify_user(app, &message);
+                }
+            } else {
+                lock_or_recover(&state).last_fallback_device = None;
             }
         }
         Err(e) => {
             log::error!("Failed to start recording: {}", e);
+            set_status(app, AppStatus::error("mic", e.clone()));
             let message = format!("Microphone error: {e}");
-            set_status(app, AppStatus::Error(message.clone()));
             let _ = app.emit(events::OPERATION_NOTICE, &message);
             notify_user(app, &message);
             app.state::<TrayAnimator>().stop();

@@ -899,3 +899,24 @@ input:checked + .toggle-slider::before {
   border-color: #ef4444;
   color: #f87171;
 }
+
+/* ---- Microphone error ---- */
+.mic-error {
+  max-width: 300px;
+  text-align: center;
+}
+
+.mic-error-detail {
+  font-size: 11px;
+  line-height: 1.45;
+  color: #fca5a5;
+  user-select: text;
+  word-break: break-word;
+}
+
+.mic-error-actions {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 6px;
+}

@@ -24,6 +24,8 @@ export type AppStatusState =
 /** Serialized `AppStatus` from Rust: `{ state }` or `{ state: "error", message }`. */
 export interface AppStatus {
   state: AppStatusState;
+  /** Error class, e.g. "mic" (set only when state is "error"). */
+  code?: string;
   message?: string;
 }
 

@@ -9,10 +9,10 @@ use std::sync::{Mutex, MutexGuard};
 pub const HISTORY_LIMIT: usize = 5;
 
 /// Pipeline state as seen by the UI. Serializes as `{"state": "idle"}` or
-/// `{"state": "error", "message": "..."}` so both webviews branch on `state`
-/// instead of parsing free-form strings.
+/// `{"state": "error", "code": "mic", "message": "..."}` so both webviews
+/// branch on `state` (and `code`) instead of parsing free-form strings.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "state", content = "message", rename_all = "lowercase")]
+#[serde(tag = "state", rename_all = "lowercase")]
 pub enum AppStatus {
     #[default]
     Idle,
@@ -20,7 +20,20 @@ pub enum AppStatus {
     Transcribing,
     Formatting,
     Injecting,
-    Error(String),
+    Error {
+        /// Machine-readable class: `mic` for a microphone that failed to open.
+        code: String,
+        message: String,
+    },
+}
+
+impl AppStatus {
+    pub fn error(code: &str, message: impl Into<String>) -> Self {
+        AppStatus::Error {
+            code: code.to_string(),
+            message: message.into(),
+        }
+    }
 }
 
 /// Problems found while loading state files at startup. Shown in the main
@@ -92,6 +105,9 @@ pub struct AppState {
     /// Most recent transcriptions, newest first, capped at HISTORY_LIMIT.
     pub history: Vec<String>,
     pub diagnostics: StartupDiagnostics,
+    /// The fallback microphone that was last announced, so the toast fires
+    /// once per device instead of on every recording.
+    pub last_fallback_device: Option<String>,
 }
 
 impl Default for AppState {
@@ -104,6 +120,7 @@ impl Default for AppState {
             recording_locked: false,
             history: Vec::new(),
             diagnostics: StartupDiagnostics::default(),
+            last_fallback_device: None,
         }
     }
 }
@@ -225,8 +242,8 @@ mod tests {
             json!({ "state": "transcribing" })
         );
         assert_eq!(
-            serde_json::to_value(AppStatus::Error("mic gone".to_string())).unwrap(),
-            json!({ "state": "error", "message": "mic gone" })
+            serde_json::to_value(AppStatus::error("mic", "mic gone")).unwrap(),
+            json!({ "state": "error", "code": "mic", "message": "mic gone" })
         );
     }
 

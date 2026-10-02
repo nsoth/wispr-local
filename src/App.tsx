@@ -71,6 +71,7 @@ interface InputDeviceInfo {
   name: string;
   sample_rate: number;
   channels: number;
+  is_default: boolean;
 }
 
 // Mirrors the Rust LanguageMode enum (serde "auto"/"ru"/"en").
@@ -609,7 +610,22 @@ function App() {
   const isInjecting = status.state === "injecting";
   const isProcessing = isTranscribing || isFormatting || isInjecting;
   const hasError = status.state === "error";
-  const errorText = status.message || "Something went wrong";
+  const isMicError = hasError && status.code === "mic";
+  const errorText = isMicError
+    ? "Microphone unavailable"
+    : status.message || "Something went wrong";
+
+  const retryMicrophone = () => {
+    invoke<string>("probe_input_device")
+      .then((device) => setNotice(`Microphone OK: ${device}`))
+      .catch((error) => setError(`Microphone still unavailable: ${String(error)}`));
+  };
+
+  const openMicrophoneSettings = () => {
+    setShowSettings(true);
+    void refreshInputDevices();
+    setTimeout(() => document.getElementById("microphone-select")?.focus(), 50);
+  };
 
   return (
     <div className="app">
@@ -622,7 +638,10 @@ function App() {
           onClick={() => {
             const next = !showSettings;
             setShowSettings(next);
-            if (next) void refreshModelFiles();
+            if (next) {
+              void refreshModelFiles();
+              void refreshInputDevices();
+            }
           }}
           aria-label={showSettings ? "Return to dictation status" : "Open settings"}
           aria-expanded={showSettings}
@@ -699,6 +718,20 @@ function App() {
                 ? errorText
                 : "Ready"}
             </div>
+
+            {isMicError && (
+              <div className="mic-error">
+                <div className="mic-error-detail">{status.message}</div>
+                <div className="mic-error-actions">
+                  <button type="button" className="sound-btn" onClick={openMicrophoneSettings}>
+                    Choose microphone
+                  </button>
+                  <button type="button" className="sound-btn" onClick={retryMicrophone}>
+                    Retry
+                  </button>
+                </div>
+              </div>
+            )}
 
             {isRecording && streamingPreview && (
               <div className="streaming-preview" aria-live="polite">
@@ -856,7 +889,10 @@ function App() {
                   )}
                   {inputDevices.map((device) => (
                     <option key={device.name} value={device.name}>
-                      {device.name} · {Math.round(device.sample_rate / 1000)} kHz
+                      {device.name}
+                      {device.is_default ? " (default)" : ""} ·{" "}
+                      {Math.round(device.sample_rate / 1000)} kHz ·{" "}
+                      {device.channels === 1 ? "mono" : "stereo"}
                     </option>
                   ))}
                 </select>

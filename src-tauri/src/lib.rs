@@ -307,6 +307,7 @@ pub fn run() {
             commands::get_input_devices,
             commands::get_input_device,
             commands::set_input_device,
+            commands::probe_input_device,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

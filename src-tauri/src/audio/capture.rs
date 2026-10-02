@@ -1,5 +1,10 @@
+//! Microphone capture: opens the selected (or default) input device, converts
+//! every packet to 16 kHz mono f32 and appends it to the shared buffer.
+
 use cpal::traits::{DeviceTrait, StreamTrait};
-use cpal::{SampleFormat, Stream, StreamConfig};
+use cpal::{
+    FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig, SupportedStreamConfig,
+};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
@@ -10,6 +15,9 @@ use super::devices;
 /// is peak-normalized right before transcription (see WhisperEngine), which
 /// avoids the clipping distortion a fixed capture gain caused on loud speech.
 const LEVEL_GAIN: f32 = 4.0;
+
+/// Throttle level events to ~20Hz — enough for smooth waveform, cheap.
+const LEVEL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Wrapper to make cpal::Stream usable across threads.
 /// On WASAPI (Windows), the stream handle is safe to move between threads.
@@ -26,12 +34,12 @@ pub struct AudioCapture {
 
 pub struct CaptureStart {
     pub sample_rate: u32,
+    pub channels: u16,
     pub device_name: String,
+    /// The preferred microphone was not used (absent or failed to open).
     pub used_fallback: bool,
+    pub fallback_reason: Option<String>,
 }
-
-// AudioCapture is Send+Sync because SendStream is Send and other fields are Send+Sync
-unsafe impl Sync for AudioCapture {}
 
 impl AudioCapture {
     pub fn new(buffer: AudioBuffer) -> Self {
@@ -47,121 +55,78 @@ impl AudioCapture {
         app: Option<AppHandle>,
         preferred_device: Option<&str>,
     ) -> Result<CaptureStart, String> {
-        let (device, supported_config, device_name, used_fallback) =
-            devices::select_input_device(preferred_device)?;
+        // Never leave a previous stream running underneath a new one.
+        self.stream = None;
 
-        let sample_format = supported_config.sample_format();
-        let config: StreamConfig = supported_config.into();
-        self.device_sample_rate = config.sample_rate.0;
+        let selected = devices::select_input_device(preferred_device)?;
+        let mut used_fallback = selected.used_fallback;
+        let mut fallback_reason = selected.fallback_reason.clone();
+
+        let (stream, config, device_name) =
+            match self.open_stream(&selected.device, &selected.config, app.clone()) {
+                Ok(stream) => (stream, selected.config.clone(), selected.name.clone()),
+                Err(e) if !selected.used_fallback && preferred_device.is_some() => {
+                    // The preferred microphone exists but refuses to open
+                    // (seen with a virtual mic whose host app is not running):
+                    // use the system default rather than failing the recording.
+                    log::warn!(
+                        "Preferred microphone '{}' failed to open ({e}); trying the system default",
+                        selected.name
+                    );
+                    let fallback = devices::select_input_device(None)?;
+                    if fallback.name == selected.name {
+                        return Err(e);
+                    }
+                    let stream = self.open_stream(&fallback.device, &fallback.config, app)?;
+                    used_fallback = true;
+                    fallback_reason = Some(format!("'{}' could not be opened: {e}", selected.name));
+                    (stream, fallback.config.clone(), fallback.name.clone())
+                }
+                Err(e) => return Err(e),
+            };
+
+        self.stream = Some(SendStream(stream));
+        self.device_sample_rate = config.sample_rate().0;
+        Ok(CaptureStart {
+            sample_rate: self.device_sample_rate,
+            channels: config.channels(),
+            device_name,
+            used_fallback,
+            fallback_reason,
+        })
+    }
+
+    fn open_stream(
+        &mut self,
+        device: &cpal::Device,
+        supported: &SupportedStreamConfig,
+        app: Option<AppHandle>,
+    ) -> Result<Stream, String> {
+        let sample_format = supported.sample_format();
+        let config: StreamConfig = supported.clone().into();
         let channels = config.channels as usize;
-        let native_rate = self.device_sample_rate;
-
-        // Throttle level events to ~20Hz — enough for smooth waveform, cheap.
-        const LEVEL_INTERVAL: Duration = Duration::from_millis(50);
+        let native_rate = config.sample_rate.0;
+        let buffer = self.buffer.clone();
 
         let stream = match sample_format {
             SampleFormat::F32 => {
-                let buffer = self.buffer.clone();
-                let app_cb = app.clone();
-                let error_app = app.clone();
-                let mut last_emit = Instant::now() - LEVEL_INTERVAL;
-                let mut limit_emitted = false;
-                let mut error_emitted = false;
-                device
-                    .build_input_stream(
-                        &config,
-                        move |data: &[f32], _info: &cpal::InputCallbackInfo| {
-                            let mono = to_mono(data, channels);
-                            let resampled = resample(&mono, native_rate, 16000);
-                            let limit_reached = buffer.push_samples(&resampled);
-
-                            if let Some(ref h) = app_cb {
-                                if limit_reached && !limit_emitted {
-                                    limit_emitted = true;
-                                    let _ = h.emit(crate::events::RECORDING_LIMIT_REACHED, ());
-                                }
-                                let now = Instant::now();
-                                if now.duration_since(last_emit) >= LEVEL_INTERVAL {
-                                    last_emit = now;
-                                    let _ = h.emit(
-                                        crate::events::AUDIO_LEVEL,
-                                        rms(&resampled) * LEVEL_GAIN,
-                                    );
-                                }
-                            }
-                        },
-                        move |err| {
-                            log::error!("Audio stream error: {}", err);
-                            if !error_emitted {
-                                error_emitted = true;
-                                if let Some(ref h) = error_app {
-                                    let _ =
-                                        h.emit(crate::events::AUDIO_STREAM_ERROR, err.to_string());
-                                }
-                            }
-                        },
-                        None,
-                    )
-                    .map_err(|e| format!("Failed to build f32 input stream: {}", e))?
+                build_stream::<f32>(device, &config, buffer, app, channels, native_rate)?
             }
             SampleFormat::I16 => {
-                let buffer = self.buffer.clone();
-                let app_cb = app.clone();
-                let error_app = app.clone();
-                let mut last_emit = Instant::now() - LEVEL_INTERVAL;
-                let mut limit_emitted = false;
-                let mut error_emitted = false;
-                device
-                    .build_input_stream(
-                        &config,
-                        move |data: &[i16], _info: &cpal::InputCallbackInfo| {
-                            let float_data: Vec<f32> =
-                                data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
-                            let mono = to_mono(&float_data, channels);
-                            let resampled = resample(&mono, native_rate, 16000);
-                            let limit_reached = buffer.push_samples(&resampled);
-
-                            if let Some(ref h) = app_cb {
-                                if limit_reached && !limit_emitted {
-                                    limit_emitted = true;
-                                    let _ = h.emit(crate::events::RECORDING_LIMIT_REACHED, ());
-                                }
-                                let now = Instant::now();
-                                if now.duration_since(last_emit) >= LEVEL_INTERVAL {
-                                    last_emit = now;
-                                    let _ = h.emit(
-                                        crate::events::AUDIO_LEVEL,
-                                        rms(&resampled) * LEVEL_GAIN,
-                                    );
-                                }
-                            }
-                        },
-                        move |err| {
-                            log::error!("Audio stream error: {}", err);
-                            if !error_emitted {
-                                error_emitted = true;
-                                if let Some(ref h) = error_app {
-                                    let _ =
-                                        h.emit(crate::events::AUDIO_STREAM_ERROR, err.to_string());
-                                }
-                            }
-                        },
-                        None,
-                    )
-                    .map_err(|e| format!("Failed to build i16 input stream: {}", e))?
+                build_stream::<i16>(device, &config, buffer, app, channels, native_rate)?
             }
-            _ => return Err(format!("Unsupported sample format: {:?}", sample_format)),
+            SampleFormat::U16 => {
+                build_stream::<u16>(device, &config, buffer, app, channels, native_rate)?
+            }
+            SampleFormat::I32 => {
+                build_stream::<i32>(device, &config, buffer, app, channels, native_rate)?
+            }
+            other => return Err(format!("Unsupported sample format: {other:?}")),
         };
-
         stream
             .play()
-            .map_err(|e| format!("Failed to start stream: {}", e))?;
-        self.stream = Some(SendStream(stream));
-        Ok(CaptureStart {
-            sample_rate: self.device_sample_rate,
-            device_name,
-            used_fallback,
-        })
+            .map_err(|e| format!("Failed to start stream: {e}"))?;
+        Ok(stream)
     }
 
     pub fn stop(&mut self) {
@@ -177,9 +142,66 @@ impl AudioCapture {
     }
 }
 
+/// Build the input stream for one sample type; every format converts to f32
+/// before the shared mono/resample path.
+fn build_stream<T>(
+    device: &cpal::Device,
+    config: &StreamConfig,
+    buffer: AudioBuffer,
+    app: Option<AppHandle>,
+    channels: usize,
+    native_rate: u32,
+) -> Result<Stream, String>
+where
+    T: SizedSample,
+    f32: FromSample<T>,
+{
+    let app_cb = app.clone();
+    let error_app = app;
+    let mut last_emit = Instant::now() - LEVEL_INTERVAL;
+    let mut limit_emitted = false;
+    let mut error_emitted = false;
+    let mut scratch: Vec<f32> = Vec::new();
+
+    device
+        .build_input_stream(
+            config,
+            move |data: &[T], _info: &cpal::InputCallbackInfo| {
+                scratch.clear();
+                scratch.extend(data.iter().map(|&s| f32::from_sample(s)));
+                let mono = to_mono(&scratch, channels);
+                let resampled = resample(&mono, native_rate, 16000);
+                let limit_reached = buffer.push_samples(&resampled);
+
+                if let Some(ref h) = app_cb {
+                    if limit_reached && !limit_emitted {
+                        limit_emitted = true;
+                        let _ = h.emit(crate::events::RECORDING_LIMIT_REACHED, ());
+                    }
+                    let now = Instant::now();
+                    if now.duration_since(last_emit) >= LEVEL_INTERVAL {
+                        last_emit = now;
+                        let _ = h.emit(crate::events::AUDIO_LEVEL, rms(&resampled) * LEVEL_GAIN);
+                    }
+                }
+            },
+            move |err| {
+                log::error!("Audio stream error: {}", err);
+                if !error_emitted {
+                    error_emitted = true;
+                    if let Some(ref h) = error_app {
+                        let _ = h.emit(crate::events::AUDIO_STREAM_ERROR, err.to_string());
+                    }
+                }
+            },
+            None,
+        )
+        .map_err(|e| format!("Failed to build input stream: {e}"))
+}
+
 /// Convert multi-channel audio to mono by averaging channels.
 fn to_mono(data: &[f32], channels: usize) -> Vec<f32> {
-    if channels == 1 {
+    if channels <= 1 {
         return data.to_vec();
     }
     data.chunks(channels)
@@ -214,4 +236,31 @@ fn resample(data: &[f32], source_rate: u32, target_rate: u32) -> Vec<f32> {
         output.push(sample as f32);
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resample, rms, to_mono};
+
+    #[test]
+    fn mono_averages_channels() {
+        assert_eq!(to_mono(&[1.0, 0.0, 0.5, 0.5], 2), vec![0.5, 0.5]);
+        assert_eq!(to_mono(&[0.2, 0.4], 1), vec![0.2, 0.4]);
+    }
+
+    #[test]
+    fn resample_keeps_duration_and_identity() {
+        let input: Vec<f32> = (0..48_000).map(|i| (i % 7) as f32 / 7.0).collect();
+        let out = resample(&input, 48_000, 16_000);
+        assert_eq!(out.len(), 16_000);
+        assert_eq!(resample(&input, 16_000, 16_000), input);
+        assert!(resample(&[], 48_000, 16_000).is_empty());
+    }
+
+    #[test]
+    fn rms_of_silence_and_full_scale() {
+        assert_eq!(rms(&[]), 0.0);
+        assert_eq!(rms(&[0.0, 0.0]), 0.0);
+        assert!((rms(&[1.0, -1.0]) - 1.0).abs() < 1e-6);
+    }
 }
