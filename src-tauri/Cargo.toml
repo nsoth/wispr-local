@@ -36,6 +36,7 @@ log = "0.4"
 env_logger = "0.11"
 humantime = "2"
 regex = "1"
+tauri-winrt-notification = "0.7"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
@@ -48,6 +49,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security",
     "Win32_Security_Cryptography",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
 ] }
 
 [features]

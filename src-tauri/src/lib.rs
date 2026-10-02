@@ -94,6 +94,11 @@ pub fn run() {
     config
         .ensure_dirs()
         .expect("Failed to create app directories");
+    // Toasts and the taskbar need our own identity; without it every toast
+    // is attributed to "Windows PowerShell".
+    if let Err(e) = system::notify::register_app_identity(&config.data_dir) {
+        log::warn!("Notification identity not registered: {e}");
+    }
     // Leftovers of an interrupted atomic write from a previous run.
     config::remove_stale_temp_files(&config.data_dir);
 

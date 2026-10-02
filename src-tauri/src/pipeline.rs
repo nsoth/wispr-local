@@ -505,14 +505,33 @@ fn finish_pipeline(app: &tauri::AppHandle, outcome: Outcome) {
     }
 }
 
+/// Show a toast under our own identity; fall back to the notification
+/// plugin (attributed to PowerShell) if WinRT refuses, and log either failure
+/// instead of dropping the message silently.
 pub fn notify_user(app: &tauri::AppHandle, message: &str) {
+    notify_user_with(app, message, false);
+}
+
+/// Like [`notify_user`], but the toast stays for ~25 s (session-level news).
+pub fn notify_user_long(app: &tauri::AppHandle, message: &str) {
+    notify_user_with(app, message, true);
+}
+
+fn notify_user_with(app: &tauri::AppHandle, message: &str, long: bool) {
+    match system::notify::show_toast(app.clone(), message, long) {
+        Ok(()) => return,
+        Err(e) => log::warn!("Toast via WinRT failed ({e}); using the notification plugin"),
+    }
     use tauri_plugin_notification::NotificationExt;
-    let _ = app
+    if let Err(e) = app
         .notification()
         .builder()
         .title("Wispr Local")
         .body(message)
-        .show();
+        .show()
+    {
+        log::warn!("Toast via plugin failed: {e}");
+    }
 }
 
 /// Record the model state and tell the main window.
@@ -587,7 +606,7 @@ pub fn spawn_model_loader(app: tauri::AppHandle, requested: String) {
                         } else {
                             "CUDA is unavailable; transcription runs on the CPU and will be slow."
                         };
-                        notify_user(&app, message);
+                        notify_user_long(&app, message);
                     }
                 }
                 ModelState::Missing => {
@@ -604,7 +623,7 @@ pub fn spawn_model_loader(app: tauri::AppHandle, requested: String) {
                     }
                 }
                 ModelState::Failed { error } => {
-                    notify_user(&app, &format!("Whisper model failed to load: {error}"));
+                    notify_user_long(&app, &format!("Whisper model failed to load: {error}"));
                 }
                 ModelState::Loading => {}
             }

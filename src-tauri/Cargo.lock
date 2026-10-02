@@ -6463,6 +6463,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-global-shortcut",
  "tauri-plugin-notification",
+ "tauri-winrt-notification",
  "tokio",
  "whisper-rs",
  "windows-sys 0.59.0",
