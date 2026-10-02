@@ -175,6 +175,9 @@ pub struct SettingsLoad {
     pub error: Option<String>,
     pub read_only: bool,
     pub unknown_keys: Vec<String>,
+    /// Values that could not be used as written and were replaced by their
+    /// defaults (e.g. a hotkey that does not parse). Shown at startup.
+    pub adjustments: Vec<String>,
     /// Problem decrypting the stored API keys, if any.
     pub api_key_error: Option<String>,
 }
@@ -302,6 +305,7 @@ impl Settings {
             error: None,
             read_only: false,
             unknown_keys: Vec::new(),
+            adjustments: Vec::new(),
             api_key_error: None,
         };
 
@@ -353,7 +357,10 @@ impl Settings {
             }
         }
 
-        normalize(&mut load.settings);
+        load.adjustments = normalize(&mut load.settings);
+        for adjustment in &load.adjustments {
+            log::warn!("{adjustment}");
+        }
 
         match secrets::load_api_keys(data_dir) {
             Ok(keys) => load.settings.ai.keys = keys,
@@ -410,8 +417,28 @@ fn parse_settings(text: &str) -> Result<(Settings, Vec<String>), String> {
     Ok((settings, unknown_keys))
 }
 
-/// Clamp and default values from older or hand-edited files.
-fn normalize(settings: &mut Settings) {
+/// Clamp and default values from older or hand-edited files. Returns the
+/// user-facing description of every value that had to be replaced.
+fn normalize(settings: &mut Settings) -> Vec<String> {
+    let mut adjustments = Vec::new();
+    if let Err(e) = crate::hotkey::parse_hotkey(&settings.hotkey) {
+        adjustments.push(format!(
+            "The hotkey {:?} in settings.json is not valid ({e}); using {} until you set a new one.",
+            settings.hotkey,
+            default_hotkey()
+        ));
+        settings.hotkey = default_hotkey();
+    }
+    if !settings.cancel_hotkey.trim().is_empty() {
+        if let Err(e) = crate::hotkey::parse_hotkey(&settings.cancel_hotkey) {
+            adjustments.push(format!(
+                "The cancel hotkey {:?} in settings.json is not valid ({e}); using {}.",
+                settings.cancel_hotkey,
+                default_cancel_hotkey()
+            ));
+            settings.cancel_hotkey = default_cancel_hotkey();
+        }
+    }
     settings.sound_volume = settings.sound_volume.clamp(0.0, 1.0);
     settings.history_limit = settings.history_limit.min(crate::state::HISTORY_MAX);
     if settings.model_file.trim().is_empty() {
@@ -428,6 +455,7 @@ fn normalize(settings: &mut Settings) {
     if settings.ai.prompt.trim().is_empty() {
         settings.ai.prompt = crate::formatting::default_prompt();
     }
+    adjustments
 }
 
 /// A pre-DPAPI settings file stored the key in plaintext. Move it into the
@@ -553,6 +581,22 @@ mod load_tests {
         assert!(!load.read_only);
         assert_eq!(load.settings.hotkey, "Ctrl+Shift+Space");
         assert!(listing(&dir).is_empty(), "load must not create files");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_hotkey_strings_fall_back_to_defaults_and_are_reported() {
+        let dir = test_dir("bad-hotkey");
+        write(
+            &dir,
+            br#"{"hotkey":"Ctrl+NotAKey","cancel_hotkey":"Nope+Nope"}"#,
+        );
+        let load = Settings::load_with_report(&dir);
+        assert!(load.error.is_none(), "{:?}", load.error);
+        assert_eq!(load.settings.hotkey, "Ctrl+Shift+Space");
+        assert_eq!(load.settings.cancel_hotkey, "Ctrl+Shift+Backspace");
+        assert_eq!(load.adjustments.len(), 2, "{:?}", load.adjustments);
+        assert!(load.adjustments[0].contains("Ctrl+NotAKey"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

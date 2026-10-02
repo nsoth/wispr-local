@@ -93,6 +93,8 @@ pub struct StartupDiagnostics {
     /// in-memory defaults must not be written back over a file we never saw.
     pub settings_read_only: bool,
     pub unknown_settings_keys: Vec<String>,
+    /// Settings values replaced by defaults because they could not be used.
+    pub settings_adjustments: Vec<String>,
     pub history_error: Option<String>,
     pub api_key_error: Option<String>,
 }
@@ -142,6 +144,9 @@ pub fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Lock order, everywhere: `Settings` before `AppState` (and either before the
+/// engine). A path that takes them the other way round can deadlock against
+/// the stop flow and the AI/language commands.
 pub struct AppState {
     pub status: AppStatus,
     pub model: ModelState,
@@ -176,6 +181,13 @@ pub struct AppState {
     pub suppress_paste: Arc<AtomicBool>,
     /// Writer thread spooling the active recording to disk.
     pub spool: Option<crate::audio::spool::SpoolWriter>,
+    /// Set by the tray's "Stop and paste": the menu itself had focus, so the
+    /// stop flow pastes into whichever foreign window is focused when the
+    /// text is ready instead of insisting on the origin window.
+    pub tray_stop_pending: bool,
+    /// Wall-clock start of the active recording; compared with the captured
+    /// audio length at stop to notice a sleep (no samples while suspended).
+    pub recording_started_wall: Option<std::time::SystemTime>,
 }
 
 impl Default for AppState {
@@ -198,6 +210,8 @@ impl Default for AppState {
             cancel_requested: Arc::new(AtomicBool::new(false)),
             suppress_paste: Arc::new(AtomicBool::new(false)),
             spool: None,
+            tray_stop_pending: false,
+            recording_started_wall: None,
         }
     }
 }

@@ -155,6 +155,8 @@ pub fn start_recording_flow(app: &tauri::AppHandle, pinned: bool) {
                 s.recording_locked = pinned;
                 s.detected_language.clear();
                 s.recording_started_at = Some(Instant::now());
+                s.recording_started_wall = Some(std::time::SystemTime::now());
+                s.tray_stop_pending = false;
                 s.preview_abort.store(false, Ordering::Relaxed);
                 s.cancel_requested.store(false, Ordering::Relaxed);
                 s.suppress_paste.store(false, Ordering::Relaxed);
@@ -309,15 +311,23 @@ async fn recording_guard_loop(app: tauri::AppHandle) {
     let mut no_foreground_ticks = 0u32;
     loop {
         tokio::time::sleep(Duration::from_millis(1000)).await;
-        if !is_recording(&app) {
-            return;
-        }
         let now = std::time::SystemTime::now();
         let jumped = now
             .duration_since(last_tick)
             .map(|d| d > Duration::from_secs(10))
             .unwrap_or(true);
         last_tick = now;
+        if jumped {
+            // Flag first: the resume may already have stopped the recording
+            // (audio stream error) and the stop flow may be transcribing.
+            let state = app.state::<Mutex<AppState>>();
+            lock_or_recover(&state)
+                .suppress_paste
+                .store(true, Ordering::Relaxed);
+        }
+        if !is_recording(&app) {
+            return;
+        }
         if crate::system::focus::foreground_target().is_none() {
             no_foreground_ticks += 1;
         } else {
@@ -494,27 +504,34 @@ async fn streaming_preview_loop(app: tauri::AppHandle) {
 /// the overlay's X button and the tray.
 pub fn cancel_recording(app: &tauri::AppHandle) {
     let state = app.state::<Mutex<AppState>>();
-    let was_recording = {
+    let (was_recording, writer) = {
         let mut s = lock_or_recover(&state);
         match s.status {
             AppStatus::Recording => {
                 s.status = AppStatus::Idle;
                 s.recording_locked = false;
                 s.recording_started_at = None;
+                s.recording_started_wall = None;
                 s.preview_abort.store(true, Ordering::Relaxed);
-                true
+                (true, s.spool.take())
             }
             AppStatus::Transcribing | AppStatus::Formatting => {
                 s.cancel_requested.store(true, Ordering::Relaxed);
-                false
+                (false, None)
             }
             _ => return,
         }
     };
     if was_recording {
         log::info!("Recording cancelled");
+        // Stop the spool outside the state lock (it joins a thread) and drop
+        // the file: a cancelled dictation must not come back as "recovered".
+        if let Some(writer) = writer {
+            writer.stop();
+        }
         lock_or_recover(&app.state::<Mutex<AudioCapture>>()).stop();
         app.state::<AudioBuffer>().clear();
+        spool::remove_spool(&app.state::<AppConfig>().data_dir);
         app.state::<SoundPlayer>().play(SoundKind::Cancel);
         emit_status(app, &AppStatus::Idle);
         let _ = app.emit(events::LOCK_CHANGED, false);
@@ -599,9 +616,6 @@ impl Outcome {
     }
 }
 
-/// The single exit of the stop pipeline: back to Idle, result shown in the
-/// pill for a moment, tray back to idle, overlay hidden afterwards unless a
-/// new recording has started in the meantime.
 /// Append one line to the usage stats; a failure is logged, never surfaced.
 fn record_stat(app: &tauri::AppHandle, outcome: &Outcome, audio_s: f64, words: u32, lang: &str) {
     let data_dir = app.state::<AppConfig>().data_dir.clone();
@@ -617,7 +631,28 @@ fn record_stat(app: &tauri::AppHandle, outcome: &Outcome, audio_s: f64, words: u
     }
 }
 
+/// Whether the crash spool of the recording should survive this outcome:
+/// only a failed pipeline leaves audio worth recovering on the next start.
+/// Everything else (pasted, copied, too short, no speech, cancelled) was
+/// either delivered or discarded on purpose.
+fn keeps_spool(outcome: &Outcome) -> bool {
+    matches!(outcome, Outcome::Failed)
+}
+
+/// A recording whose wall-clock duration exceeds its captured audio by more
+/// than ten seconds spanned a sleep (no samples arrive while suspended) or a
+/// stalled microphone; either way the paste target is no longer trustworthy.
+fn sleep_gap_detected(wall_s: f64, audio_s: f64) -> bool {
+    wall_s - audio_s > 10.0
+}
+
+/// The single exit of the stop pipeline: back to Idle, result shown in the
+/// pill for a moment, tray back to idle, overlay hidden afterwards unless a
+/// new recording has started in the meantime.
 fn finish_pipeline(app: &tauri::AppHandle, outcome: Outcome) {
+    if !keeps_spool(&outcome) {
+        spool::remove_spool(&app.state::<AppConfig>().data_dir);
+    }
     let (message, tone, linger_ms) = outcome.overlay();
     if let Some(reason) = outcome.empty_reason() {
         log::warn!("No transcription result: {reason}");
@@ -826,15 +861,16 @@ fn recover_spooled_recording(app: &tauri::AppHandle) {
         log::info!("Recovered audio contained no speech");
         return;
     }
+    // Lock order: Settings before AppState, like every other path.
+    let limit = {
+        let settings = app.state::<Mutex<Settings>>();
+        let guard = lock_or_recover(&settings);
+        guard.history_limit
+    };
     let history = {
         let state = app.state::<Mutex<AppState>>();
         let mut s = lock_or_recover(&state);
         s.last_transcription = text.clone();
-        let limit = {
-            let settings = app.state::<Mutex<Settings>>();
-            let guard = lock_or_recover(&settings);
-            guard.history_limit
-        };
         s.push_history(
             HistoryEntry {
                 text: text.clone(),
@@ -918,14 +954,18 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
 
     // Claim the stop atomically. Hotkey release, tray, pin button, and the
     // recording-limit event can arrive together; only one may finalize audio.
-    let preview_abort = {
+    let (preview_abort, origin_unknown, started_wall) = {
         let mut s = lock_or_recover(&state);
         if s.status != AppStatus::Recording {
             return;
         }
         s.recording_locked = false;
         s.status = AppStatus::Transcribing;
-        s.preview_abort.clone()
+        (
+            s.preview_abort.clone(),
+            std::mem::take(&mut s.tray_stop_pending),
+            s.recording_started_wall.take(),
+        )
     };
     // The window the user was in when the key went up is where the text
     // belongs; anything focused later (settings, another app) must not get it.
@@ -973,6 +1013,19 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
     let audio_s = samples.len() as f64 / 16000.0;
     let utterance = UTTERANCES.fetch_add(1, Ordering::Relaxed) + 1;
     log::info!("utt#{utterance}: transcribing {audio_s:.1}s of audio");
+    let wall_s = started_wall
+        .and_then(|t| t.elapsed().ok())
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(audio_s);
+    if sleep_gap_detected(wall_s, audio_s) {
+        log::warn!(
+            "utt#{utterance}: {wall_s:.0}s of wall time for {audio_s:.1}s of audio; the machine \
+             slept or the microphone stalled, so the text will not be auto-pasted"
+        );
+        lock_or_recover(&state)
+            .suppress_paste
+            .store(true, Ordering::Relaxed);
+    }
 
     let (language, pipeline, paste_suffix, restore_clipboard, history_limit, backend) = {
         let settings = app.state::<Mutex<Settings>>();
@@ -1177,7 +1230,13 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
     let decision = if suppressed {
         PasteDecision::CopyOnly("the recording was interrupted by sleep or lock".to_string())
     } else {
-        focus::decide_paste(origin.as_ref(), now.as_ref(), std::process::id(), elevated)
+        focus::decide_paste(
+            origin.as_ref(),
+            now.as_ref(),
+            std::process::id(),
+            elevated,
+            origin_unknown,
+        )
     };
     let outcome = match decision {
         PasteDecision::Paste => {
@@ -1280,6 +1339,32 @@ mod tests {
     use super::{model_candidates, ArmedGuard, Outcome};
     use std::cell::Cell;
     use std::rc::Rc;
+
+    #[test]
+    fn spool_is_kept_only_when_the_pipeline_failed() {
+        use super::keeps_spool;
+        assert!(keeps_spool(&Outcome::Failed));
+        for outcome in [
+            Outcome::Pasted,
+            Outcome::CopiedToClipboard { in_clipboard: true },
+            Outcome::TooShort,
+            Outcome::NoSpeech,
+            Outcome::Cancelled,
+        ] {
+            assert!(!keeps_spool(&outcome), "{outcome:?}");
+        }
+    }
+
+    #[test]
+    fn a_wall_clock_gap_beyond_the_audio_means_the_machine_slept() {
+        use super::sleep_gap_detected;
+        assert!(!sleep_gap_detected(12.0, 10.0), "normal jitter");
+        assert!(sleep_gap_detected(600.0, 10.0), "ten minutes of sleep");
+        assert!(
+            !sleep_gap_detected(5.0, 10.0),
+            "clock went backwards is not a gap"
+        );
+    }
 
     #[test]
     fn outcome_labels_match_the_stats_vocabulary() {

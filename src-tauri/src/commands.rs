@@ -4,9 +4,10 @@
 
 use std::sync::Mutex;
 use tauri::{AppHandle, Manager, State};
-use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
+use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
 use crate::config::AppConfig;
+pub use crate::hotkey::{has_modifier, is_safe_bare_key, parse_hotkey, parse_key_code};
 use crate::settings::Settings;
 use crate::state::{AppState, AppStatus, ModelState};
 use crate::system::sounds::SoundPlayer;
@@ -342,16 +343,20 @@ pub fn set_hotkey(
     if hotkey.eq_ignore_ascii_case(&old_hotkey) {
         return Ok(old_hotkey);
     }
-    let old_shortcut = parse_hotkey(&old_hotkey)?;
+    // A saved hotkey that does not parse (hand-edited file) was never
+    // registered: nothing to unregister, and it must not block the fix.
+    let old_shortcut = parse_hotkey(&old_hotkey).ok();
 
     // Register first so a conflict never removes the working shortcut. If a
     // later step fails, roll back to the previous registration and setting.
     let gs = app.global_shortcut();
     gs.register(new_shortcut)
         .map_err(|e| friendly_register_error(&e.to_string()))?;
-    if let Err(e) = gs.unregister(old_shortcut) {
-        let _ = gs.unregister(new_shortcut);
-        return Err(format!("Failed to replace old hotkey: {e}"));
+    if let Some(old_shortcut) = old_shortcut {
+        if let Err(e) = gs.unregister(old_shortcut) {
+            let _ = gs.unregister(new_shortcut);
+            return Err(format!("Failed to replace old hotkey: {e}"));
+        }
     }
 
     // Save to settings
@@ -362,7 +367,9 @@ pub fn set_hotkey(
     };
     if let Err(e) = save_result {
         let _ = gs.unregister(new_shortcut);
-        let _ = gs.register(old_shortcut);
+        if let Some(old_shortcut) = old_shortcut {
+            let _ = gs.register(old_shortcut);
+        }
         if let Ok(mut s) = settings.lock() {
             s.hotkey = old_hotkey;
         }
@@ -371,17 +378,6 @@ pub fn set_hotkey(
 
     log::info!("Hotkey changed to: {}", hotkey);
     Ok(hotkey)
-}
-
-/// Keys that never produce text, so they may be a hotkey on their own.
-pub fn is_safe_bare_key(hotkey: &str) -> bool {
-    let key = hotkey.trim().to_ascii_lowercase();
-    if key == "pause" || key == "scrolllock" || key == "capslock" {
-        return true;
-    }
-    key.strip_prefix('f')
-        .and_then(|n| n.parse::<u32>().ok())
-        .is_some_and(|n| (13..=24).contains(&n))
 }
 
 /// The plugin's error for a taken combination is a bare "already registered"
@@ -513,15 +509,6 @@ pub fn cancel_recording(app: AppHandle) {
     crate::pipeline::cancel_recording(&app);
 }
 
-fn has_modifier(hotkey: &str) -> bool {
-    hotkey.split('+').any(|part| {
-        matches!(
-            part.trim().to_ascii_lowercase().as_str(),
-            "ctrl" | "control" | "shift" | "alt" | "super" | "win" | "meta" | "cmd"
-        )
-    })
-}
-
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct SoundSettings {
     pub start_sound: String,
@@ -621,31 +608,30 @@ pub fn get_ai_settings(
     Ok(ai_settings_view(&s, &app_state))
 }
 
-/// Apply an edit from the Settings page. Keys are written to the encrypted
-/// store only when the update carries them; settings.json only when a visible
-/// field changed. Returns the refreshed view.
-#[tauri::command]
-pub fn set_ai_settings(
-    app: AppHandle,
-    update: crate::settings::AiSettingsUpdate,
-    settings: State<'_, Mutex<Settings>>,
-    state: State<'_, Mutex<AppState>>,
-    config: State<'_, AppConfig>,
-) -> Result<AiSettingsView, String> {
+/// The lock-holding part of `set_ai_settings`, kept free of anything that
+/// locks Settings or AppState again (the tray refresh does both): a
+/// re-entrant `std::sync::Mutex::lock` never returns, and commands run on the
+/// main thread. Returns the refreshed view and whether the tray needs a
+/// refresh once both guards are gone.
+pub(crate) fn apply_ai_settings(
+    settings: &Mutex<Settings>,
+    state: &Mutex<AppState>,
+    data_dir: &std::path::Path,
+    update: &crate::settings::AiSettingsUpdate,
+) -> Result<(AiSettingsView, bool), String> {
     let mut s = settings.lock().map_err(|e| e.to_string())?;
     let previous = s.clone();
-    let change = s.apply_ai_update(&update);
+    let change = s.apply_ai_update(update);
     if change.keys_changed {
-        if let Err(e) = crate::secrets::save_api_keys(&config.data_dir, &s.ai.keys) {
+        if let Err(e) = crate::secrets::save_api_keys(data_dir, &s.ai.keys) {
             *s = previous;
             return Err(e);
         }
     }
     if change.settings_changed {
-        if let Err(e) = s.save(&config.data_dir) {
+        if let Err(e) = s.save(data_dir) {
             if change.keys_changed {
-                if let Err(e2) = crate::secrets::save_api_keys(&config.data_dir, &previous.ai.keys)
-                {
+                if let Err(e2) = crate::secrets::save_api_keys(data_dir, &previous.ai.keys) {
                     log::warn!("Could not roll back the API keys after a failed save: {e2}");
                 }
             }
@@ -657,7 +643,6 @@ pub fn set_ai_settings(
             s.ai.provider,
             s.ai.enabled
         );
-        crate::system::tray::refresh(&app);
     }
     if change.keys_changed {
         log::info!(
@@ -675,7 +660,25 @@ pub fn set_ai_settings(
         );
     }
     let app_state = state.lock().map_err(|e| e.to_string())?;
-    Ok(ai_settings_view(&s, &app_state))
+    Ok((ai_settings_view(&s, &app_state), change.settings_changed))
+}
+
+/// Apply an edit from the Settings page. Keys are written to the encrypted
+/// store only when the update carries them; settings.json only when a visible
+/// field changed. Returns the refreshed view.
+#[tauri::command]
+pub fn set_ai_settings(
+    app: AppHandle,
+    update: crate::settings::AiSettingsUpdate,
+    settings: State<'_, Mutex<Settings>>,
+    state: State<'_, Mutex<AppState>>,
+    config: State<'_, AppConfig>,
+) -> Result<AiSettingsView, String> {
+    let (view, refresh_tray) = apply_ai_settings(&settings, &state, &config.data_dir, &update)?;
+    if refresh_tray {
+        crate::system::tray::refresh(&app);
+    }
+    Ok(view)
 }
 
 /// Settings → AI Formatting → Test: one tiny request with the stored key and
@@ -965,157 +968,41 @@ pub fn set_autostart(
     Ok(())
 }
 
-/// Parse a hotkey string like "Ctrl+Shift+Space" into a tauri Shortcut.
-pub fn parse_hotkey(hotkey: &str) -> Result<Shortcut, String> {
-    let parts: Vec<&str> = hotkey.split('+').map(|s| s.trim()).collect();
-    if parts.is_empty() {
-        return Err("Empty hotkey".to_string());
-    }
-
-    let mut modifiers = Modifiers::empty();
-    let mut key_code: Option<Code> = None;
-
-    for part in &parts {
-        match part.to_lowercase().as_str() {
-            "ctrl" | "control" => modifiers |= Modifiers::CONTROL,
-            "shift" => modifiers |= Modifiers::SHIFT,
-            "alt" => modifiers |= Modifiers::ALT,
-            "super" | "win" | "meta" | "cmd" => modifiers |= Modifiers::SUPER,
-            key => {
-                if key_code.is_some() {
-                    return Err(format!("Multiple keys in hotkey: {}", hotkey));
-                }
-                key_code = Some(parse_key_code(key)?);
-            }
-        }
-    }
-
-    let code = key_code.ok_or_else(|| format!("No key specified in hotkey: {}", hotkey))?;
-    let mods = if modifiers.is_empty() {
-        None
-    } else {
-        Some(modifiers)
-    };
-
-    Ok(Shortcut::new(mods, code))
-}
-
-fn parse_key_code(key: &str) -> Result<Code, String> {
-    match key.to_lowercase().as_str() {
-        "space" => Ok(Code::Space),
-        "enter" | "return" => Ok(Code::Enter),
-        "tab" => Ok(Code::Tab),
-        "escape" | "esc" => Ok(Code::Escape),
-        "backspace" => Ok(Code::Backspace),
-        "delete" | "del" => Ok(Code::Delete),
-        "insert" => Ok(Code::Insert),
-        "home" => Ok(Code::Home),
-        "end" => Ok(Code::End),
-        "pageup" => Ok(Code::PageUp),
-        "pagedown" => Ok(Code::PageDown),
-        "up" => Ok(Code::ArrowUp),
-        "down" => Ok(Code::ArrowDown),
-        "left" => Ok(Code::ArrowLeft),
-        "right" => Ok(Code::ArrowRight),
-        "f1" => Ok(Code::F1),
-        "f2" => Ok(Code::F2),
-        "f3" => Ok(Code::F3),
-        "f4" => Ok(Code::F4),
-        "f5" => Ok(Code::F5),
-        "f6" => Ok(Code::F6),
-        "f7" => Ok(Code::F7),
-        "f8" => Ok(Code::F8),
-        "f9" => Ok(Code::F9),
-        "f10" => Ok(Code::F10),
-        "f11" => Ok(Code::F11),
-        "f12" => Ok(Code::F12),
-        "f13" => Ok(Code::F13),
-        "f14" => Ok(Code::F14),
-        "f15" => Ok(Code::F15),
-        "f16" => Ok(Code::F16),
-        "f17" => Ok(Code::F17),
-        "f18" => Ok(Code::F18),
-        "f19" => Ok(Code::F19),
-        "f20" => Ok(Code::F20),
-        "f21" => Ok(Code::F21),
-        "f22" => Ok(Code::F22),
-        "f23" => Ok(Code::F23),
-        "f24" => Ok(Code::F24),
-        "pause" => Ok(Code::Pause),
-        "scrolllock" => Ok(Code::ScrollLock),
-        "capslock" => Ok(Code::CapsLock),
-        "numlock" => Ok(Code::NumLock),
-        "printscreen" => Ok(Code::PrintScreen),
-        "numpad0" => Ok(Code::Numpad0),
-        "numpad1" => Ok(Code::Numpad1),
-        "numpad2" => Ok(Code::Numpad2),
-        "numpad3" => Ok(Code::Numpad3),
-        "numpad4" => Ok(Code::Numpad4),
-        "numpad5" => Ok(Code::Numpad5),
-        "numpad6" => Ok(Code::Numpad6),
-        "numpad7" => Ok(Code::Numpad7),
-        "numpad8" => Ok(Code::Numpad8),
-        "numpad9" => Ok(Code::Numpad9),
-        "numpadadd" => Ok(Code::NumpadAdd),
-        "numpadsubtract" => Ok(Code::NumpadSubtract),
-        "numpadmultiply" => Ok(Code::NumpadMultiply),
-        "numpaddivide" => Ok(Code::NumpadDivide),
-        "numpaddecimal" => Ok(Code::NumpadDecimal),
-        "numpadenter" => Ok(Code::NumpadEnter),
-        "`" | "backquote" => Ok(Code::Backquote),
-        "-" | "minus" => Ok(Code::Minus),
-        "=" | "equal" => Ok(Code::Equal),
-        "[" | "bracketleft" => Ok(Code::BracketLeft),
-        "]" | "bracketright" => Ok(Code::BracketRight),
-        "\\" | "backslash" => Ok(Code::Backslash),
-        ";" | "semicolon" => Ok(Code::Semicolon),
-        "'" | "quote" => Ok(Code::Quote),
-        "," | "comma" => Ok(Code::Comma),
-        "." | "period" => Ok(Code::Period),
-        "/" | "slash" => Ok(Code::Slash),
-        "0" => Ok(Code::Digit0),
-        "1" => Ok(Code::Digit1),
-        "2" => Ok(Code::Digit2),
-        "3" => Ok(Code::Digit3),
-        "4" => Ok(Code::Digit4),
-        "5" => Ok(Code::Digit5),
-        "6" => Ok(Code::Digit6),
-        "7" => Ok(Code::Digit7),
-        "8" => Ok(Code::Digit8),
-        "9" => Ok(Code::Digit9),
-        "a" => Ok(Code::KeyA),
-        "b" => Ok(Code::KeyB),
-        "c" => Ok(Code::KeyC),
-        "d" => Ok(Code::KeyD),
-        "e" => Ok(Code::KeyE),
-        "f" => Ok(Code::KeyF),
-        "g" => Ok(Code::KeyG),
-        "h" => Ok(Code::KeyH),
-        "i" => Ok(Code::KeyI),
-        "j" => Ok(Code::KeyJ),
-        "k" => Ok(Code::KeyK),
-        "l" => Ok(Code::KeyL),
-        "m" => Ok(Code::KeyM),
-        "n" => Ok(Code::KeyN),
-        "o" => Ok(Code::KeyO),
-        "p" => Ok(Code::KeyP),
-        "q" => Ok(Code::KeyQ),
-        "r" => Ok(Code::KeyR),
-        "s" => Ok(Code::KeyS),
-        "t" => Ok(Code::KeyT),
-        "u" => Ok(Code::KeyU),
-        "v" => Ok(Code::KeyV),
-        "w" => Ok(Code::KeyW),
-        "x" => Ok(Code::KeyX),
-        "y" => Ok(Code::KeyY),
-        "z" => Ok(Code::KeyZ),
-        other => Err(format!("Unknown key: {}", other)),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{has_modifier, parse_hotkey};
+
+    #[test]
+    fn ai_settings_update_releases_both_locks_and_reports_the_refresh() {
+        use crate::formatting::AiProvider;
+        use crate::settings::{AiSettingsUpdate, Settings};
+        use crate::state::AppState;
+        use std::sync::Mutex;
+        let dir = crate::config::test_dir("ai-update");
+        let settings = Mutex::new(Settings::default());
+        let state = Mutex::new(AppState::default());
+        let update = AiSettingsUpdate {
+            provider: AiProvider::Claude,
+            enabled: true,
+            openai_model: "gpt-4o-mini".to_string(),
+            claude_model: "claude-haiku-4-5-20251001".to_string(),
+            prompt: crate::formatting::default_prompt(),
+            openai_api_key: None,
+            claude_api_key: None,
+        };
+        let (view, refresh_tray) =
+            super::apply_ai_settings(&settings, &state, &dir, &update).expect("apply");
+        assert!(refresh_tray, "a visible change asks for a tray refresh");
+        assert_eq!(view.provider, AiProvider::Claude);
+        // The tray refresh locks Settings and AppState itself, so both must be
+        // free again by the time the caller gets to refresh.
+        assert!(settings.try_lock().is_ok(), "settings lock released");
+        assert!(state.try_lock().is_ok(), "state lock released");
+        let (_, refresh_again) =
+            super::apply_ai_settings(&settings, &state, &dir, &update).expect("apply");
+        assert!(!refresh_again, "nothing visible changed the second time");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn hotkey_parser_accepts_supported_combo() {

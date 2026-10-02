@@ -242,8 +242,13 @@ fn on_menu(app: &AppHandle, id: &str) {
         "start_stop" => {
             let recording = {
                 let state = app.state::<Mutex<AppState>>();
-                let s = lock_or_recover(&state);
-                s.status == AppStatus::Recording
+                let mut s = lock_or_recover(&state);
+                let recording = s.status == AppStatus::Recording;
+                // The menu popup had the focus, not the user's document:
+                // let the stop flow paste into whatever foreign window is
+                // focused once the text is ready.
+                s.tray_stop_pending = recording;
+                recording
             };
             if recording {
                 let _ = app.emit(events::REQUEST_STOP_RECORDING, ());

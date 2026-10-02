@@ -41,12 +41,16 @@ pub enum PasteDecision {
 }
 
 /// Decide whether Ctrl+V may be sent. `then` is the window that was focused
-/// when the recording stopped, `now` the one focused right before pasting.
+/// when the recording stopped (`None`: nothing had focus, i.e. the secure
+/// desktop), `now` the one focused right before pasting. `origin_unknown` is
+/// set for a stop from the tray menu, whose own popup was the focused window:
+/// then any foreign, non-elevated `now` is the target.
 pub fn decide_paste(
     then: Option<&PasteTarget>,
     now: Option<&PasteTarget>,
     own_pid: u32,
     target_elevated: bool,
+    origin_unknown: bool,
 ) -> PasteDecision {
     let Some(now) = now else {
         return PasteDecision::CopyOnly("no window is focused (screen locked?)".to_string());
@@ -54,9 +58,17 @@ pub fn decide_paste(
     if now.pid == own_pid {
         return PasteDecision::CopyOnly("the Wispr Local window is focused".to_string());
     }
-    if let Some(then) = then {
-        if then.pid != now.pid {
-            return PasteDecision::CopyOnly(format!("focus moved to {}", now.describe()));
+    if !origin_unknown {
+        match then {
+            None => {
+                return PasteDecision::CopyOnly(
+                    "no window had focus when the recording stopped".to_string(),
+                );
+            }
+            Some(then) if then.pid != now.pid => {
+                return PasteDecision::CopyOnly(format!("focus moved to {}", now.describe()));
+            }
+            Some(_) => {}
         }
     }
     if target_elevated {
@@ -258,7 +270,7 @@ mod tests {
         let then = target(100, "Telegram");
         let now = target(100, "Telegram");
         assert_eq!(
-            decide_paste(Some(&then), Some(&now), 7, false),
+            decide_paste(Some(&then), Some(&now), 7, false, false),
             PasteDecision::Paste
         );
     }
@@ -272,7 +284,7 @@ mod tests {
             ..target(100, "Telegram - dialog")
         };
         assert_eq!(
-            decide_paste(Some(&then), Some(&now), 7, false),
+            decide_paste(Some(&then), Some(&now), 7, false, false),
             PasteDecision::Paste
         );
     }
@@ -282,7 +294,7 @@ mod tests {
         let then = target(100, "Telegram");
         let now = target(200, "VS Code");
         assert!(matches!(
-            decide_paste(Some(&then), Some(&now), 7, false),
+            decide_paste(Some(&then), Some(&now), 7, false, false),
             PasteDecision::CopyOnly(_)
         ));
     }
@@ -292,7 +304,7 @@ mod tests {
         let then = target(100, "Telegram");
         let now = target(7, "Wispr Local");
         assert!(matches!(
-            decide_paste(Some(&then), Some(&now), 7, false),
+            decide_paste(Some(&then), Some(&now), 7, false, false),
             PasteDecision::CopyOnly(_)
         ));
     }
@@ -301,24 +313,51 @@ mod tests {
     fn no_foreground_window_or_elevated_target_copies_only() {
         let then = target(100, "Telegram");
         assert!(matches!(
-            decide_paste(Some(&then), None, 7, false),
+            decide_paste(Some(&then), None, 7, false, false),
             PasteDecision::CopyOnly(_)
         ));
         let now = target(100, "Task Manager");
         assert!(matches!(
-            decide_paste(Some(&then), Some(&now), 7, true),
+            decide_paste(Some(&then), Some(&now), 7, true, false),
             PasteDecision::CopyOnly(_)
         ));
     }
 
     #[test]
-    fn unknown_origin_still_pastes_into_a_valid_target() {
-        // Recording started from the tray with no capture of the origin.
+    fn no_focus_at_stop_means_the_desktop_was_locked() {
+        // The stop flow always captures the origin; None means nothing had
+        // focus when the key went up (the secure desktop), so the text must
+        // not land in whatever window comes up after unlock.
+        let now = target(100, "Telegram");
+        assert!(matches!(
+            decide_paste(None, Some(&now), 7, false, false),
+            PasteDecision::CopyOnly(_)
+        ));
+    }
+
+    #[test]
+    fn a_tray_stop_pastes_into_the_foreign_window_focused_when_ready() {
+        // Stopped from the tray menu: the origin is the menu itself, so the
+        // target is whatever foreign, non-elevated window has focus when the
+        // text is ready.
         let now = target(100, "Telegram");
         assert_eq!(
-            decide_paste(None, Some(&now), 7, false),
+            decide_paste(None, Some(&now), 7, false, true),
             PasteDecision::Paste
         );
+        let own = target(7, "Wispr Local");
+        assert!(matches!(
+            decide_paste(None, Some(&own), 7, false, true),
+            PasteDecision::CopyOnly(_)
+        ));
+        assert!(matches!(
+            decide_paste(None, Some(&now), 7, true, true),
+            PasteDecision::CopyOnly(_)
+        ));
+        assert!(matches!(
+            decide_paste(None, None, 7, false, true),
+            PasteDecision::CopyOnly(_)
+        ));
     }
 
     #[test]

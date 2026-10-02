@@ -123,6 +123,7 @@ pub fn run() {
         settings_error: settings_load.error.clone(),
         settings_read_only: settings_load.read_only,
         unknown_settings_keys: settings_load.unknown_keys.clone(),
+        settings_adjustments: settings_load.adjustments.clone(),
         history_error,
         api_key_error: settings_load.api_key_error.clone(),
     };

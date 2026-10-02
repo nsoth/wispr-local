@@ -12,6 +12,7 @@
 //! while the key is already considered down.
 
 use serde::{Deserialize, Serialize};
+use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut};
 
 /// Releases quicker than this are taps, not holds.
 pub const TAP_MAX_MS: u128 = 350;
@@ -87,6 +88,175 @@ pub fn decide(event: HotkeyEvent, ctx: HotkeyContext) -> (HotkeyAction, bool) {
             }
         }
     }
+}
+
+/// Parse a hotkey string like "Ctrl+Shift+Space" into a tauri Shortcut.
+pub fn parse_hotkey(hotkey: &str) -> Result<Shortcut, String> {
+    let parts: Vec<&str> = hotkey.split('+').map(|s| s.trim()).collect();
+    if parts.is_empty() {
+        return Err("Empty hotkey".to_string());
+    }
+
+    let mut modifiers = Modifiers::empty();
+    let mut key_code: Option<Code> = None;
+
+    for part in &parts {
+        match part.to_lowercase().as_str() {
+            "ctrl" | "control" => modifiers |= Modifiers::CONTROL,
+            "shift" => modifiers |= Modifiers::SHIFT,
+            "alt" => modifiers |= Modifiers::ALT,
+            "super" | "win" | "meta" | "cmd" => modifiers |= Modifiers::SUPER,
+            key => {
+                if key_code.is_some() {
+                    return Err(format!("Multiple keys in hotkey: {}", hotkey));
+                }
+                key_code = Some(parse_key_code(key)?);
+            }
+        }
+    }
+
+    let code = key_code.ok_or_else(|| format!("No key specified in hotkey: {}", hotkey))?;
+    let mods = if modifiers.is_empty() {
+        None
+    } else {
+        Some(modifiers)
+    };
+
+    Ok(Shortcut::new(mods, code))
+}
+
+pub fn parse_key_code(key: &str) -> Result<Code, String> {
+    match key.to_lowercase().as_str() {
+        "space" => Ok(Code::Space),
+        "enter" | "return" => Ok(Code::Enter),
+        "tab" => Ok(Code::Tab),
+        "escape" | "esc" => Ok(Code::Escape),
+        "backspace" => Ok(Code::Backspace),
+        "delete" | "del" => Ok(Code::Delete),
+        "insert" => Ok(Code::Insert),
+        "home" => Ok(Code::Home),
+        "end" => Ok(Code::End),
+        "pageup" => Ok(Code::PageUp),
+        "pagedown" => Ok(Code::PageDown),
+        "up" => Ok(Code::ArrowUp),
+        "down" => Ok(Code::ArrowDown),
+        "left" => Ok(Code::ArrowLeft),
+        "right" => Ok(Code::ArrowRight),
+        "f1" => Ok(Code::F1),
+        "f2" => Ok(Code::F2),
+        "f3" => Ok(Code::F3),
+        "f4" => Ok(Code::F4),
+        "f5" => Ok(Code::F5),
+        "f6" => Ok(Code::F6),
+        "f7" => Ok(Code::F7),
+        "f8" => Ok(Code::F8),
+        "f9" => Ok(Code::F9),
+        "f10" => Ok(Code::F10),
+        "f11" => Ok(Code::F11),
+        "f12" => Ok(Code::F12),
+        "f13" => Ok(Code::F13),
+        "f14" => Ok(Code::F14),
+        "f15" => Ok(Code::F15),
+        "f16" => Ok(Code::F16),
+        "f17" => Ok(Code::F17),
+        "f18" => Ok(Code::F18),
+        "f19" => Ok(Code::F19),
+        "f20" => Ok(Code::F20),
+        "f21" => Ok(Code::F21),
+        "f22" => Ok(Code::F22),
+        "f23" => Ok(Code::F23),
+        "f24" => Ok(Code::F24),
+        "pause" => Ok(Code::Pause),
+        "scrolllock" => Ok(Code::ScrollLock),
+        "capslock" => Ok(Code::CapsLock),
+        "numlock" => Ok(Code::NumLock),
+        "printscreen" => Ok(Code::PrintScreen),
+        "numpad0" => Ok(Code::Numpad0),
+        "numpad1" => Ok(Code::Numpad1),
+        "numpad2" => Ok(Code::Numpad2),
+        "numpad3" => Ok(Code::Numpad3),
+        "numpad4" => Ok(Code::Numpad4),
+        "numpad5" => Ok(Code::Numpad5),
+        "numpad6" => Ok(Code::Numpad6),
+        "numpad7" => Ok(Code::Numpad7),
+        "numpad8" => Ok(Code::Numpad8),
+        "numpad9" => Ok(Code::Numpad9),
+        "numpadadd" => Ok(Code::NumpadAdd),
+        "numpadsubtract" => Ok(Code::NumpadSubtract),
+        "numpadmultiply" => Ok(Code::NumpadMultiply),
+        "numpaddivide" => Ok(Code::NumpadDivide),
+        "numpaddecimal" => Ok(Code::NumpadDecimal),
+        "numpadenter" => Ok(Code::NumpadEnter),
+        "`" | "backquote" => Ok(Code::Backquote),
+        "-" | "minus" => Ok(Code::Minus),
+        "=" | "equal" => Ok(Code::Equal),
+        "[" | "bracketleft" => Ok(Code::BracketLeft),
+        "]" | "bracketright" => Ok(Code::BracketRight),
+        "\\" | "backslash" => Ok(Code::Backslash),
+        ";" | "semicolon" => Ok(Code::Semicolon),
+        "'" | "quote" => Ok(Code::Quote),
+        "," | "comma" => Ok(Code::Comma),
+        "." | "period" => Ok(Code::Period),
+        "/" | "slash" => Ok(Code::Slash),
+        "0" => Ok(Code::Digit0),
+        "1" => Ok(Code::Digit1),
+        "2" => Ok(Code::Digit2),
+        "3" => Ok(Code::Digit3),
+        "4" => Ok(Code::Digit4),
+        "5" => Ok(Code::Digit5),
+        "6" => Ok(Code::Digit6),
+        "7" => Ok(Code::Digit7),
+        "8" => Ok(Code::Digit8),
+        "9" => Ok(Code::Digit9),
+        "a" => Ok(Code::KeyA),
+        "b" => Ok(Code::KeyB),
+        "c" => Ok(Code::KeyC),
+        "d" => Ok(Code::KeyD),
+        "e" => Ok(Code::KeyE),
+        "f" => Ok(Code::KeyF),
+        "g" => Ok(Code::KeyG),
+        "h" => Ok(Code::KeyH),
+        "i" => Ok(Code::KeyI),
+        "j" => Ok(Code::KeyJ),
+        "k" => Ok(Code::KeyK),
+        "l" => Ok(Code::KeyL),
+        "m" => Ok(Code::KeyM),
+        "n" => Ok(Code::KeyN),
+        "o" => Ok(Code::KeyO),
+        "p" => Ok(Code::KeyP),
+        "q" => Ok(Code::KeyQ),
+        "r" => Ok(Code::KeyR),
+        "s" => Ok(Code::KeyS),
+        "t" => Ok(Code::KeyT),
+        "u" => Ok(Code::KeyU),
+        "v" => Ok(Code::KeyV),
+        "w" => Ok(Code::KeyW),
+        "x" => Ok(Code::KeyX),
+        "y" => Ok(Code::KeyY),
+        "z" => Ok(Code::KeyZ),
+        other => Err(format!("Unknown key: {}", other)),
+    }
+}
+
+/// Keys that never produce text, so they may be a hotkey on their own.
+pub fn is_safe_bare_key(hotkey: &str) -> bool {
+    let key = hotkey.trim().to_ascii_lowercase();
+    if key == "pause" || key == "scrolllock" || key == "capslock" {
+        return true;
+    }
+    key.strip_prefix('f')
+        .and_then(|n| n.parse::<u32>().ok())
+        .is_some_and(|n| (13..=24).contains(&n))
+}
+
+/// True when the string names at least one modifier key.
+pub fn has_modifier(hotkey: &str) -> bool {
+    hotkey.split('+').any(|part| {
+        matches!(
+            part.trim().to_ascii_lowercase().as_str(),
+            "ctrl" | "control" | "shift" | "alt" | "super" | "win" | "meta" | "cmd"
+        )
+    })
 }
 
 #[cfg(test)]

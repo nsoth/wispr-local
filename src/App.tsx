@@ -74,6 +74,7 @@ interface StartupDiagnostics {
   settings_error: string | null;
   settings_read_only: boolean;
   unknown_settings_keys: string[];
+  settings_adjustments?: string[];
   history_error: string | null;
   api_key_error: string | null;
 }
@@ -292,6 +293,7 @@ function App() {
           );
         }
         if (d.history_error) problems.push(d.history_error);
+        for (const adjustment of d.settings_adjustments ?? []) problems.push(adjustment);
         if (d.api_key_error) problems.push(`API keys could not be decrypted: ${d.api_key_error}`);
         setDiagnostics(problems);
       }),
