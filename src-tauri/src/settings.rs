@@ -175,6 +175,8 @@ pub struct SettingsLoad {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AiSettingsUpdate {
     pub provider: AiProvider,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     pub openai_model: String,
     pub claude_model: String,
     pub prompt: String,
@@ -243,6 +245,7 @@ impl Settings {
             update.prompt.clone()
         };
         if self.ai.provider != update.provider
+            || self.ai.enabled != update.enabled
             || self.ai.openai_model != update.openai_model
             || self.ai.claude_model != update.claude_model
             || self.ai.prompt != prompt
@@ -250,6 +253,7 @@ impl Settings {
             settings_changed = true;
         }
         self.ai.provider = update.provider.clone();
+        self.ai.enabled = update.enabled;
         self.ai.openai_model = update.openai_model.clone();
         self.ai.claude_model = update.claude_model.clone();
         self.ai.prompt = prompt;
@@ -633,6 +637,7 @@ mod load_tests {
         s.ai.keys.claude = "sk-ant".into();
         let change = s.apply_ai_update(&AiSettingsUpdate {
             provider: AiProvider::OpenAi,
+            enabled: true,
             openai_model: "gpt-4o-mini".into(),
             claude_model: "claude-haiku-4-5".into(),
             prompt: "Format it".into(),
@@ -653,6 +658,7 @@ mod load_tests {
         s.ai.keys.claude = "sk-ant".into();
         let change = s.apply_ai_update(&AiSettingsUpdate {
             provider: AiProvider::Claude,
+            enabled: true,
             openai_model: s.ai.openai_model.clone(),
             claude_model: s.ai.claude_model.clone(),
             prompt: s.ai.prompt.clone(),
@@ -670,6 +676,7 @@ mod load_tests {
         let mut s = Settings::default();
         s.apply_ai_update(&AiSettingsUpdate {
             provider: AiProvider::None,
+            enabled: true,
             openai_model: s.ai.openai_model.clone(),
             claude_model: s.ai.claude_model.clone(),
             prompt: "   ".into(),

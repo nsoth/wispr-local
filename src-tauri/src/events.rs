@@ -30,6 +30,14 @@ pub const REQUEST_START_RECORDING: &str = "request-start-recording";
 pub const REQUEST_STOP_RECORDING: &str = "request-stop-recording";
 /// Discard the active recording (or skip the paste of the one in progress).
 pub const REQUEST_CANCEL_RECORDING: &str = "request-cancel-recording";
+/// Start a recording that stays on without the hotkey (tray, main window).
+pub const REQUEST_START_HANDS_FREE: &str = "request-start-hands-free";
+/// Main window: switch to the Settings page (tray → Settings…).
+pub const OPEN_SETTINGS: &str = "open-settings";
+/// Payload: serialized `LanguageMode` — the mode changed outside the window.
+pub const LANGUAGE_MODE_CHANGED: &str = "language-mode-changed";
+/// The AI section changed outside the window (tray toggle): reload it.
+pub const AI_SETTINGS_CHANGED: &str = "ai-settings-changed";
 /// Emitted once by the capture callback when the 30-minute cap is reached.
 pub const RECORDING_LIMIT_REACHED: &str = "recording-limit-reached";
 /// Emitted once by the capture error callback (device disconnected etc.).

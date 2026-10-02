@@ -17,6 +17,7 @@ type AiProvider = "none" | "openai" | "claude";
 // What the backend shows: never the key itself, only whether one is stored.
 interface AiSettingsView {
   provider: AiProvider;
+  enabled: boolean;
   openai_model: string;
   claude_model: string;
   prompt: string;
@@ -135,6 +136,7 @@ function App() {
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const [aiSettings, setAiSettings] = useState<AiSettingsView>({
     provider: "none",
+    enabled: true,
     openai_model: "gpt-4o-mini",
     claude_model: "claude-haiku-4-5-20251001",
     prompt: "",
@@ -280,6 +282,24 @@ function App() {
       setActiveLanguage(event.payload.language.toUpperCase());
     });
 
+    // Changes made from the tray reach the window through these events.
+    const unlisten8 = listen(EVENTS.openSettings, () => {
+      setShowSettings(true);
+      void refreshModelFiles();
+      void refreshInputDevices();
+    });
+    const unlisten9 = listen<LanguageMode>(EVENTS.languageModeChanged, (event) => {
+      setLanguage(event.payload);
+    });
+    const unlisten10 = listen(EVENTS.aiSettingsChanged, () => {
+      void invoke<AiSettingsView>("get_ai_settings")
+        .then((ai) => {
+          aiRef.current.view = ai;
+          setAiSettings(ai);
+        })
+        .catch(() => undefined);
+    });
+
     return () => {
       mounted = false;
       void initialLoad;
@@ -290,6 +310,9 @@ function App() {
       unlisten5.then((fn) => fn());
       unlisten6.then((fn) => fn());
       unlisten7.then((fn) => fn());
+      unlisten8.then((fn) => fn());
+      unlisten9.then((fn) => fn());
+      unlisten10.then((fn) => fn());
       clearTimeout(noticeTimerRef.current);
       clearTimeout(copiedTimerRef.current);
       clearTimeout(soundSaveTimer.current);
@@ -437,6 +460,7 @@ function App() {
     const { view, draft } = aiRef.current;
     const update = {
       provider: view.provider,
+      enabled: view.enabled,
       openai_model: view.openai_model,
       claude_model: view.claude_model,
       prompt: view.prompt,
@@ -476,6 +500,7 @@ function App() {
     const view = aiRef.current.view;
     const update = {
       provider: view.provider,
+      enabled: view.enabled,
       openai_model: view.openai_model,
       claude_model: view.claude_model,
       prompt: view.prompt,
@@ -1385,6 +1410,18 @@ function App() {
 
             {aiSettings.provider !== "none" && (
               <>
+                <div className="setting-row">
+                  <span className="setting-label" id="ai-enabled-label">Formatting on</span>
+                  <label className="toggle-switch">
+                    <input
+                      type="checkbox"
+                      aria-labelledby="ai-enabled-label"
+                      checked={aiSettings.enabled}
+                      onChange={(e) => updateAiSettings({ enabled: e.target.checked })}
+                    />
+                    <span className="toggle-slider"></span>
+                  </label>
+                </div>
                 <div className="setting-row prompt-row">
                   <label className="setting-label" htmlFor="formatting-prompt">Prompt</label>
                   <textarea

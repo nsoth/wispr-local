@@ -261,10 +261,15 @@ pub fn run() {
                 });
             }
 
-            // Start requests come from the hotkey, the tray and (later) the UI.
+            // Start requests come from the hotkey (hold) and the tray / window
+            // (hands-free).
             let app_handle = app.handle().clone();
             app.listen(events::REQUEST_START_RECORDING, move |_event| {
-                start_recording_flow(&app_handle);
+                start_recording_flow(&app_handle, false);
+            });
+            let app_handle = app.handle().clone();
+            app.listen(events::REQUEST_START_HANDS_FREE, move |_event| {
+                start_recording_flow(&app_handle, true);
             });
 
             // Cancel: cancel hotkey, overlay X button, tray.

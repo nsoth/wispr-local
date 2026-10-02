@@ -1,17 +1,24 @@
-//! System tray: menu, click handling and the icon that mirrors the pipeline
-//! phase (idle, pulsing red while recording, steady amber while the previous
-//! recording is still being transcribed or pasted).
+//! System tray: a menu that mirrors the app state (start/stop, cancel,
+//! language, AI formatting, paused hotkey, restart on GPU), click handling
+//! and an icon that mirrors the pipeline phase (idle, pulsing red while
+//! recording, steady amber while the previous recording is still being
+//! transcribed or pasted).
 
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tauri::{
     image::Image,
-    menu::{Menu, MenuItem},
+    menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager,
+    AppHandle, Emitter, Manager, Wry,
 };
+
+use crate::events;
+use crate::settings::Settings;
+use crate::state::{lock_or_recover, AppState, AppStatus};
+use crate::transcription::engine::LanguageMode;
 
 pub const TRAY_ID: &str = "main-tray";
 
@@ -56,19 +63,134 @@ impl TrayAnimator {
     }
 }
 
+/// Handles to the menu items whose text / enabled / checked state follows
+/// the app state (see [`refresh`]).
+pub struct TrayMenu {
+    status: MenuItem<Wry>,
+    start_stop: MenuItem<Wry>,
+    cancel: MenuItem<Wry>,
+    lang_auto: CheckMenuItem<Wry>,
+    lang_ru: CheckMenuItem<Wry>,
+    lang_en: CheckMenuItem<Wry>,
+    ai_enabled: CheckMenuItem<Wry>,
+    hotkey_paused: CheckMenuItem<Wry>,
+    restart_gpu: MenuItem<Wry>,
+    copy_last: MenuItem<Wry>,
+}
+
+/// What the state-dependent items should show. Pure, for the tests.
+pub fn tray_labels(status: &AppStatus, hotkey: &str) -> (String, &'static str, bool, bool) {
+    let status_text = match status {
+        AppStatus::Idle => "Idle".to_string(),
+        AppStatus::Recording => "Recording…".to_string(),
+        AppStatus::Transcribing => "Transcribing…".to_string(),
+        AppStatus::Formatting => "Formatting…".to_string(),
+        AppStatus::Injecting => "Pasting…".to_string(),
+        AppStatus::Error { message, .. } => format!("Error: {message}"),
+    };
+    let (start_stop, start_enabled) = match status {
+        AppStatus::Recording => ("Stop and paste", true),
+        AppStatus::Idle | AppStatus::Error { .. } => ("Start hands-free recording", true),
+        _ => ("Start hands-free recording", false),
+    };
+    let cancel_enabled = matches!(
+        status,
+        AppStatus::Recording | AppStatus::Transcribing | AppStatus::Formatting
+    );
+    let status_line = if hotkey.is_empty() {
+        status_text
+    } else {
+        format!("{status_text}  ·  {hotkey}")
+    };
+    (status_line, start_stop, start_enabled, cancel_enabled)
+}
+
 pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
-    let start_item = MenuItem::with_id(
+    let status = MenuItem::with_id(app, "status", "Idle", false, None::<&str>)?;
+    let start_stop = MenuItem::with_id(
         app,
-        "start_recording",
-        "Start Recording",
+        "start_stop",
+        "Start hands-free recording",
         true,
         None::<&str>,
     )?;
-    let stop_item = MenuItem::with_id(app, "stop_recording", "Stop Recording", true, None::<&str>)?;
-    let show_item = MenuItem::with_id(app, "show_window", "Show Window", true, None::<&str>)?;
+    let cancel = MenuItem::with_id(app, "cancel", "Cancel recording", false, None::<&str>)?;
+    let copy_last = MenuItem::with_id(
+        app,
+        "copy_last",
+        "Copy last transcript",
+        false,
+        None::<&str>,
+    )?;
+
+    let lang_auto = CheckMenuItem::with_id(
+        app,
+        "lang_auto",
+        "Auto (Russian / English)",
+        true,
+        true,
+        None::<&str>,
+    )?;
+    let lang_ru = CheckMenuItem::with_id(app, "lang_ru", "Russian", true, false, None::<&str>)?;
+    let lang_en = CheckMenuItem::with_id(app, "lang_en", "English", true, false, None::<&str>)?;
+    let language = Submenu::with_items(app, "Language", true, &[&lang_auto, &lang_ru, &lang_en])?;
+
+    let ai_enabled = CheckMenuItem::with_id(
+        app,
+        "ai_enabled",
+        "AI formatting",
+        true,
+        false,
+        None::<&str>,
+    )?;
+    let hotkey_paused = CheckMenuItem::with_id(
+        app,
+        "hotkey_paused",
+        "Pause hotkey",
+        true,
+        false,
+        None::<&str>,
+    )?;
+    let restart_gpu = MenuItem::with_id(app, "restart_gpu", "Restart on GPU", false, None::<&str>)?;
+
+    let show_item = MenuItem::with_id(app, "show_window", "Show window", true, None::<&str>)?;
+    let settings_item = MenuItem::with_id(app, "open_settings", "Settings…", true, None::<&str>)?;
+    let log_item = MenuItem::with_id(app, "open_log", "Open log folder", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
 
-    let menu = Menu::with_items(app, &[&start_item, &stop_item, &show_item, &quit_item])?;
+    let menu = Menu::with_items(
+        app,
+        &[
+            &status,
+            &PredefinedMenuItem::separator(app)?,
+            &start_stop,
+            &cancel,
+            &copy_last,
+            &PredefinedMenuItem::separator(app)?,
+            &language,
+            &ai_enabled,
+            &hotkey_paused,
+            &restart_gpu,
+            &PredefinedMenuItem::separator(app)?,
+            &show_item,
+            &settings_item,
+            &log_item,
+            &quit_item,
+        ],
+    )?;
+
+    app.manage(TrayMenu {
+        status,
+        start_stop,
+        cancel,
+        lang_auto,
+        lang_ru,
+        lang_en,
+        ai_enabled,
+        hotkey_paused,
+        restart_gpu,
+        copy_last,
+    });
 
     let idle_icon = idle_icon(app);
 
@@ -77,24 +199,7 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         .menu(&menu)
         .show_menu_on_left_click(false)
         .tooltip(TrayPhase::Idle.tooltip())
-        .on_menu_event(|app, event| match event.id.as_ref() {
-            "start_recording" => {
-                let _ = app.emit(crate::events::REQUEST_START_RECORDING, ());
-            }
-            "stop_recording" => {
-                let _ = app.emit(crate::events::REQUEST_STOP_RECORDING, ());
-            }
-            "show_window" => {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
-            }
-            "quit" => {
-                app.exit(0);
-            }
-            _ => {}
-        })
+        .on_menu_event(|app, event| on_menu(app, event.id.as_ref()))
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click {
                 button: MouseButton::Left,
@@ -102,11 +207,7 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
                 ..
             } = event
             {
-                let app = tray.app_handle();
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
+                show_main_window(tray.app_handle());
             }
         })
         .build(app)?;
@@ -124,7 +225,175 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         .name("wispr-tray".into())
         .spawn(move || animator_loop(app_handle, phase))?;
 
+    refresh(app);
     Ok(())
+}
+
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+fn on_menu(app: &AppHandle, id: &str) {
+    match id {
+        "start_stop" => {
+            let recording = {
+                let state = app.state::<Mutex<AppState>>();
+                let s = lock_or_recover(&state);
+                s.status == AppStatus::Recording
+            };
+            if recording {
+                let _ = app.emit(events::REQUEST_STOP_RECORDING, ());
+            } else {
+                let _ = app.emit(events::REQUEST_START_HANDS_FREE, ());
+            }
+        }
+        "cancel" => {
+            let _ = app.emit(events::REQUEST_CANCEL_RECORDING, ());
+        }
+        "copy_last" => {
+            let text = {
+                let state = app.state::<Mutex<AppState>>();
+                let s = lock_or_recover(&state);
+                s.last_transcription.clone()
+            };
+            if !text.is_empty() {
+                match crate::system::text_injection::copy_only(&text) {
+                    Ok(()) => log::info!("Last transcript copied from the tray"),
+                    Err(e) => log::warn!("Could not copy the last transcript: {e}"),
+                }
+            }
+        }
+        "lang_auto" => set_language_from_tray(app, LanguageMode::Auto),
+        "lang_ru" => set_language_from_tray(app, LanguageMode::Russian),
+        "lang_en" => set_language_from_tray(app, LanguageMode::English),
+        "ai_enabled" => {
+            let enabled = {
+                let settings = app.state::<Mutex<Settings>>();
+                let s = lock_or_recover(&settings);
+                s.ai.enabled
+            };
+            if let Err(e) = crate::commands::apply_ai_enabled(app, !enabled) {
+                log::warn!("Could not toggle AI formatting from the tray: {e}");
+            }
+        }
+        "hotkey_paused" => {
+            let paused = {
+                let state = app.state::<Mutex<AppState>>();
+                let mut s = lock_or_recover(&state);
+                s.hotkey_paused = !s.hotkey_paused;
+                s.hotkey_paused
+            };
+            log::info!(
+                "Hotkey {} from the tray",
+                if paused { "paused" } else { "resumed" }
+            );
+            refresh(app);
+        }
+        "restart_gpu" => {
+            log::info!("Restart on GPU requested from the tray");
+            app.exit(crate::supervisor::RESTART_ON_GPU_CODE);
+        }
+        "show_window" => show_main_window(app),
+        "open_settings" => {
+            show_main_window(app);
+            let _ = app.emit(events::OPEN_SETTINGS, ());
+        }
+        "open_log" => {
+            let log_path = app
+                .state::<crate::config::AppConfig>()
+                .data_dir
+                .join("wispr.log");
+            #[cfg(windows)]
+            {
+                let _ = std::process::Command::new("explorer.exe")
+                    .arg(format!("/select,{}", log_path.display()))
+                    .spawn();
+            }
+            #[cfg(not(windows))]
+            {
+                log::info!("Log file: {}", log_path.display());
+            }
+        }
+        "quit" => quit_when_idle(app.clone()),
+        _ => {}
+    }
+}
+
+fn set_language_from_tray(app: &AppHandle, language: LanguageMode) {
+    if let Err(e) = crate::commands::apply_language(app, language) {
+        log::warn!("Could not change the language from the tray: {e}");
+    }
+}
+
+/// Quit, but give an in-flight transcription/paste up to two seconds to
+/// finish so the clipboard is restored and the text is not lost mid-paste.
+fn quit_when_idle(app: AppHandle) {
+    std::thread::spawn(move || {
+        for _ in 0..20 {
+            let busy = {
+                let state = app.state::<Mutex<AppState>>();
+                let s = lock_or_recover(&state);
+                matches!(
+                    s.status,
+                    AppStatus::Transcribing | AppStatus::Formatting | AppStatus::Injecting
+                )
+            };
+            if !busy {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        log::info!("Quit requested from the tray");
+        app.exit(0);
+    });
+}
+
+/// Bring every state-dependent item in line with AppState and Settings.
+/// Cheap; called on each status / model / settings change.
+pub fn refresh(app: &AppHandle) {
+    let Some(menu) = app.try_state::<TrayMenu>() else {
+        return;
+    };
+    let (status, backend_cpu, paused, has_last) = {
+        let state = app.state::<Mutex<AppState>>();
+        let s = lock_or_recover(&state);
+        (
+            s.status.clone(),
+            s.model.backend() == "CPU",
+            s.hotkey_paused,
+            !s.last_transcription.is_empty(),
+        )
+    };
+    let (language, ai_on, ai_configured, hotkey) = {
+        let settings = app.state::<Mutex<Settings>>();
+        let s = lock_or_recover(&settings);
+        (
+            s.language,
+            s.ai.enabled,
+            s.ai.provider != crate::formatting::AiProvider::None,
+            s.hotkey.clone(),
+        )
+    };
+    let (status_line, start_stop, start_enabled, cancel_enabled) = tray_labels(&status, &hotkey);
+    let _ = menu.status.set_text(status_line);
+    let _ = menu.start_stop.set_text(start_stop);
+    let _ = menu.start_stop.set_enabled(start_enabled);
+    let _ = menu.cancel.set_enabled(cancel_enabled);
+    let _ = menu.copy_last.set_enabled(has_last);
+    let _ = menu.lang_auto.set_checked(matches!(
+        language,
+        LanguageMode::Auto | LanguageMode::Unknown
+    ));
+    let _ = menu.lang_ru.set_checked(language == LanguageMode::Russian);
+    let _ = menu.lang_en.set_checked(language == LanguageMode::English);
+    let _ = menu.ai_enabled.set_checked(ai_on && ai_configured);
+    let _ = menu.ai_enabled.set_enabled(ai_configured);
+    let _ = menu.hotkey_paused.set_checked(paused);
+    let _ = menu.restart_gpu.set_enabled(backend_cpu);
 }
 
 fn animator_loop(app: AppHandle, phase: Arc<AtomicU8>) {
@@ -221,7 +490,8 @@ fn dot_icon(radius: f32, rgb: [u8; 3]) -> Image<'static> {
 
 #[cfg(test)]
 mod tests {
-    use super::TrayPhase;
+    use super::{tray_labels, TrayPhase};
+    use crate::state::AppStatus;
 
     #[test]
     fn phases_round_trip_through_the_atomic() {
@@ -229,5 +499,29 @@ mod tests {
             assert_eq!(TrayPhase::from_u8(phase as u8), phase);
         }
         assert_eq!(TrayPhase::from_u8(42), TrayPhase::Idle);
+    }
+
+    #[test]
+    fn menu_labels_follow_the_status() {
+        let (status, start_stop, enabled, cancel) =
+            tray_labels(&AppStatus::Idle, "Ctrl+Shift+Space");
+        assert_eq!(status, "Idle  ·  Ctrl+Shift+Space");
+        assert_eq!(start_stop, "Start hands-free recording");
+        assert!(enabled);
+        assert!(!cancel);
+
+        let (status, start_stop, enabled, cancel) = tray_labels(&AppStatus::Recording, "");
+        assert_eq!(status, "Recording…");
+        assert_eq!(start_stop, "Stop and paste");
+        assert!(enabled);
+        assert!(cancel);
+
+        let (_, _, enabled, cancel) = tray_labels(&AppStatus::Transcribing, "");
+        assert!(!enabled, "cannot start while transcribing");
+        assert!(cancel, "but can cancel the paste");
+
+        let (_, _, enabled, cancel) = tray_labels(&AppStatus::Injecting, "");
+        assert!(!enabled);
+        assert!(!cancel, "too late to cancel a paste in flight");
     }
 }

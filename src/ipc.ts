@@ -13,6 +13,9 @@ export const EVENTS = {
   modelStateChanged: "model-state-changed",
   overlayState: "overlay-state",
   languageDetected: "language-detected",
+  openSettings: "open-settings",
+  languageModeChanged: "language-mode-changed",
+  aiSettingsChanged: "ai-settings-changed",
 } as const;
 
 export type OverlayPhase = "recording" | "processing" | "result";

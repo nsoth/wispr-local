@@ -44,6 +44,7 @@ pub fn set_status(app: &tauri::AppHandle, status: AppStatus) {
 /// Broadcast a status that was already stored (e.g. under an existing lock).
 pub fn emit_status(app: &tauri::AppHandle, status: &AppStatus) {
     let _ = app.emit(events::STATUS_CHANGED, status);
+    system::tray::refresh(app);
 }
 
 /// What the overlay pill shows. `phase` drives the layout (waveform vs text),
@@ -121,8 +122,10 @@ impl<F: FnOnce()> Drop for ArmedGuard<F> {
     }
 }
 
-pub fn start_recording_flow(app: &tauri::AppHandle) {
-    log::debug!("start_recording_flow called");
+/// `pinned`: keep recording after the hotkey is released (tray / window
+/// start buttons have no key to hold).
+pub fn start_recording_flow(app: &tauri::AppHandle, pinned: bool) {
+    log::debug!("start_recording_flow called (pinned={pinned})");
     let state = app.state::<Mutex<AppState>>();
     let capture = app.state::<Mutex<AudioCapture>>();
     let buffer = app.state::<AudioBuffer>();
@@ -147,7 +150,7 @@ pub fn start_recording_flow(app: &tauri::AppHandle) {
         match &s.model {
             ModelState::Ready { .. } | ModelState::Loading => {
                 s.status = AppStatus::Recording;
-                s.recording_locked = false;
+                s.recording_locked = pinned;
                 s.detected_language.clear();
                 s.recording_started_at = Some(Instant::now());
                 s.preview_abort.store(false, Ordering::Relaxed);
@@ -269,7 +272,7 @@ pub fn start_recording_flow(app: &tauri::AppHandle) {
     }
 
     emit_status(app, &AppStatus::Recording);
-    let _ = app.emit(events::LOCK_CHANGED, false);
+    let _ = app.emit(events::LOCK_CHANGED, pinned);
     app.state::<SoundPlayer>().play_start();
 
     // Kick off tray animation and reveal overlay (if user hasn't disabled it).
@@ -590,6 +593,7 @@ pub fn set_model_state(app: &tauri::AppHandle, model: ModelState) {
         lock_or_recover(&state).model = model.clone();
     }
     let _ = app.emit(events::MODEL_STATE_CHANGED, &model);
+    system::tray::refresh(app);
 }
 
 /// Model files to try, in order: the configured one, the shipped defaults,
@@ -894,7 +898,7 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
     }
 
     let format_started = Instant::now();
-    let text = if ai_settings.provider != formatting::AiProvider::None {
+    let text = if ai_settings.is_active() {
         set_status(app, AppStatus::Formatting);
         emit_overlay_state(app, "processing", "Formatting", "");
         match formatting::format_text(&text, &ai_settings).await {
@@ -910,7 +914,7 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
     } else {
         text
     };
-    let format_ms = if ai_settings.provider != formatting::AiProvider::None {
+    let format_ms = if ai_settings.is_active() {
         format_started.elapsed().as_millis()
     } else {
         0

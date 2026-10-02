@@ -428,9 +428,10 @@ pub fn end_hotkey_capture(state: State<'_, Mutex<AppState>>) {
 
 /// Tray → "Pause hotkey".
 #[tauri::command]
-pub fn set_hotkey_paused(paused: bool, state: State<'_, Mutex<AppState>>) {
+pub fn set_hotkey_paused(app: AppHandle, paused: bool, state: State<'_, Mutex<AppState>>) {
     crate::state::lock_or_recover(&state).hotkey_paused = paused;
     log::info!("Hotkey {}", if paused { "paused" } else { "resumed" });
+    crate::system::tray::refresh(&app);
 }
 
 /// Overlay X button / tray: discard the recording or skip the paste.
@@ -515,6 +516,7 @@ pub fn test_sound(
 #[derive(serde::Serialize)]
 pub struct AiSettingsView {
     pub provider: crate::formatting::AiProvider,
+    pub enabled: bool,
     pub openai_model: String,
     pub claude_model: String,
     pub prompt: String,
@@ -526,6 +528,7 @@ pub struct AiSettingsView {
 fn ai_settings_view(s: &Settings, state: &AppState) -> AiSettingsView {
     AiSettingsView {
         provider: s.ai.provider.clone(),
+        enabled: s.ai.enabled,
         openai_model: s.ai.openai_model.clone(),
         claude_model: s.ai.claude_model.clone(),
         prompt: s.ai.prompt.clone(),
@@ -550,6 +553,7 @@ pub fn get_ai_settings(
 /// field changed. Returns the refreshed view.
 #[tauri::command]
 pub fn set_ai_settings(
+    app: AppHandle,
     update: crate::settings::AiSettingsUpdate,
     settings: State<'_, Mutex<Settings>>,
     state: State<'_, Mutex<AppState>>,
@@ -575,7 +579,12 @@ pub fn set_ai_settings(
             *s = previous;
             return Err(e);
         }
-        log::info!("AI settings updated: provider={:?}", s.ai.provider);
+        log::info!(
+            "AI settings updated: provider={:?} enabled={}",
+            s.ai.provider,
+            s.ai.enabled
+        );
+        crate::system::tray::refresh(&app);
     }
     if change.keys_changed {
         log::info!(
@@ -649,6 +658,29 @@ pub fn set_text_settings(
     Ok(())
 }
 
+/// Tray toggle for AI formatting; keeps provider and keys, flips the switch.
+pub fn apply_ai_enabled(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    let settings = app.state::<Mutex<Settings>>();
+    let config = app.state::<AppConfig>();
+    {
+        let mut s = crate::state::lock_or_recover(&settings);
+        let previous = s.ai.enabled;
+        s.ai.enabled = enabled;
+        if let Err(e) = s.save(&config.data_dir) {
+            s.ai.enabled = previous;
+            return Err(e);
+        }
+    }
+    log::info!(
+        "AI formatting {}",
+        if enabled { "enabled" } else { "disabled" }
+    );
+    use tauri::Emitter;
+    let _ = app.emit(crate::events::AI_SETTINGS_CHANGED, ());
+    crate::system::tray::refresh(app);
+    Ok(())
+}
+
 /// Problems found while loading state files at startup (settings.json moved
 /// aside, unreadable history, undecryptable keys).
 #[tauri::command]
@@ -703,18 +735,36 @@ pub fn get_language(
 
 #[tauri::command]
 pub fn set_language(
+    app: AppHandle,
     language: crate::transcription::engine::LanguageMode,
-    settings: State<'_, Mutex<Settings>>,
-    config: State<'_, AppConfig>,
 ) -> Result<(), String> {
-    let mut s = settings.lock().map_err(|e| e.to_string())?;
-    log::info!("Language mode updated: {:?}", language);
-    let previous = s.language;
-    s.language = language;
-    if let Err(e) = s.save(&config.data_dir) {
-        s.language = previous;
-        return Err(e);
+    apply_language(&app, language)
+}
+
+/// Change the language mode from the Settings page or the tray; both stay
+/// in sync through the `language-mode-changed` event and the tray refresh.
+pub fn apply_language(
+    app: &AppHandle,
+    language: crate::transcription::engine::LanguageMode,
+) -> Result<(), String> {
+    let settings = app.state::<Mutex<Settings>>();
+    let config = app.state::<AppConfig>();
+    {
+        let mut s = crate::state::lock_or_recover(&settings);
+        if s.language == language {
+            return Ok(());
+        }
+        let previous = s.language;
+        s.language = language;
+        if let Err(e) = s.save(&config.data_dir) {
+            s.language = previous;
+            return Err(e);
+        }
     }
+    log::info!("Language mode updated: {:?}", language);
+    use tauri::Emitter;
+    let _ = app.emit(crate::events::LANGUAGE_MODE_CHANGED, language);
+    crate::system::tray::refresh(app);
     Ok(())
 }
 

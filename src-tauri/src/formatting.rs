@@ -27,10 +27,17 @@ pub enum AiProvider {
     Unknown,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiSettings {
     #[serde(default)]
     pub provider: AiProvider,
+    /// Quick on/off (tray) without forgetting the provider and key.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     /// Plaintext key from pre-DPAPI settings files. Read for migration only;
     /// never written back.
     #[serde(default, rename = "api_key", skip_serializing)]
@@ -47,6 +54,11 @@ pub struct AiSettings {
 }
 
 impl AiSettings {
+    /// Formatting runs only with a provider selected and the switch on.
+    pub fn is_active(&self) -> bool {
+        self.enabled && !matches!(self.provider, AiProvider::None | AiProvider::Unknown)
+    }
+
     /// The key for the active provider ("" when none is stored).
     pub fn api_key(&self) -> &str {
         match self.provider {
@@ -72,6 +84,7 @@ impl Default for AiSettings {
     fn default() -> Self {
         Self {
             provider: AiProvider::None,
+            enabled: true,
             legacy_api_key: String::new(),
             openai_model: default_openai_model(),
             claude_model: default_claude_model(),
