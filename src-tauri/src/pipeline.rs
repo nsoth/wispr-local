@@ -13,8 +13,8 @@ use crate::audio::capture::AudioCapture;
 use crate::config::AppConfig;
 use crate::events;
 use crate::overlay::{hide_overlay, show_overlay_if_enabled};
-use crate::settings::Settings;
-use crate::state::{self, AppState, AppStatus};
+use crate::settings::{self, Settings};
+use crate::state::{self, lock_or_recover, AppState, AppStatus, ModelState};
 use crate::system::sounds::SoundPlayer;
 use crate::system::tray::TrayAnimator;
 use crate::text::remove_fillers;
@@ -43,31 +43,51 @@ pub fn start_recording_flow(app: &tauri::AppHandle) {
     let capture = app.state::<Mutex<AudioCapture>>();
     let buffer = app.state::<AudioBuffer>();
 
-    let can_start = {
-        let Ok(mut s) = state.lock() else {
-            log::error!("App state lock poisoned while starting recording");
-            return;
-        };
+    let model = {
+        let mut s = lock_or_recover(&state);
         if !matches!(s.status, AppStatus::Idle | AppStatus::Error(_)) {
             log::info!("Ignoring recording request while app is busy");
             return;
         }
-        if !s.model_loaded {
-            false
-        } else {
-            s.status = AppStatus::Recording;
-            s.recording_locked = false;
-            true
+        match &s.model {
+            ModelState::Ready { .. } | ModelState::Loading => {
+                s.status = AppStatus::Recording;
+                s.recording_locked = false;
+            }
+            ModelState::Missing | ModelState::Failed { .. } => {}
         }
+        s.model.clone()
     };
 
-    if !can_start {
-        notify_user(
-            app,
-            "Whisper model is not loaded. Open Wispr Local for setup help.",
-        );
-        let _ = app.emit(events::OPERATION_NOTICE, "Whisper model is not loaded");
-        return;
+    match &model {
+        ModelState::Ready { .. } => {}
+        ModelState::Loading => {
+            // Capture does not need the model; the final transcription waits
+            // for the engine lock that the loader holds.
+            log::info!("Recording while the model is still loading");
+            let _ = app.emit(
+                events::OPERATION_NOTICE,
+                "Model is still loading; this recording is transcribed when it is ready",
+            );
+        }
+        ModelState::Missing => {
+            log::warn!("Recording refused: no Whisper model found");
+            notify_user(app, "No Whisper model found. Open Wispr Local to add one.");
+            let _ = app.emit(events::OPERATION_NOTICE, "No Whisper model found");
+            return;
+        }
+        ModelState::Failed { error } => {
+            log::warn!("Recording refused: model failed to load ({error})");
+            notify_user(
+                app,
+                "The Whisper model failed to load. Open Wispr Local to retry.",
+            );
+            let _ = app.emit(
+                events::OPERATION_NOTICE,
+                format!("Model failed to load: {error}"),
+            );
+            return;
+        }
     }
 
     {
@@ -231,70 +251,148 @@ pub fn notify_user(app: &tauri::AppHandle, message: &str) {
         .show();
 }
 
-/// Payload for the `model-state-changed` event so the frontend can flip the
-/// footer indicator the moment the async model load finishes (or fails).
-#[derive(Clone, serde::Serialize)]
-pub struct ModelStatePayload {
-    pub loaded: bool,
-    pub backend: String,
+/// Record the model state and tell the main window.
+pub fn set_model_state(app: &tauri::AppHandle, model: ModelState) {
+    {
+        let state = app.state::<Mutex<AppState>>();
+        lock_or_recover(&state).model = model.clone();
+    }
+    let _ = app.emit(events::MODEL_STATE_CHANGED, &model);
 }
 
-/// Load the Whisper model on a background thread and mirror the result into
-/// AppState, then notify the frontend. Must be called only after the engine and
-/// AppState mutexes are managed. Tries each candidate path in order and stops at
-/// the first that loads.
-pub fn spawn_model_loader(
-    app: tauri::AppHandle,
-    candidate_paths: Vec<std::path::PathBuf>,
-    models_dir: std::path::PathBuf,
-) {
-    std::thread::spawn(move || {
-        let engine = app.state::<Mutex<WhisperEngine>>();
-        let mut loaded = false;
-        for path in &candidate_paths {
-            if !path.exists() {
-                log::warn!("Model not found at {:?}", path);
-                continue;
-            }
-            let result = engine.lock().unwrap().load_model(path);
-            match result {
-                Ok(_) => {
-                    log::info!("Model loaded from {:?}", path);
-                    loaded = true;
-                    break;
+/// Model files to try, in order: the configured one, the shipped defaults,
+/// then anything else discovered in the models directory. Deduplicated.
+pub fn model_candidates(requested: &str, discovered: &[String]) -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    let mut push = |name: &str| {
+        if !name.trim().is_empty() && !candidates.iter().any(|c| c == name) {
+            candidates.push(name.to_string());
+        }
+    };
+    push(requested);
+    push(&settings::default_model_file());
+    push("ggml-medium.bin");
+    for name in discovered {
+        push(name);
+    }
+    candidates
+}
+
+/// Load the Whisper model on a background thread: marks the state Loading,
+/// tries each candidate in order, mirrors the result into AppState and emits
+/// `model-state-changed`. A panic inside whisper-rs becomes `Failed` instead
+/// of a poisoned engine. Must be called only after the engine and AppState
+/// mutexes are managed.
+pub fn spawn_model_loader(app: tauri::AppHandle, requested: String) {
+    set_model_state(&app, ModelState::Loading);
+    std::thread::Builder::new()
+        .name("wispr-model-loader".into())
+        .spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                load_first_available(&app, &requested)
+            }));
+            let model = match outcome {
+                Ok(model) => model,
+                Err(_) => {
+                    log::error!("Model loader panicked; see the lines above");
+                    ModelState::Failed {
+                        error: "the model loader crashed (see wispr.log)".to_string(),
+                    }
                 }
-                Err(e) => log::error!("Failed to load model {:?}: {}", path, e),
+            };
+            set_model_state(&app, model.clone());
+
+            match &model {
+                ModelState::Ready {
+                    backend,
+                    file,
+                    fallback,
+                } => {
+                    if *fallback {
+                        let message = format!(
+                            "Configured model {requested} is not available; using {file} instead."
+                        );
+                        log::warn!("{message}");
+                        let _ = app.emit(events::OPERATION_NOTICE, &message);
+                        notify_user(&app, &message);
+                    }
+                    if backend != "CUDA" {
+                        let message = if std::env::var("WISPR_FORCE_CPU").is_ok() {
+                            "Wispr Local recovered from a GPU failure and is using CPU                              transcription until restart."
+                        } else {
+                            "CUDA is unavailable; transcription runs on the CPU and will be slow."
+                        };
+                        notify_user(&app, message);
+                    }
+                }
+                ModelState::Missing => {
+                    let models_dir = app.state::<AppConfig>().models_dir.clone();
+                    log::error!(
+                        "No Whisper model found in {}. Download one to enable transcription.",
+                        models_dir.display()
+                    );
+                    // First-run dead end otherwise: the window is hidden in
+                    // the tray and the hotkey only shows a toast.
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                    }
+                }
+                ModelState::Failed { error } => {
+                    notify_user(&app, &format!("Whisper model failed to load: {error}"));
+                }
+                ModelState::Loading => {}
+            }
+        })
+        .expect("spawn model loader thread");
+}
+
+fn load_first_available(app: &tauri::AppHandle, requested: &str) -> ModelState {
+    let config = app.state::<AppConfig>();
+    let discovered = config.available_model_files();
+    let candidates = model_candidates(requested, &discovered);
+    let engine = app.state::<Mutex<WhisperEngine>>();
+
+    let mut any_present = false;
+    let mut last_error = String::new();
+    for name in &candidates {
+        let path = config.model_path(name);
+        if !path.exists() {
+            log::debug!("Model not found at {}", path.display());
+            continue;
+        }
+        any_present = true;
+        let started = std::time::Instant::now();
+        let result = {
+            let mut eng = lock_or_recover(&engine);
+            eng.unload();
+            eng.load_model(&path)
+        };
+        match result {
+            Ok(()) => {
+                let backend = lock_or_recover(&engine).compute_backend().to_string();
+                log::info!(
+                    "Model loaded from {} in {} ms ({backend})",
+                    path.display(),
+                    started.elapsed().as_millis()
+                );
+                return ModelState::Ready {
+                    backend,
+                    file: name.clone(),
+                    fallback: name != requested,
+                };
+            }
+            Err(e) => {
+                log::error!("Failed to load model {}: {e}", path.display());
+                last_error = e;
             }
         }
-
-        let backend = if loaded {
-            engine.lock().unwrap().compute_backend().to_string()
-        } else {
-            String::new()
-        };
-        {
-            let state = app.state::<Mutex<AppState>>();
-            let mut s = state.lock().unwrap();
-            s.model_loaded = loaded;
-            s.compute_backend = backend.clone();
-        }
-        let _ = app.emit(
-            events::MODEL_STATE_CHANGED,
-            ModelStatePayload { loaded, backend },
-        );
-
-        if !loaded {
-            log::error!(
-                "No usable Whisper model found in {:?}. Download one to enable transcription.",
-                models_dir
-            );
-        } else if std::env::var("WISPR_FORCE_CPU").is_ok() {
-            notify_user(
-                &app,
-                "Wispr Local recovered from a GPU failure and is using CPU transcription until restart.",
-            );
-        }
-    });
+    }
+    if any_present {
+        ModelState::Failed { error: last_error }
+    } else {
+        ModelState::Missing
+    }
 }
 
 pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
@@ -429,4 +527,35 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
     emit_status(app, &AppStatus::Idle);
     let _ = app.emit(events::HISTORY_CHANGED, &history);
     let _ = app.emit(events::TRANSCRIPTION_COMPLETE, text);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::model_candidates;
+
+    #[test]
+    fn candidates_start_with_the_requested_file_and_dedupe() {
+        let discovered = vec![
+            "ggml-base.bin".to_string(),
+            "ggml-large-v3-turbo.bin".to_string(),
+            "ggml-small-q5_1.bin".to_string(),
+        ];
+        assert_eq!(
+            model_candidates("ggml-small-q5_1.bin", &discovered),
+            vec![
+                "ggml-small-q5_1.bin",
+                "ggml-large-v3-turbo.bin",
+                "ggml-medium.bin",
+                "ggml-base.bin",
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_request_falls_back_to_defaults() {
+        assert_eq!(
+            model_candidates("  ", &[]),
+            vec!["ggml-large-v3-turbo.bin", "ggml-medium.bin"]
+        );
+    }
 }

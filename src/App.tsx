@@ -33,6 +33,19 @@ interface StartupDiagnostics {
   api_key_error: string | null;
 }
 
+type ModelState =
+  | { state: "loading" }
+  | { state: "ready"; backend: string; file: string; fallback: boolean }
+  | { state: "missing" }
+  | { state: "failed"; error: string };
+
+interface ModelFileInfo {
+  name: string;
+  size_bytes: number;
+  configured: boolean;
+  loaded: boolean;
+}
+
 type NoticeKind = "info" | "error";
 interface Notice {
   text: string;
@@ -57,12 +70,8 @@ function App() {
   const [history, setHistory] = useState<string[]>([]);
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
   const [streamingPreview, setStreamingPreview] = useState("");
-  const [modelLoaded, setModelLoaded] = useState(false);
-  // The model loads asynchronously on the backend; until we get a definitive
-  // result (initial query returning true, or the model-state-changed event) we
-  // show "Checking model..." instead of the false "Model not loaded" help.
-  const [modelReported, setModelReported] = useState(false);
-  const [computeBackend, setComputeBackend] = useState("");
+  const [modelState, setModelState] = useState<ModelState>({ state: "loading" });
+  const [modelFiles, setModelFiles] = useState<ModelFileInfo[]>([]);
   const [modelsDir, setModelsDir] = useState("");
   const [hotkey, setHotkey] = useState("Ctrl+Shift+Space");
   const [isCapturingHotkey, setIsCapturingHotkey] = useState(false);
@@ -116,14 +125,12 @@ function App() {
       const value = await invoke<T>(command);
       if (mounted) apply(value);
     };
-    const initialLoad = Promise.allSettled([
-      load<boolean>("is_model_loaded", (value) => {
-        setModelLoaded(value);
-        // A positive result is definitive; a negative one may just mean the
-        // async load hasn't finished, so wait for model-state-changed.
-        if (value) setModelReported(true);
-      }),
-      load<string>("get_compute_backend", setComputeBackend),
+    // State is registered before the windows exist, so these should never
+    // fail; if the IPC bridge is not ready yet (observed on some cold starts),
+    // retry with a short backoff before telling the user to restart.
+    const RETRY_DELAYS = [300, 1000, 3000];
+    const loadAll = (attempt: number) => Promise.allSettled([
+      load<ModelState>("get_model_state", setModelState),
       load<string>("get_models_dir", setModelsDir),
       load<string>("get_hotkey", setHotkey),
       load<string[]>("get_history", setHistory),
@@ -166,11 +173,26 @@ function App() {
       load<AppStatus>("get_status", setStatus),
     ]).then((results) => {
       if (!mounted) return;
-      if (results.some((result) => result.status === "rejected")) {
+      const failed = results.filter(
+        (result): result is PromiseRejectedResult => result.status === "rejected",
+      );
+      if (failed.length > 0) {
+        const reason = String(failed[0].reason);
+        if (attempt < RETRY_DELAYS.length) {
+          setTimeout(() => {
+            if (mounted) void loadAll(attempt + 1);
+          }, RETRY_DELAYS[attempt]);
+          return;
+        }
         setError("Some settings could not be loaded. Restart Wispr Local if this persists.");
+        void invoke("log_frontend_error", {
+          command: "initial-load",
+          message: `${failed.length} of ${results.length} calls failed: ${reason}`,
+        }).catch(() => undefined);
       }
       setIsLoading(false);
     });
+    const initialLoad = loadAll(0);
 
     const unlisten1 = listen<AppStatus>(EVENTS.statusChanged, (event) => {
       setStatus(event.payload);
@@ -202,14 +224,9 @@ function App() {
 
     // The model loads on a background thread; this fires once it finishes (or
     // fails), flipping the footer indicator without a restart.
-    const unlisten6 = listen<{ loaded: boolean; backend: string }>(
-      EVENTS.modelStateChanged,
-      (event) => {
-        setModelLoaded(event.payload.loaded);
-        setComputeBackend(event.payload.backend);
-        setModelReported(true);
-      },
-    );
+    const unlisten6 = listen<ModelState>(EVENTS.modelStateChanged, (event) => {
+      setModelState(event.payload);
+    });
 
     return () => {
       mounted = false;
@@ -484,6 +501,34 @@ function App() {
     }
   };
 
+  const refreshModelFiles = async () => {
+    try {
+      setModelFiles(await invoke<ModelFileInfo[]>("get_model_files"));
+    } catch (error) {
+      setError(`Could not list models: ${String(error)}`);
+    }
+  };
+
+  const reloadModel = () => {
+    invoke("reload_model")
+      .then(() => setNotice("Reloading the model…"))
+      .catch((error) => setError(String(error)));
+  };
+
+  const chooseModel = (name: string) => {
+    invoke("set_model_file", { name })
+      .then(() => {
+        setNotice(`Loading ${name}…`);
+        void refreshModelFiles();
+      })
+      .catch((error) => setError(String(error)));
+  };
+
+  const modelLabel = (file: string) => file.replace(/^ggml-/, "").replace(/\.bin$/, "");
+  const formatSize = (bytes: number) => `${(bytes / 1_000_000_000).toFixed(2)} GB`;
+  const modelReady = modelState.state === "ready";
+  const modelLoading = modelState.state === "loading";
+
   const refreshInputDevices = async () => {
     setRefreshingDevices(true);
     try {
@@ -512,7 +557,11 @@ function App() {
         <button
           type="button"
           className="settings-toggle"
-          onClick={() => setShowSettings(!showSettings)}
+          onClick={() => {
+            const next = !showSettings;
+            setShowSettings(next);
+            if (next) void refreshModelFiles();
+          }}
           aria-label={showSettings ? "Return to dictation status" : "Open settings"}
           aria-expanded={showSettings}
         >
@@ -856,6 +905,57 @@ function App() {
           </div>
 
           <div className="settings-group">
+            <div className="settings-group-title">Model</div>
+            <div className="setting-row">
+              <label className="setting-label" htmlFor="model-select">Whisper model</label>
+              <div className="device-controls">
+                <select
+                  id="model-select"
+                  className="setting-select"
+                  value={modelFiles.find((m) => m.configured)?.name ?? ""}
+                  disabled={modelLoading || isProcessing || isRecording}
+                  onChange={(e) => chooseModel(e.target.value)}
+                >
+                  {modelFiles.length === 0 && <option value="">No models found</option>}
+                  {modelFiles.map((m) => (
+                    <option key={m.name} value={m.name}>
+                      {modelLabel(m.name)} · {formatSize(m.size_bytes)}
+                      {m.loaded ? " · loaded" : ""}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  className="device-refresh-btn"
+                  disabled={modelLoading || isProcessing || isRecording}
+                  onClick={() => {
+                    void refreshModelFiles();
+                    reloadModel();
+                  }}
+                  aria-label="Rescan the models folder and reload"
+                  title="Rescan the models folder and reload"
+                >
+                  ↻
+                </button>
+              </div>
+            </div>
+            <div className="settings-note">
+              Models folder: <span className="model-path">{modelsDir}</span>
+              <button
+                type="button"
+                className="sound-btn"
+                onClick={() =>
+                  invoke("open_models_dir").catch((error) =>
+                    setError(`Could not open model folder: ${String(error)}`),
+                  )
+                }
+              >
+                Open folder
+              </button>
+            </div>
+          </div>
+
+          <div className="settings-group">
             <div className="settings-group-title">AI Formatting</div>
 
             <div className="setting-row">
@@ -997,21 +1097,24 @@ function App() {
       <div className="footer">
         <div
           className={`model-indicator ${
-            isLoading || (!modelReported && !modelLoaded)
-              ? ""
-              : modelLoaded
-                ? "ok"
-                : "err"
+            modelLoading ? "" : modelReady ? "ok" : "err"
           }`}
         >
           <span className="dot" />
-          {isLoading || (!modelReported && !modelLoaded)
-            ? "Checking model..."
-            : modelLoaded
-              ? `Model ready${computeBackend ? ` · ${computeBackend}` : ""}`
-              : "Model not loaded"}
+          {modelState.state === "loading" && "Loading model…"}
+          {modelState.state === "ready" &&
+            `Model ready · ${modelState.backend} · ${modelLabel(modelState.file)}${
+              modelState.fallback ? " (fallback)" : ""
+            }`}
+          {modelState.state === "missing" && "No Whisper model found"}
+          {modelState.state === "failed" && "Model failed to load"}
         </div>
-        {!isLoading && modelReported && !modelLoaded && (
+        {modelState.state === "ready" && modelState.backend !== "CUDA" && (
+          <div className="model-help">
+            Running on the CPU (slow). Quit and start Wispr Local again to retry CUDA.
+          </div>
+        )}
+        {modelState.state === "missing" && (
           <div className="model-help">
             Download <code>ggml-large-v3-turbo.bin</code> to:
             <span className="model-path">{modelsDir}</span>
@@ -1028,7 +1131,19 @@ function App() {
               >
                 Open folder
               </button>
-              <span>Restart Wispr Local after adding the model.</span>
+              <button type="button" className="model-open-btn" onClick={reloadModel}>
+                Rescan
+              </button>
+            </div>
+          </div>
+        )}
+        {modelState.state === "failed" && (
+          <div className="model-help">
+            {modelState.error}
+            <div className="model-actions">
+              <button type="button" className="model-open-btn" onClick={reloadModel}>
+                Retry
+              </button>
             </div>
           </div>
         )}

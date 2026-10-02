@@ -80,6 +80,12 @@ impl WhisperEngine {
         self.context.is_some()
     }
 
+    /// Drop the current model (frees its VRAM) before loading another one.
+    pub fn unload(&mut self) {
+        self.context = None;
+        self.using_gpu = false;
+    }
+
     pub fn compute_backend(&self) -> &'static str {
         if self.using_gpu {
             "CUDA"

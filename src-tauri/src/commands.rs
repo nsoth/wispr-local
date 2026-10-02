@@ -4,7 +4,7 @@ use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut}
 
 use crate::config::AppConfig;
 use crate::settings::Settings;
-use crate::state::{AppState, AppStatus};
+use crate::state::{AppState, AppStatus, ModelState};
 use crate::system::sounds::SoundPlayer;
 
 /// Current pipeline status, in the same shape as the `status-changed` event.
@@ -14,21 +14,116 @@ pub fn get_status(state: State<'_, Mutex<AppState>>) -> Result<AppStatus, String
     Ok(app_state.status.clone())
 }
 
-// Both read from AppState rather than the engine mutex: the model loads on a
-// background thread (so it's not ready at first paint), and the engine mutex is
-// held for the entire duration of a transcription — locking it here would stall
-// the UI. lib.rs mirrors the engine's loaded/backend state into AppState and
-// emits `model-state-changed` when the load finishes.
+/// Model state mirrored in AppState (never blocks on the engine mutex, which
+/// is held for the whole of a load or a transcription).
 #[tauri::command]
-pub fn is_model_loaded(state: State<'_, Mutex<AppState>>) -> Result<bool, String> {
-    let app_state = state.lock().map_err(|e| e.to_string())?;
-    Ok(app_state.model_loaded)
+pub fn get_model_state(state: State<'_, Mutex<AppState>>) -> Result<ModelState, String> {
+    Ok(crate::state::lock_or_recover(&state).model.clone())
 }
 
+#[derive(serde::Serialize)]
+pub struct ModelFileInfo {
+    pub name: String,
+    pub size_bytes: u64,
+    /// The file named in settings.json.
+    pub configured: bool,
+    /// The file currently loaded in the engine.
+    pub loaded: bool,
+}
+
+/// Multilingual whisper.cpp models present in the models directory.
 #[tauri::command]
-pub fn get_compute_backend(state: State<'_, Mutex<AppState>>) -> Result<String, String> {
-    let app_state = state.lock().map_err(|e| e.to_string())?;
-    Ok(app_state.compute_backend.clone())
+pub fn get_model_files(
+    config: State<'_, AppConfig>,
+    settings: State<'_, Mutex<Settings>>,
+    state: State<'_, Mutex<AppState>>,
+) -> Result<Vec<ModelFileInfo>, String> {
+    let configured = settings
+        .lock()
+        .map_err(|e| e.to_string())?
+        .model_file
+        .clone();
+    let loaded = match &crate::state::lock_or_recover(&state).model {
+        ModelState::Ready { file, .. } => file.clone(),
+        _ => String::new(),
+    };
+    Ok(config
+        .available_model_files()
+        .into_iter()
+        .map(|name| {
+            let size_bytes = std::fs::metadata(config.model_path(&name))
+                .map(|m| m.len())
+                .unwrap_or(0);
+            ModelFileInfo {
+                configured: name == configured,
+                loaded: name == loaded,
+                name,
+                size_bytes,
+            }
+        })
+        .collect())
+}
+
+/// Choose another model file and load it right away.
+#[tauri::command]
+pub fn set_model_file(
+    app: AppHandle,
+    name: String,
+    config: State<'_, AppConfig>,
+    settings: State<'_, Mutex<Settings>>,
+    state: State<'_, Mutex<AppState>>,
+) -> Result<(), String> {
+    if !config.available_model_files().iter().any(|f| *f == name) {
+        return Err(format!("{name} is not in the models folder"));
+    }
+    ensure_model_reload_allowed(&state)?;
+    {
+        let mut s = settings.lock().map_err(|e| e.to_string())?;
+        let previous = s.model_file.clone();
+        s.model_file = name.clone();
+        if let Err(e) = s.save(&config.data_dir) {
+            s.model_file = previous;
+            return Err(e);
+        }
+    }
+    log::info!("Model file changed to {name}; reloading");
+    crate::pipeline::spawn_model_loader(app, name);
+    Ok(())
+}
+
+/// Reload the configured model (after adding a file, or to retry a failure).
+#[tauri::command]
+pub fn reload_model(
+    app: AppHandle,
+    settings: State<'_, Mutex<Settings>>,
+    state: State<'_, Mutex<AppState>>,
+) -> Result<(), String> {
+    ensure_model_reload_allowed(&state)?;
+    let requested = settings
+        .lock()
+        .map_err(|e| e.to_string())?
+        .model_file
+        .clone();
+    log::info!("Model reload requested");
+    crate::pipeline::spawn_model_loader(app, requested);
+    Ok(())
+}
+
+fn ensure_model_reload_allowed(state: &Mutex<AppState>) -> Result<(), String> {
+    let s = crate::state::lock_or_recover(state);
+    if !matches!(s.status, AppStatus::Idle | AppStatus::Error(_)) {
+        return Err("Finish the current dictation before reloading the model".to_string());
+    }
+    if s.model == ModelState::Loading {
+        return Err("The model is already loading".to_string());
+    }
+    Ok(())
+}
+
+/// Let the webview put its own failures into wispr.log, next to the backend's.
+#[tauri::command]
+pub fn log_frontend_error(command: String, message: String) {
+    log::warn!("Frontend: {command}: {message}");
 }
 
 #[tauri::command]

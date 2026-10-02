@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
 /// Keep this many recent transcriptions for the in-app history.
 pub const HISTORY_LIMIT: usize = 5;
@@ -35,13 +36,54 @@ pub struct StartupDiagnostics {
     pub api_key_error: Option<String>,
 }
 
+/// Where the Whisper model stands. Mirrored here from the engine so UI
+/// queries never block on the engine mutex (held for the full duration of a
+/// transcription and of a load). Serialized for `get_model_state` and the
+/// `model-state-changed` event.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub enum ModelState {
+    Loading,
+    Ready {
+        /// "CUDA" or "CPU".
+        backend: String,
+        /// File name inside the models directory.
+        file: String,
+        /// True when the configured model was unavailable and another one
+        /// was loaded instead.
+        fallback: bool,
+    },
+    Missing,
+    Failed {
+        error: String,
+    },
+}
+
+impl ModelState {
+    pub fn is_ready(&self) -> bool {
+        matches!(self, ModelState::Ready { .. })
+    }
+
+    pub fn backend(&self) -> &str {
+        match self {
+            ModelState::Ready { backend, .. } => backend,
+            _ => "",
+        }
+    }
+}
+
+/// Lock a mutex even if a previous holder panicked: the protected state is
+/// plain data that is always left consistent, and a poisoned lock must not
+/// turn one panic into a permanently dead dictation pipeline.
+pub fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub struct AppState {
     pub status: AppStatus,
-    pub model_loaded: bool,
-    /// "CUDA" or "CPU" once the model finishes loading; empty until then.
-    /// Mirrored here from the engine so UI queries never block on the engine
-    /// mutex (held for the full duration of a transcription).
-    pub compute_backend: String,
+    pub model: ModelState,
     pub last_transcription: String,
     pub device_sample_rate: u32,
     /// True while a hands-free (pinned) recording is active — the hotkey
@@ -56,8 +98,7 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             status: AppStatus::Idle,
-            model_loaded: false,
-            compute_backend: String::new(),
+            model: ModelState::Loading,
             last_transcription: String::new(),
             device_sample_rate: 48000,
             recording_locked: false,
@@ -131,9 +172,47 @@ pub fn save_history(data_dir: &Path, history: &[String]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_history_with_report, AppState, AppStatus};
+    use super::{load_history_with_report, lock_or_recover, AppState, AppStatus, ModelState};
     use crate::config::test_dir;
     use serde_json::json;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn model_state_serializes_with_state_tag() {
+        assert_eq!(
+            serde_json::to_value(ModelState::Loading).unwrap(),
+            json!({ "state": "loading" })
+        );
+        assert_eq!(
+            serde_json::to_value(ModelState::Ready {
+                backend: "CUDA".into(),
+                file: "ggml-large-v3-turbo.bin".into(),
+                fallback: false,
+            })
+            .unwrap(),
+            json!({ "state": "ready", "backend": "CUDA", "file": "ggml-large-v3-turbo.bin", "fallback": false })
+        );
+        assert_eq!(
+            serde_json::to_value(ModelState::Failed {
+                error: "boom".into()
+            })
+            .unwrap(),
+            json!({ "state": "failed", "error": "boom" })
+        );
+    }
+
+    #[test]
+    fn lock_or_recover_survives_a_poisoned_mutex() {
+        let shared = Arc::new(Mutex::new(5));
+        let poisoner = Arc::clone(&shared);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison");
+        })
+        .join();
+        assert!(shared.lock().is_err(), "mutex is poisoned");
+        assert_eq!(*lock_or_recover(&shared), 5);
+    }
 
     #[test]
     fn status_serializes_as_tagged_state_object() {

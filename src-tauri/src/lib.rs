@@ -14,6 +14,12 @@
 //! - [`settings`] / [`secrets`] / [`config`] persisted configuration
 //! - [`commands`]   the Tauri IPC surface used by the webviews
 //! - [`events`]     event names shared with the frontend
+//!
+//! Everything that does not need an `AppHandle` is built *before* the Tauri
+//! builder and registered with `Builder::manage`, so it exists before the
+//! windows are created. Registering state inside `setup()` let the main
+//! window's first IPC calls race an as-yet unmanaged state ("state not
+//! managed" → "Some settings could not be loaded" banner on ~1 in 4 starts).
 
 pub mod audio;
 pub mod autostart;
@@ -40,7 +46,7 @@ use audio::capture::AudioCapture;
 use config::AppConfig;
 use pipeline::{notify_user, spawn_model_loader, start_recording_flow, stop_and_transcribe_flow};
 use settings::Settings;
-use state::{AppState, AppStatus};
+use state::{AppState, AppStatus, ModelState, StartupDiagnostics};
 use system::sounds::SoundPlayer;
 use transcription::engine::WhisperEngine;
 
@@ -82,7 +88,58 @@ pub fn run() {
     // invisible stderr of a windows-subsystem process.
     whisper_rs::install_logging_hooks();
 
+    // ---- State that needs no AppHandle: built before any window exists ----
+    let config = AppConfig::new();
+    config
+        .ensure_dirs()
+        .expect("Failed to create app directories");
+    // Leftovers of an interrupted atomic write from a previous run.
+    config::remove_stale_temp_files(&config.data_dir);
+
+    // A broken settings file is quarantined and reported, never overwritten
+    // with defaults.
+    let settings_load = Settings::load_with_report(&config.data_dir);
+    let user_settings = settings_load.settings.clone();
+    log::info!("Loaded hotkey setting: {}", user_settings.hotkey);
+    let (history, history_error) = state::load_history_with_report(&config.data_dir);
+    let diagnostics = StartupDiagnostics {
+        settings_error: settings_load.error.clone(),
+        settings_read_only: settings_load.read_only,
+        unknown_settings_keys: settings_load.unknown_keys.clone(),
+        history_error,
+        api_key_error: settings_load.api_key_error.clone(),
+    };
+
+    let buffer = AudioBuffer::new();
+    let capture = AudioCapture::new(buffer.clone());
+    // Empty engine; the model loads on a background thread from setup().
+    let engine = WhisperEngine::new();
+    // The sound thread opens the output device per chime.
+    let sound_player = SoundPlayer::new(user_settings.sound_config());
+
+    // Sync autostart state with saved settings
+    if user_settings.run_on_startup {
+        let _ = autostart::set_autostart_registry(true);
+        log::info!("Autostart enabled");
+    }
+
+    let initial_state = AppState {
+        history,
+        diagnostics: diagnostics.clone(),
+        model: ModelState::Loading,
+        ..AppState::default()
+    };
+    let hotkey_string = user_settings.hotkey.clone();
+    let requested_model = user_settings.model_file.clone();
+
     tauri::Builder::default()
+        .manage(Mutex::new(initial_state))
+        .manage(Mutex::new(capture))
+        .manage(buffer)
+        .manage(Mutex::new(engine))
+        .manage(config)
+        .manage(sound_player)
+        .manage(Mutex::new(user_settings))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
@@ -91,7 +148,7 @@ pub fn run() {
 
                     let (recording, locked) = {
                         let state = app.state::<Mutex<AppState>>();
-                        let s = state.lock().unwrap();
+                        let s = state::lock_or_recover(&state);
                         (s.status == AppStatus::Recording, s.recording_locked)
                     };
 
@@ -123,92 +180,11 @@ pub fn run() {
         )
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
-        .setup(|app| {
-            // Initialize configuration
-            let config = AppConfig::new();
-            config
-                .ensure_dirs()
-                .expect("Failed to create app directories");
-
-            // Initialize audio pipeline
-            let buffer = AudioBuffer::new();
-            let capture = AudioCapture::new(buffer.clone());
-
-            // Leftovers of an interrupted atomic write from a previous run.
-            config::remove_stale_temp_files(&config.data_dir);
-
-            // Load settings (needed below for model selection). A broken file
-            // is quarantined and reported, never overwritten with defaults.
-            let settings_load = Settings::load_with_report(&config.data_dir);
-            let user_settings = settings_load.settings.clone();
-            log::info!("Loaded hotkey setting: {}", user_settings.hotkey);
-            let (history, history_error) = state::load_history_with_report(&config.data_dir);
-            let diagnostics = state::StartupDiagnostics {
-                settings_error: settings_load.error.clone(),
-                settings_read_only: settings_load.read_only,
-                unknown_settings_keys: settings_load.unknown_keys.clone(),
-                history_error,
-                api_key_error: settings_load.api_key_error.clone(),
-            };
-
-            // Initialize an empty Whisper engine; the model is loaded on a
-            // background thread after state is registered (see below). Loading
-            // synchronously here — especially the slower CPU fallback after a
-            // GPU crash — let the frontend's initial queries race an as-yet
-            // unmanaged state and stick on a false "Model not loaded" banner.
-            let engine = WhisperEngine::new();
-            let initial_state = AppState {
-                history,
-                diagnostics: diagnostics.clone(),
-                ..AppState::default()
-            };
-
-            // Try the configured model first, then fall back to older models so
-            // an incomplete download doesn't leave the app without transcription.
-            let mut candidates = vec![user_settings.model_file.clone()];
-            for fallback in [
-                settings::default_model_file(),
-                "ggml-medium.bin".to_string(),
-            ] {
-                if !candidates.contains(&fallback) {
-                    candidates.push(fallback);
-                }
-            }
-            for discovered in config.available_model_files() {
-                if !candidates.contains(&discovered) {
-                    candidates.push(discovered);
-                }
-            }
-            // Resolve to full paths now, before `config` is moved into state.
-            let candidate_paths: Vec<std::path::PathBuf> = candidates
-                .iter()
-                .map(|name| config.model_path(name))
-                .collect();
-            let models_dir = config.models_dir.clone();
-
-            // Sync autostart state with saved settings
-            if user_settings.run_on_startup {
-                let _ = autostart::set_autostart_registry(true);
-                log::info!("Autostart enabled");
-            }
-
-            // Initialize the sound thread (opens the output device per chime).
-            let sound_player = SoundPlayer::new(user_settings.sound_config());
-
-            // Register state
-            app.manage(Mutex::new(initial_state));
-            app.manage(Mutex::new(capture));
-            app.manage(buffer.clone());
-            app.manage(Mutex::new(engine));
-            app.manage(config);
-            app.manage(sound_player);
-            app.manage(Mutex::new(user_settings.clone()));
-
-            // Load the model off-thread now that state is managed. Commands
-            // (is_model_loaded, get_compute_backend) read the mirrored fields in
-            // AppState, so the window never races an unmanaged state; the load
-            // result is pushed to the frontend via `model-state-changed`.
-            spawn_model_loader(app.handle().clone(), candidate_paths, models_dir);
+        .setup(move |app| {
+            // Load the model off-thread. The state is already managed, so the
+            // window can query it at any time; the result arrives through the
+            // model-state-changed event.
+            spawn_model_loader(app.handle().clone(), requested_model);
 
             // The window is hidden at this point, so a quarantined settings
             // file also gets a toast; the banner appears once the window opens.
@@ -234,12 +210,12 @@ pub fn run() {
             // Register global hotkey from settings
             {
                 use tauri_plugin_global_shortcut::GlobalShortcutExt;
-                let shortcut = commands::parse_hotkey(&user_settings.hotkey)
+                let shortcut = commands::parse_hotkey(&hotkey_string)
                     .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
                 app.global_shortcut().register(shortcut)?;
                 log::info!(
                     "Global hotkey registered: {} (hold to dictate)",
-                    user_settings.hotkey
+                    hotkey_string
                 );
             }
 
@@ -300,8 +276,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_status,
-            commands::is_model_loaded,
-            commands::get_compute_backend,
+            commands::get_model_state,
+            commands::get_model_files,
+            commands::set_model_file,
+            commands::reload_model,
+            commands::log_frontend_error,
             commands::get_last_transcription,
             commands::toggle_recording_lock,
             commands::get_history,
