@@ -169,6 +169,11 @@ pub struct AppState {
     pub capturing_hotkey: bool,
     /// Set by a cancel request while transcribing/formatting: skip the paste.
     pub cancel_requested: Arc<AtomicBool>,
+    /// Set when the recording was interrupted by sleep or a locked session:
+    /// the text goes to history and clipboard, never auto-pasted.
+    pub suppress_paste: Arc<AtomicBool>,
+    /// Writer thread spooling the active recording to disk.
+    pub spool: Option<crate::audio::spool::SpoolWriter>,
 }
 
 impl Default for AppState {
@@ -189,6 +194,8 @@ impl Default for AppState {
             hotkey_paused: false,
             capturing_hotkey: false,
             cancel_requested: Arc::new(AtomicBool::new(false)),
+            suppress_paste: Arc::new(AtomicBool::new(false)),
+            spool: None,
         }
     }
 }

@@ -63,6 +63,27 @@ impl AudioBuffer {
         }
     }
 
+    /// Samples captured so far.
+    pub fn len(&self) -> usize {
+        self.samples.lock().map(|b| b.len()).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Copy everything captured after `offset` (for the crash spool).
+    pub fn snapshot_from(&self, offset: usize) -> Vec<f32> {
+        if let Ok(buf) = self.samples.lock() {
+            if offset >= buf.len() {
+                return Vec::new();
+            }
+            buf[offset..].to_vec()
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Copy at most the newest `max_samples` without cloning a long recording.
     pub fn snapshot_tail(&self, max_samples: usize) -> Vec<f32> {
         if let Ok(buf) = self.samples.lock() {

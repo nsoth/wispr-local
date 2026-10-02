@@ -32,7 +32,7 @@ pub struct ModelFileInfo {
 }
 
 /// Multilingual whisper.cpp models present in the models directory.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_model_files(
     config: State<'_, AppConfig>,
     settings: State<'_, Mutex<Settings>>,
@@ -843,7 +843,7 @@ pub fn apply_language(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_input_devices() -> Result<Vec<crate::audio::devices::AudioDeviceInfo>, String> {
     Ok(crate::audio::devices::list_input_devices())
 }
@@ -854,7 +854,7 @@ pub fn get_input_device(settings: State<'_, Mutex<Settings>>) -> Result<String, 
     Ok(s.input_device.clone())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_input_device(
     input_device: String,
     settings: State<'_, Mutex<Settings>>,
@@ -881,7 +881,7 @@ pub fn set_input_device(
 /// Check that the configured microphone (or the system default) can be
 /// resolved right now; clears a standing microphone error. Returns the name
 /// of the device that would be used.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn probe_input_device(
     app: AppHandle,
     settings: State<'_, Mutex<Settings>>,

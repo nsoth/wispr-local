@@ -16,6 +16,7 @@ use tauri::{Emitter, Manager};
 use crate::audio::buffer::AudioBuffer;
 use crate::audio::capture::AudioCapture;
 use crate::audio::devices;
+use crate::audio::spool::{self, SpoolWriter};
 use crate::config::AppConfig;
 use crate::events;
 use crate::overlay::{hide_overlay, show_overlay_if_enabled};
@@ -155,6 +156,7 @@ pub fn start_recording_flow(app: &tauri::AppHandle, pinned: bool) {
                 s.recording_started_at = Some(Instant::now());
                 s.preview_abort.store(false, Ordering::Relaxed);
                 s.cancel_requested.store(false, Ordering::Relaxed);
+                s.suppress_paste.store(false, Ordering::Relaxed);
             }
             ModelState::Missing | ModelState::Failed { .. } => {}
         }
@@ -275,6 +277,17 @@ pub fn start_recording_flow(app: &tauri::AppHandle, pinned: bool) {
     let _ = app.emit(events::LOCK_CHANGED, pinned);
     app.state::<SoundPlayer>().play_start();
 
+    // Crash insurance: spool the audio to disk while recording.
+    let spool_path = spool::spool_path(&app.state::<AppConfig>().data_dir);
+    match SpoolWriter::start(spool_path, app.state::<AudioBuffer>().inner().clone()) {
+        Ok(writer) => lock_or_recover(&state).spool = Some(writer),
+        Err(e) => log::warn!("{e}; recording continues without crash insurance"),
+    }
+    let guard_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        recording_guard_loop(guard_app).await;
+    });
+
     // Kick off tray animation and reveal overlay (if user hasn't disabled it).
     app.state::<TrayAnimator>().set_phase(TrayPhase::Recording);
     show_overlay_if_enabled(app);
@@ -285,6 +298,53 @@ pub fn start_recording_flow(app: &tauri::AppHandle, pinned: bool) {
     tauri::async_runtime::spawn(async move {
         streaming_preview_loop(app_clone).await;
     });
+}
+
+/// While recording, watch for a locked session or a sleep/resume: in both
+/// cases the paste target is gone, so the recording is finished without an
+/// automatic paste (text goes to history and clipboard).
+async fn recording_guard_loop(app: tauri::AppHandle) {
+    let mut last_tick = std::time::SystemTime::now();
+    let mut no_foreground_ticks = 0u32;
+    loop {
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        if !is_recording(&app) {
+            return;
+        }
+        let now = std::time::SystemTime::now();
+        let jumped = now
+            .duration_since(last_tick)
+            .map(|d| d > Duration::from_secs(10))
+            .unwrap_or(true);
+        last_tick = now;
+        if crate::system::focus::foreground_target().is_none() {
+            no_foreground_ticks += 1;
+        } else {
+            no_foreground_ticks = 0;
+        }
+        let reason = if jumped {
+            Some("the computer slept")
+        } else if no_foreground_ticks >= 2 {
+            Some("the session was locked")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            log::warn!("Recording interrupted: {reason}; finishing without auto-paste");
+            {
+                let state = app.state::<Mutex<AppState>>();
+                lock_or_recover(&state)
+                    .suppress_paste
+                    .store(true, Ordering::Relaxed);
+            }
+            let _ = app.emit(
+                events::OPERATION_NOTICE,
+                format!("Recording stopped because {reason}; the text is in the clipboard."),
+            );
+            let _ = app.emit(events::REQUEST_STOP_RECORDING, ());
+            return;
+        }
+    }
 }
 
 fn is_recording(app: &tauri::AppHandle) -> bool {
@@ -658,6 +718,7 @@ pub fn spawn_model_loader(app: tauri::AppHandle, requested: String) {
                     file,
                     fallback,
                 } => {
+                    recover_spooled_recording(&app);
                     if *fallback {
                         let message = format!(
                             "Configured model {requested} is not available; using {file} instead."
@@ -696,6 +757,69 @@ pub fn spawn_model_loader(app: tauri::AppHandle, requested: String) {
             }
         })
         .expect("spawn model loader thread");
+}
+
+/// A spool file left by a crashed run holds a dictation the user never got:
+/// transcribe it, keep it in history and the clipboard, and say so.
+fn recover_spooled_recording(app: &tauri::AppHandle) {
+    let data_dir = app.state::<AppConfig>().data_dir.clone();
+    let Some(path) = spool::pending_recovery(&data_dir) else {
+        return;
+    };
+    let samples = match spool::read_spool(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("Recording spool unreadable: {e}");
+            spool::remove_spool(&data_dir);
+            return;
+        }
+    };
+    let audio_s = samples.len() as f64 / 16000.0;
+    log::info!("Recovering {audio_s:.1}s of audio spooled by a previous run");
+    let (language, pipeline) = {
+        let settings = app.state::<Mutex<Settings>>();
+        let guard = lock_or_recover(&settings);
+        (guard.language, guard.text_pipeline())
+    };
+    let result = {
+        let engine = app.state::<Mutex<WhisperEngine>>();
+        let mut eng = lock_or_recover(&engine);
+        eng.transcribe(&samples, language, TranscribeOptions::final_pass())
+    };
+    spool::remove_spool(&data_dir);
+    let text = match result {
+        Ok(r) => pipeline.finalize(&r.text),
+        Err(e) => {
+            log::warn!("Recovered audio could not be transcribed: {e}");
+            return;
+        }
+    };
+    if text.is_empty() {
+        log::info!("Recovered audio contained no speech");
+        return;
+    }
+    let history = {
+        let state = app.state::<Mutex<AppState>>();
+        let mut s = lock_or_recover(&state);
+        s.last_transcription = text.clone();
+        s.push_history(HistoryEntry {
+            text: text.clone(),
+            ts: HistoryEntry::now_ms(),
+            target: String::new(),
+            lang: String::new(),
+            duration_s: audio_s as f32,
+            pasted: false,
+            hwnd: 0,
+        });
+        let _ = state::save_history(&data_dir, &s.history);
+        s.history.clone()
+    };
+    let _ = app.emit(events::HISTORY_CHANGED, &history);
+    let _ = system::text_injection::copy_only(&text);
+    notify_user_long(
+        app,
+        "Recovered the last dictation after a crash: it is in the clipboard and the history.",
+    );
 }
 
 fn load_first_available(app: &tauri::AppHandle, requested: &str) -> ModelState {
@@ -788,6 +912,10 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
     // Stop capture
     lock_or_recover(&capture).stop();
     app.state::<SoundPlayer>().play_stop();
+    // Flush the crash spool before the buffer is drained.
+    if let Some(writer) = lock_or_recover(&state).spool.take() {
+        writer.stop();
+    }
 
     let samples = buffer.take_samples();
     // Under ~0.5s is an accidental hotkey tap — not enough audio for even one
@@ -960,7 +1088,14 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
         .as_ref()
         .map(|t| t.describe())
         .unwrap_or_else(|| "none".to_string());
-    let decision = focus::decide_paste(origin.as_ref(), now.as_ref(), std::process::id(), elevated);
+    let suppressed = lock_or_recover(&state)
+        .suppress_paste
+        .load(Ordering::Relaxed);
+    let decision = if suppressed {
+        PasteDecision::CopyOnly("the recording was interrupted by sleep or lock".to_string())
+    } else {
+        focus::decide_paste(origin.as_ref(), now.as_ref(), std::process::id(), elevated)
+    };
     let outcome = match decision {
         PasteDecision::Paste => {
             match system::text_injection::inject_text(&to_paste, restore_clipboard) {
@@ -1001,7 +1136,10 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
     };
     let paste_ms = paste_started.elapsed().as_millis();
 
-    let (history, history_changed) = {
+    // History is saved under the state lock so "Clear history" from the UI
+    // can never interleave with this write.
+    let data_dir = app.state::<AppConfig>().data_dir.clone();
+    let (history, save_error) = {
         let mut s = lock_or_recover(&state);
         s.last_transcription = text.clone();
         let changed = s.push_history(HistoryEntry {
@@ -1013,17 +1151,21 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
             pasted: outcome == Outcome::Pasted,
             hwnd: now.as_ref().map(|t| t.hwnd).unwrap_or(0),
         });
-        (s.history.clone(), changed)
+        let error = if changed {
+            state::save_history(&data_dir, &s.history).err()
+        } else {
+            None
+        };
+        (s.history.clone(), error)
     };
-    if history_changed {
-        if let Err(e) = state::save_history(&app.state::<AppConfig>().data_dir, &history) {
-            log::warn!("Failed to save transcription history: {e}");
-            let _ = app.emit(
-                events::OPERATION_NOTICE,
-                "History could not be saved to disk",
-            );
-        }
+    if let Some(e) = save_error {
+        log::warn!("Failed to save transcription history: {e}");
+        let _ = app.emit(
+            events::OPERATION_NOTICE,
+            "History could not be saved to disk",
+        );
     }
+    spool::remove_spool(&data_dir);
     log::info!(
         "utt#{utterance} audio={audio_s:.1}s lock={lock_ms}ms detect={}ms transcribe={}ms (rtf {rtf:.2}) \
          format={format_ms}ms paste={paste_ms}ms backend={backend} lang={} chars={} segments={} dropped={} target={target_name} outcome={outcome:?}",
