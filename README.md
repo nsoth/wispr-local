@@ -25,8 +25,9 @@ Built with Tauri 2 (Rust + React). Windows 10/11 only.
 - **Crash insurance**: the audio of a recording is spooled to disk; after a crash it is transcribed into the
   history and the clipboard on the next start. A supervisor process restarts the app after a native CUDA abort
   and falls back to the CPU for one run.
-- **Every recording is kept** (the last 30, up to 400 MB, as 16 kHz WAV in `data\recordings`). If a result
-  looks wrong, *Tray → Re-transcribe last recording* runs the model again and copies the text.
+- **Every recording is kept for a week** (at most 20 files / 200 MB, as 16 kHz WAV in `data\recordings`,
+  pruned automatically). If a result looks wrong, *Tray → Re-transcribe last recording* runs the model again
+  and copies the text.
 - **A muted or wrong microphone cannot eat a dictation any more**: the pill names a fallback device, a
   hands-free recording without speech for 20 s says "No sound from the mic?" with a chime, and a capture
   without speech dynamics or a looping result ends as *No speech* with a toast explaining why, instead of
