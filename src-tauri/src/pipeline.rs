@@ -732,11 +732,6 @@ fn mic_label(device: &str) -> String {
         .to_string()
 }
 
-/// How many finished recordings stay on disk for a re-transcription.
-const KEEP_RECORDINGS: usize = 30;
-/// ...and how much space they may take (a minute is 1.9 MB).
-const KEEP_RECORDING_BYTES: u64 = 400 * 1024 * 1024;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SpoolAction {
     /// Leave `pending.pcm` for the crash recovery on the next start.
@@ -777,7 +772,7 @@ fn finish_pipeline(app: &tauri::AppHandle, outcome: Outcome) {
             if let Some(path) = spool::archive_spool(&data_dir, outcome.label()) {
                 log::info!("Recording kept at {}", path.display());
             }
-            spool::prune_recordings(&data_dir, KEEP_RECORDINGS, KEEP_RECORDING_BYTES);
+            spool::prune_recordings_default(&data_dir);
         }
     }
     let (message, tone, linger_ms) = outcome.overlay();

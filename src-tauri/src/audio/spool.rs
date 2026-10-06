@@ -196,18 +196,43 @@ pub fn list_recordings(data_dir: &Path) -> Vec<PathBuf> {
     files.into_iter().map(|(_, p)| p).collect()
 }
 
-/// Keep at most `keep` recordings and `max_bytes` in total, dropping the oldest.
-pub fn prune_recordings(data_dir: &Path, keep: usize, max_bytes: u64) {
+/// Retention of kept recordings: a week, at most 20 files, at most 200 MB
+/// (a minute of 16 kHz 16-bit audio is 1.9 MB). Applied after every archive
+/// and once at startup, so the folder never grows on its own.
+pub const KEEP_FILES: usize = 20;
+pub const KEEP_BYTES: u64 = 200 * 1024 * 1024;
+pub const KEEP_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+
+/// Drop recordings beyond `keep` files, `max_bytes` in total, or older than
+/// `max_age`, oldest first.
+pub fn prune_recordings(
+    data_dir: &Path,
+    keep: usize,
+    max_bytes: u64,
+    max_age: std::time::Duration,
+) {
+    let now = std::time::SystemTime::now();
     let mut total = 0u64;
     for (index, path) in list_recordings(data_dir).iter().enumerate() {
-        let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let meta = std::fs::metadata(path).ok();
+        let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let age = meta
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| now.duration_since(t).ok())
+            .unwrap_or_default();
         total += len;
-        if index >= keep || total > max_bytes {
-            if let Err(e) = std::fs::remove_file(path) {
-                log::warn!("Could not prune {}: {e}", path.display());
+        if index >= keep || total > max_bytes || age > max_age {
+            match std::fs::remove_file(path) {
+                Ok(()) => log::info!("Pruned old recording {}", path.display()),
+                Err(e) => log::warn!("Could not prune {}: {e}", path.display()),
             }
         }
     }
+}
+
+/// [`prune_recordings`] with the built-in retention.
+pub fn prune_recordings_default(data_dir: &Path) {
+    prune_recordings(data_dir, KEEP_FILES, KEEP_BYTES, KEEP_AGE);
 }
 
 /// Read an archived recording (16 kHz mono 16-bit WAV) back into samples.
@@ -260,7 +285,8 @@ mod tests {
             archive_spool(&dir, &format!("x{i}")).expect("archived");
         }
         assert_eq!(list_recordings(&dir).len(), 6);
-        prune_recordings(&dir, 3, u64::MAX);
+        const WEEK: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+        prune_recordings(&dir, 3, u64::MAX, WEEK);
         let left = list_recordings(&dir);
         assert_eq!(left.len(), 3, "{left:?}");
         let names: Vec<String> = left
@@ -275,11 +301,29 @@ mod tests {
             !names.iter().any(|n| n.contains("pasted")),
             "oldest dropped: {names:?}"
         );
-        prune_recordings(&dir, 10, 44 + bytes.len() as u64);
+        prune_recordings(&dir, 10, 44 + bytes.len() as u64, WEEK);
         assert_eq!(
             list_recordings(&dir).len(),
             1,
             "byte cap keeps only the newest"
+        );
+        // Age: a file older than the limit goes even when the counts allow it.
+        std::fs::write(&spool, &bytes).unwrap();
+        let old = archive_spool(&dir, "old").expect("archived");
+        let ten_days_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 24 * 3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(ten_days_ago)
+            .unwrap();
+        prune_recordings(&dir, 10, u64::MAX, WEEK);
+        let left = list_recordings(&dir);
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert!(
+            !left[0].ends_with(old.file_name().unwrap()),
+            "the aged file is gone"
         );
         assert!(
             archive_spool(&dir, "none").is_none(),

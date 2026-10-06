@@ -1744,8 +1744,8 @@ function App() {
             </button>
           </div>
           <div className="settings-note">
-            The last 30 recordings are kept as WAV files; the tray menu can re-transcribe the
-            newest one if a result looks wrong.
+            Recordings are kept as WAV files for 7 days (at most 20 files, 200 MB) and deleted
+            automatically; the tray menu can re-transcribe the newest one if a result looks wrong.
           </div>
         </div>
       )}

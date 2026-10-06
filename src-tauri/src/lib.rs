@@ -112,6 +112,8 @@ pub fn run() {
     }
     // Leftovers of an interrupted atomic write from a previous run.
     config::remove_stale_temp_files(&config.data_dir);
+    // Kept recordings never outlive their retention, even without new ones.
+    audio::spool::prune_recordings_default(&config.data_dir);
 
     // A broken settings file is quarantined and reported, never overwritten
     // with defaults.
