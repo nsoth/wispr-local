@@ -580,7 +580,7 @@ function App() {
       .catch((error) => setAiTest({ status: "error", text: String(error) }));
   };
 
-  const openPath = (kind: "models" | "data" | "log") => {
+  const openPath = (kind: "models" | "data" | "log" | "recordings") => {
     invoke("open_path", { kind }).catch((error) =>
       setError(`Could not open the folder: ${String(error)}`),
     );
@@ -1739,6 +1739,13 @@ function App() {
             <button type="button" className="sound-btn" onClick={() => openPath("log")}>
               Open log
             </button>
+            <button type="button" className="sound-btn" onClick={() => openPath("recordings")}>
+              Open recordings
+            </button>
+          </div>
+          <div className="settings-note">
+            The last 30 recordings are kept as WAV files; the tray menu can re-transcribe the
+            newest one if a result looks wrong.
           </div>
         </div>
       )}

@@ -278,6 +278,11 @@ pub fn open_path(kind: String, config: State<'_, AppConfig>) -> Result<(), Strin
         "data" => {
             command.arg(&config.data_dir);
         }
+        "recordings" => {
+            let dir = crate::audio::spool::recordings_dir(&config.data_dir);
+            let _ = std::fs::create_dir_all(&dir);
+            command.arg(&dir);
+        }
         "log" => {
             command.arg(format!(
                 "/select,{}",

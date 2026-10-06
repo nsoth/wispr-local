@@ -3,6 +3,7 @@
 //! and final passes, and hallucination filtering of the decoded segments.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -72,6 +73,11 @@ pub struct TranscriptionResult {
     pub segments: usize,
     /// Segments removed as silence or hallucination.
     pub dropped: usize,
+    /// Why `text` is empty although audio was captured: "silence",
+    /// "no-dynamics" (a muted or dead microphone) or "hallucination-loop".
+    pub empty_reason: Option<&'static str>,
+    /// Frame-energy statistics of the capture (None for very short audio).
+    pub stats: Option<SpeechStats>,
 }
 
 pub struct WhisperEngine {
@@ -222,21 +228,41 @@ impl WhisperEngine {
         let threads = self.decode_threads();
         let state = self.state.as_mut().ok_or("Whisper model not loaded")?;
 
+        let pinned_or_cached = match language {
+            LanguageMode::Russian => "ru",
+            LanguageMode::English => "en",
+            LanguageMode::Auto | LanguageMode::Unknown => lang_cache.unwrap_or(""),
+        };
+        let stats = speech_stats(audio);
+        let empty = |reason: &'static str| TranscriptionResult {
+            text: String::new(),
+            language: pinned_or_cached,
+            detect_ms: 0,
+            full_ms: 0,
+            segments: 0,
+            dropped: 0,
+            empty_reason: Some(reason),
+            stats,
+        };
         // Silence never reaches the model: it would only hallucinate on it.
         if is_silent(audio) {
             log::info!("Capture is near-silent; skipping transcription");
-            return Ok(TranscriptionResult {
-                text: String::new(),
-                language: match language {
-                    LanguageMode::Russian => "ru",
-                    LanguageMode::English => "en",
-                    LanguageMode::Auto | LanguageMode::Unknown => lang_cache.unwrap_or(""),
-                },
-                detect_ms: 0,
-                full_ms: 0,
-                segments: 0,
-                dropped: 0,
-            });
+            return Ok(empty("silence"));
+        }
+        // Neither does a steady signal without the dynamics of speech (a muted
+        // microphone behind a virtual device, a dead line): on 2026-10-06 five
+        // minutes of it became 141 copies of one English sentence.
+        if audio.len() >= 16_000 * 4 {
+            if let Some(s) = stats.as_ref() {
+                if !has_speech_dynamics(s) {
+                    log::warn!(
+                        "Capture has no speech dynamics (floor {:.4}, loud {:.4}); skipping transcription",
+                        s.floor,
+                        s.loud
+                    );
+                    return Ok(empty("no-dynamics"));
+                }
+            }
         }
 
         // Peak-normalize so quiet mics still register, without the clipping
@@ -321,12 +347,26 @@ impl WhisperEngine {
         let full_ms = started.elapsed().as_millis();
 
         let num_segments = state.full_n_segments();
-        let decoded = (0..num_segments).filter_map(|i| {
-            state
-                .get_segment(i)
-                .map(|segment| (segment.to_string(), segment.no_speech_probability()))
-        });
+        let decoded: Vec<(String, f32)> = (0..num_segments)
+            .filter_map(|i| {
+                state
+                    .get_segment(i)
+                    .map(|segment| (segment.to_string(), segment.no_speech_probability()))
+            })
+            .collect();
+        let sentences: Vec<String> = decoded.iter().map(|(s, _)| s.clone()).collect();
         let (text, dropped) = assemble_segments(decoded);
+        let (text, empty_reason) = if !text.is_empty() && looks_like_hallucination_loop(&sentences)
+        {
+            log::warn!(
+                "Transcription is a hallucination loop ({} segments like {:?}); discarding it",
+                sentences.len(),
+                sentences[0].trim()
+            );
+            (String::new(), Some("hallucination-loop"))
+        } else {
+            (text, None)
+        };
 
         Ok(TranscriptionResult {
             text,
@@ -335,6 +375,8 @@ impl WhisperEngine {
             full_ms,
             segments: num_segments as usize,
             dropped,
+            empty_reason,
+            stats,
         })
     }
 }
@@ -396,6 +438,81 @@ fn speech_level(audio: &[f32]) -> Option<f32> {
     let index = ((magnitudes.len() - 1) as f64 * 0.995) as usize;
     let (_, level, _) = magnitudes.select_nth_unstable_by(index, |a, b| a.total_cmp(b));
     Some(*level)
+}
+
+/// Frame-energy statistics of a capture: where the noise floor sits and how
+/// far the loud frames rise above it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpeechStats {
+    /// 10th-percentile RMS of 100 ms frames: the noise floor.
+    pub floor: f32,
+    /// 95th-percentile RMS: what the loud frames reach.
+    pub loud: f32,
+    /// Fraction of frames clearly above the floor.
+    pub active: f32,
+}
+
+/// Statistics over 100 ms frames; `None` below two seconds of audio.
+pub fn speech_stats(audio: &[f32]) -> Option<SpeechStats> {
+    const FRAME: usize = 1600;
+    let frames = audio.len() / FRAME;
+    if frames < 20 {
+        return None;
+    }
+    let mut rms: Vec<f32> = (0..frames)
+        .map(|f| {
+            let chunk = &audio[f * FRAME..(f + 1) * FRAME];
+            (chunk.iter().map(|s| s * s).sum::<f32>() / FRAME as f32).sqrt()
+        })
+        .collect();
+    rms.sort_by(|a, b| a.total_cmp(b));
+    let floor = rms[(frames - 1) / 10];
+    let loud = rms[(frames - 1) * 95 / 100];
+    let gate = (4.0 * floor).max(0.005);
+    let active = rms.iter().filter(|&&r| r > gate).count() as f32 / frames as f32;
+    Some(SpeechStats {
+        floor,
+        loud,
+        active,
+    })
+}
+
+/// The loud frames of speech sit at least this far above its noise floor; a
+/// recording of the owner measured 8x, steady noise measures 1x.
+pub const MIN_DYNAMIC_RANGE: f32 = 2.5;
+
+/// Speech has dynamics (syllables and pauses); a muted line, a dead virtual
+/// microphone or steady noise does not.
+pub fn has_speech_dynamics(stats: &SpeechStats) -> bool {
+    stats.loud >= MIN_DYNAMIC_RANGE * stats.floor.max(0.001)
+}
+
+/// Whisper's answer to audio it cannot hear: the same sentence over and over
+/// (2026-10-06: 141 of 143 segments were identical). Six segments or more
+/// with one sentence making up 60 % of them is not dictation.
+pub fn looks_like_hallucination_loop(segments: &[String]) -> bool {
+    let normalize = |s: &str| -> String {
+        s.chars()
+            .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    };
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for segment in segments {
+        let key = normalize(segment);
+        if !key.is_empty() {
+            *counts.entry(key).or_insert(0) += 1;
+        }
+    }
+    let total: usize = counts.values().sum();
+    if total < 6 {
+        return false;
+    }
+    let top = counts.values().copied().max().unwrap_or(0);
+    top * 10 >= total * 6
 }
 
 /// Captures whose speech level stays below this are never shown to Whisper.
@@ -641,6 +758,78 @@ mod tests {
         ]);
         assert_eq!(text, "Привет мир.");
         assert_eq!(dropped, 2);
+    }
+
+    fn bursty_speech_like(secs: usize) -> Vec<f32> {
+        let mut x: u32 = 99;
+        (0..16000 * secs)
+            .map(|i| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = 0.003 * ((x >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0);
+                let t = i as f32 / 16000.0;
+                let in_burst = (t * 1000.0) % 600.0 < 300.0;
+                let tone = if in_burst {
+                    0.2 * (2.0 * std::f32::consts::PI * 180.0 * t).sin()
+                } else {
+                    0.0
+                };
+                tone + noise
+            })
+            .collect()
+    }
+
+    fn steady_noise(secs: usize, amplitude: f32) -> Vec<f32> {
+        let mut x: u32 = 7;
+        (0..16000 * secs)
+            .map(|_| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                amplitude * ((x >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn speech_stats_separate_bursty_speech_from_steady_noise() {
+        use super::{has_speech_dynamics, speech_stats};
+        let speech = speech_stats(&bursty_speech_like(10)).expect("stats");
+        assert!(speech.loud > 2.5 * speech.floor, "{speech:?}");
+        assert!(has_speech_dynamics(&speech), "{speech:?}");
+        let noise = speech_stats(&steady_noise(10, 0.02)).expect("stats");
+        assert!(!has_speech_dynamics(&noise), "{noise:?}");
+        assert!(
+            speech_stats(&steady_noise(1, 0.02)).is_none(),
+            "too short for statistics"
+        );
+    }
+
+    #[test]
+    fn a_repeated_sentence_is_a_hallucination_loop() {
+        use super::looks_like_hallucination_loop;
+        let sentence = "I'm going to be listening to the experience of the world.";
+        let looped: Vec<String> = vec![sentence.to_string(); 20];
+        assert!(looks_like_hallucination_loop(&looped));
+        let mut mostly: Vec<String> = looped[..8].to_vec();
+        mostly.push("Welcome to the experience.".to_string());
+        mostly.push("I'm going to be talking.".to_string());
+        assert!(looks_like_hallucination_loop(&mostly), "80% identical");
+        let real: Vec<String> = [
+            "Привет.",
+            "Сделай QA.",
+            "Проверь интерьер.",
+            "Да.",
+            "Да.",
+            "Потом кости.",
+            "И ещё меню.",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert!(!looks_like_hallucination_loop(&real));
+        let few: Vec<String> = vec!["Да.".to_string(); 4];
+        assert!(
+            !looks_like_hallucination_loop(&few),
+            "too few segments to judge"
+        );
     }
 
     #[test]
@@ -965,6 +1154,84 @@ mod tests {
                 });
             }
             eprintln!("MATRIX {name}: {}", outcomes.join(" | "));
+        }
+    }
+
+    /// What the model does with non-speech audio of the kind a muted or
+    /// wrong microphone delivers (2026-10-06: five minutes became 141 copies of
+    /// "I'm going to be listening to the experience of the world."). Prints the
+    /// language probabilities and the text per case; ignored because it needs
+    /// the model: `cargo test --release --lib -- --ignored --nocapture noise_probe`
+    #[test]
+    #[ignore]
+    fn noise_probe() {
+        use super::{LanguageMode, TranscribeOptions, WhisperEngine};
+        let model = std::path::PathBuf::from(std::env::var("APPDATA").expect("APPDATA"))
+            .join("wispr-local/WisprLocal/data/models/ggml-large-v3-turbo.bin");
+        let mut engine = WhisperEngine::new();
+        engine.load_model(&model).expect("model loads");
+        // Deterministic pseudo-random noise (LCG) at a few levels, 65 s each.
+        let noise = |amplitude: f32, secs: usize| -> Vec<f32> {
+            let mut x: u32 = 0x1234_5678;
+            (0..16000 * secs)
+                .map(|_| {
+                    x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    amplitude * ((x >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0)
+                })
+                .collect()
+        };
+        for (name, audio) in [
+            ("white noise 0.01 (above the silence gate)", noise(0.01, 65)),
+            ("white noise 0.05", noise(0.05, 65)),
+            ("white noise 0.002 (below the gate)", noise(0.002, 65)),
+        ] {
+            let r = engine.transcribe(&audio, LanguageMode::Auto, TranscribeOptions::final_pass());
+            match r {
+                Ok(res) => eprintln!(
+                    "NOISE {name}: lang={} segments={} dropped={} chars={} empty_reason={:?} stats={:?} text={:?}",
+                    res.language,
+                    res.segments,
+                    res.dropped,
+                    res.text.chars().count(),
+                    res.empty_reason,
+                    res.stats,
+                    res.text.chars().take(160).collect::<String>()
+                ),
+                Err(e) => eprintln!("NOISE {name}: ERR {e}"),
+            }
+        }
+        // A real recording of the owner, if present, as the speech reference.
+        let reference =
+            std::path::Path::new(r"C:\second brain\Projects\wisp flow copy\recovered-2026-08-24");
+        if let Ok(entries) = std::fs::read_dir(reference) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().map(|e| e == "wav").unwrap_or(false) {
+                    let bytes = std::fs::read(&path).expect("wav");
+                    // 16-bit PCM mono 16 kHz with a 44-byte header (as written by the recovery script).
+                    let samples: Vec<f32> = bytes[44..]
+                        .chunks_exact(2)
+                        .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+                        .collect();
+                    let first_60 = &samples[..samples.len().min(16000 * 60)];
+                    let r = engine.transcribe(
+                        first_60,
+                        LanguageMode::Auto,
+                        TranscribeOptions::final_pass(),
+                    );
+                    if let Ok(res) = r {
+                        eprintln!(
+                            "SPEECH {}: lang={} segments={} chars={} text={:?}",
+                            path.display(),
+                            res.language,
+                            res.segments,
+                            res.text.chars().count(),
+                            res.text.chars().take(120).collect::<String>()
+                        );
+                    }
+                    break;
+                }
+            }
         }
     }
 

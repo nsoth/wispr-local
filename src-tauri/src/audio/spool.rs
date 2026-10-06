@@ -117,6 +117,112 @@ pub fn pending_recovery(data_dir: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Folder that keeps finished recordings so a bad transcription can always be
+/// redone from the audio.
+pub const RECORDINGS_DIR: &str = "recordings";
+
+pub fn recordings_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join(RECORDINGS_DIR)
+}
+
+/// 44-byte RIFF header for 16 kHz mono 16-bit PCM.
+fn wav_header(data_len: u32) -> [u8; 44] {
+    let mut h = [0u8; 44];
+    h[0..4].copy_from_slice(b"RIFF");
+    h[4..8].copy_from_slice(&(36 + data_len).to_le_bytes());
+    h[8..12].copy_from_slice(b"WAVE");
+    h[12..16].copy_from_slice(b"fmt ");
+    h[16..20].copy_from_slice(&16u32.to_le_bytes());
+    h[20..22].copy_from_slice(&1u16.to_le_bytes()); // PCM
+    h[22..24].copy_from_slice(&1u16.to_le_bytes()); // mono
+    h[24..28].copy_from_slice(&16_000u32.to_le_bytes());
+    h[28..32].copy_from_slice(&32_000u32.to_le_bytes()); // byte rate
+    h[32..34].copy_from_slice(&2u16.to_le_bytes()); // block align
+    h[34..36].copy_from_slice(&16u16.to_le_bytes()); // bits
+    h[36..40].copy_from_slice(b"data");
+    h[40..44].copy_from_slice(&data_len.to_le_bytes());
+    h
+}
+
+/// Move the finished spool into the recordings folder as a WAV named after
+/// the time and the outcome. `None` when there is no spool (or too little).
+pub fn archive_spool(data_dir: &Path, label: &str) -> Option<PathBuf> {
+    let spool = spool_path(data_dir);
+    let bytes = std::fs::read(&spool).ok()?;
+    if bytes.len() / 2 < MIN_RECOVER_SAMPLES {
+        let _ = std::fs::remove_file(&spool);
+        return None;
+    }
+    let dir = recordings_dir(data_dir);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        log::warn!("Could not create the recordings folder: {e}");
+        return None;
+    }
+    let stamp = crate::config::timestamp_for_filename(std::time::SystemTime::now());
+    let mut path = dir.join(format!("{stamp}-{label}.wav"));
+    let mut n = 2;
+    while path.exists() {
+        path = dir.join(format!("{stamp}-{label}-{n}.wav"));
+        n += 1;
+    }
+    let mut wav = Vec::with_capacity(44 + bytes.len());
+    wav.extend_from_slice(&wav_header(bytes.len() as u32));
+    wav.extend_from_slice(&bytes);
+    if let Err(e) = std::fs::write(&path, &wav) {
+        log::warn!("Could not keep the recording at {}: {e}", path.display());
+        return None;
+    }
+    let _ = std::fs::remove_file(&spool);
+    Some(path)
+}
+
+/// Recordings, newest first.
+pub fn list_recordings(data_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(recordings_dir(data_dir)) else {
+        return Vec::new();
+    };
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().map(|x| x == "wav").unwrap_or(false))
+        .map(|p| {
+            let modified = std::fs::metadata(&p)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            (modified, p)
+        })
+        .collect();
+    files.sort_by(|a, b| b.cmp(a));
+    files.into_iter().map(|(_, p)| p).collect()
+}
+
+/// Keep at most `keep` recordings and `max_bytes` in total, dropping the oldest.
+pub fn prune_recordings(data_dir: &Path, keep: usize, max_bytes: u64) {
+    let mut total = 0u64;
+    for (index, path) in list_recordings(data_dir).iter().enumerate() {
+        let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        total += len;
+        if index >= keep || total > max_bytes {
+            if let Err(e) = std::fs::remove_file(path) {
+                log::warn!("Could not prune {}: {e}", path.display());
+            }
+        }
+    }
+}
+
+/// Read an archived recording (16 kHz mono 16-bit WAV) back into samples.
+pub fn read_recording(path: &Path) -> Result<Vec<f32>, String> {
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("Could not read {}: {e}", path.display()))?;
+    if bytes.len() < 44 || &bytes[..4] != b"RIFF" {
+        return Err(format!("{} is not a WAV file", path.display()));
+    }
+    Ok(bytes[44..]
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / i16::MAX as f32)
+        .collect())
+}
+
 pub fn remove_spool(data_dir: &Path) {
     let path = spool_path(data_dir);
     match std::fs::remove_file(&path) {
@@ -131,6 +237,56 @@ mod tests {
     use super::{pending_recovery, read_spool, spool_path, SpoolWriter, MIN_RECOVER_SAMPLES};
     use crate::audio::buffer::AudioBuffer;
     use crate::config::test_dir;
+
+    #[test]
+    fn finished_spool_is_archived_as_wav_and_pruned() {
+        use super::{archive_spool, list_recordings, prune_recordings, read_recording};
+        let dir = test_dir("archive");
+        let spool = spool_path(&dir);
+        let bytes: Vec<u8> = (0..16000i16)
+            .flat_map(|i| (i % 1000).to_le_bytes())
+            .collect();
+        std::fs::write(&spool, &bytes).unwrap();
+        let archived = archive_spool(&dir, "pasted").expect("archived");
+        assert!(!spool.exists(), "spool moved away");
+        assert!(archived.starts_with(dir.join(super::RECORDINGS_DIR)));
+        assert!(archived.extension().map(|e| e == "wav").unwrap_or(false));
+        let wav = std::fs::read(&archived).unwrap();
+        assert_eq!(&wav[..4], b"RIFF");
+        assert_eq!(wav.len(), 44 + bytes.len());
+        assert_eq!(read_recording(&archived).expect("readable").len(), 16000);
+        for i in 0..5 {
+            std::fs::write(&spool, &bytes).unwrap();
+            archive_spool(&dir, &format!("x{i}")).expect("archived");
+        }
+        assert_eq!(list_recordings(&dir).len(), 6);
+        prune_recordings(&dir, 3, u64::MAX);
+        let left = list_recordings(&dir);
+        assert_eq!(left.len(), 3, "{left:?}");
+        let names: Vec<String> = left
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            names.iter().all(|n| n.contains("-x")),
+            "newest kept: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("pasted")),
+            "oldest dropped: {names:?}"
+        );
+        prune_recordings(&dir, 10, 44 + bytes.len() as u64);
+        assert_eq!(
+            list_recordings(&dir).len(),
+            1,
+            "byte cap keeps only the newest"
+        );
+        assert!(
+            archive_spool(&dir, "none").is_none(),
+            "no spool, nothing archived"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn spool_round_trips_the_captured_audio() {

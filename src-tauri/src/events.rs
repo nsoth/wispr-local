@@ -32,6 +32,8 @@ pub const REQUEST_STOP_RECORDING: &str = "request-stop-recording";
 pub const REQUEST_CANCEL_RECORDING: &str = "request-cancel-recording";
 /// Start a recording that stays on without the hotkey (tray, main window).
 pub const REQUEST_START_HANDS_FREE: &str = "request-start-hands-free";
+/// Tray → "Re-transcribe last recording": run the newest kept recording again.
+pub const REQUEST_RETRANSCRIBE: &str = "request-retranscribe";
 /// Main window: switch to the Settings page (tray → Settings…).
 pub const OPEN_SETTINGS: &str = "open-settings";
 /// Payload: serialized `LanguageMode` — the mode changed outside the window.

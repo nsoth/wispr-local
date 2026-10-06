@@ -287,6 +287,14 @@ pub fn run() {
 
             // Stop requests: hotkey release, tray, overlay pin button.
             let app_handle = app.handle().clone();
+            app.listen(events::REQUEST_RETRANSCRIBE, move |_event| {
+                let app = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    crate::pipeline::retranscribe_latest(&app).await;
+                });
+            });
+
+            let app_handle = app.handle().clone();
             app.listen(events::REQUEST_STOP_RECORDING, move |_event| {
                 let app = app_handle.clone();
                 tauri::async_runtime::spawn(async move {

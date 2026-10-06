@@ -25,6 +25,12 @@ Built with Tauri 2 (Rust + React). Windows 10/11 only.
 - **Crash insurance**: the audio of a recording is spooled to disk; after a crash it is transcribed into the
   history and the clipboard on the next start. A supervisor process restarts the app after a native CUDA abort
   and falls back to the CPU for one run.
+- **Every recording is kept** (the last 30, up to 400 MB, as 16 kHz WAV in `dataecordings`). If a result
+  looks wrong, *Tray → Re-transcribe last recording* runs the model again and copies the text.
+- **A muted or wrong microphone cannot eat a dictation any more**: the pill names a fallback device, a
+  hands-free recording without speech for 20 s says "No sound from the mic?" with a chime, and a capture
+  without speech dynamics or a looping result ends as *No speech* with a toast explaining why, instead of
+  pasting five minutes of "I'm going to be listening to the experience of the world."
 - **History** of the last 100 dictations with time, target app and language; search, copy, paste again.
 - **Usage card**: dictations, words, minutes and the no-result rate for today and the last 7 days
   (one JSON line per dictation in `stats.jsonl`).
@@ -148,6 +154,8 @@ reported in the window — it is never silently replaced.
 - Environment variables: `WISPR_NO_SUPERVISOR=1` runs the app without the watchdog; `WISPR_FORCE_CPU=1` forces
   the CPU backend; `RUST_LOG=debug` adds per-tick preview and hotkey lines to the log.
 - Data folder (settings, history, keys, models, log): *Settings → About → Open data folder*.
+- Recordings: *Settings → About → Open recordings* (`dataecordings\<time>-<outcome>.wav`); the newest one
+  can be re-run from the tray. `recovered` files are what the crash recovery found at start.
 
 ## Project layout
 

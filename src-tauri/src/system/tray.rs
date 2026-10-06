@@ -122,6 +122,13 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         false,
         None::<&str>,
     )?;
+    let retranscribe = MenuItem::with_id(
+        app,
+        "retranscribe",
+        "Re-transcribe last recording",
+        true,
+        None::<&str>,
+    )?;
 
     let lang_auto = CheckMenuItem::with_id(
         app,
@@ -166,6 +173,7 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
             &start_stop,
             &cancel,
             &copy_last,
+            &retranscribe,
             &PredefinedMenuItem::separator(app)?,
             &language,
             &ai_enabled,
@@ -258,6 +266,9 @@ fn on_menu(app: &AppHandle, id: &str) {
         }
         "cancel" => {
             let _ = app.emit(events::REQUEST_CANCEL_RECORDING, ());
+        }
+        "retranscribe" => {
+            let _ = app.emit(events::REQUEST_RETRANSCRIBE, ());
         }
         "copy_last" => {
             let text = {

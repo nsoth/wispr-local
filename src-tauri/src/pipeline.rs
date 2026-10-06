@@ -27,7 +27,9 @@ use crate::system::focus::{self, PasteDecision};
 use crate::system::sounds::{SoundKind, SoundPlayer};
 use crate::system::tray::{TrayAnimator, TrayPhase};
 use crate::text::apply_paste_suffix;
-use crate::transcription::engine::{LanguageMode, TranscribeOptions, WhisperEngine};
+use crate::transcription::engine::{
+    has_speech_dynamics, speech_stats, LanguageMode, SpeechStats, TranscribeOptions, WhisperEngine,
+};
 use crate::watchdog::{Verdict, Watchdog};
 use crate::{formatting, system};
 
@@ -220,7 +222,12 @@ pub fn start_recording_flow(app: &tauri::AppHandle, pinned: bool) {
     };
     match start_result {
         Ok(start) => {
-            lock_or_recover(&state).device_sample_rate = start.sample_rate;
+            {
+                let mut s = lock_or_recover(&state);
+                s.device_sample_rate = start.sample_rate;
+                s.recording_device = start.device_name.clone();
+                s.recording_device_fallback = start.used_fallback;
+            }
             log::info!(
                 "Recording started at {} Hz, {} ch, input device {}",
                 start.sample_rate,
@@ -294,7 +301,26 @@ pub fn start_recording_flow(app: &tauri::AppHandle, pinned: bool) {
     // Kick off tray animation and reveal overlay (if user hasn't disabled it).
     app.state::<TrayAnimator>().set_phase(TrayPhase::Recording);
     show_overlay_if_enabled(app);
-    emit_overlay_state(app, "recording", "", "");
+    // A fallback microphone is named in the pill for the whole recording:
+    // five minutes into the wrong device is what this prevents.
+    let fallback_label = {
+        let s = lock_or_recover(&state);
+        if s.recording_device_fallback {
+            mic_label(&s.recording_device)
+        } else {
+            String::new()
+        }
+    };
+    emit_overlay_state(
+        app,
+        "recording",
+        &fallback_label,
+        if fallback_label.is_empty() {
+            ""
+        } else {
+            "warn"
+        },
+    );
 
     // Spawn streaming preview: transcribe every ~2s while recording
     let app_clone = app.clone();
@@ -309,8 +335,14 @@ pub fn start_recording_flow(app: &tauri::AppHandle, pinned: bool) {
 async fn recording_guard_loop(app: tauri::AppHandle) {
     let mut last_tick = std::time::SystemTime::now();
     let mut no_foreground_ticks = 0u32;
+    let mut ticks = 0u32;
+    let mut mic_warned = false;
     loop {
         tokio::time::sleep(Duration::from_millis(1000)).await;
+        ticks += 1;
+        if ticks % 5 == 0 && is_recording(&app) {
+            warn_if_mic_is_dead(&app, &mut mic_warned);
+        }
         let now = std::time::SystemTime::now();
         let jumped = now
             .duration_since(last_tick)
@@ -355,6 +387,58 @@ async fn recording_guard_loop(app: tauri::AppHandle) {
             let _ = app.emit(events::REQUEST_STOP_RECORDING, ());
             return;
         }
+    }
+}
+
+/// Every five seconds of a recording: if the last twenty seconds carry no
+/// speech dynamics, say so in the pill, the window and a toast (once), and
+/// clear the warning when speech shows up again.
+fn warn_if_mic_is_dead(app: &tauri::AppHandle, warned: &mut bool) {
+    let state = app.state::<Mutex<AppState>>();
+    let (elapsed, device, fallback) = {
+        let s = lock_or_recover(&state);
+        (
+            s.recording_started_at
+                .map(|t| t.elapsed().as_secs_f64())
+                .unwrap_or(0.0),
+            s.recording_device.clone(),
+            s.recording_device_fallback,
+        )
+    };
+    let tail = app.state::<AudioBuffer>().snapshot_tail(16_000 * 20);
+    let stats = speech_stats(&tail);
+    if mic_seems_dead(stats.as_ref(), elapsed) {
+        if !*warned {
+            *warned = true;
+            log::warn!(
+                "No speech dynamics in the last 20 s of the recording ({device}); warning the user"
+            );
+            emit_overlay_state(app, "recording", "No sound from the mic?", "warn");
+            let message = if fallback {
+                format!(
+                    "No speech is reaching {device} (the selected microphone is unavailable). \
+                     Check the microphone; the recording continues."
+                )
+            } else {
+                format!("No speech is reaching {device}. Is it muted? The recording continues.")
+            };
+            let _ = app.emit(events::OPERATION_NOTICE, &message);
+            notify_user(app, &message);
+            app.state::<SoundPlayer>().play(SoundKind::Busy);
+        }
+    } else if *warned && stats.as_ref().is_some_and(has_speech_dynamics) {
+        *warned = false;
+        let label = if fallback {
+            mic_label(&device)
+        } else {
+            String::new()
+        };
+        emit_overlay_state(
+            app,
+            "recording",
+            &label,
+            if label.is_empty() { "" } else { "warn" },
+        );
     }
 }
 
@@ -631,12 +715,47 @@ fn record_stat(app: &tauri::AppHandle, outcome: &Outcome, audio_s: f64, words: u
     }
 }
 
-/// Whether the crash spool of the recording should survive this outcome:
-/// only a failed pipeline leaves audio worth recovering on the next start.
-/// Everything else (pasted, copied, too short, no speech, cancelled) was
-/// either delivered or discarded on purpose.
-fn keeps_spool(outcome: &Outcome) -> bool {
-    matches!(outcome, Outcome::Failed)
+/// Hands-free recordings into a muted or dead microphone used to run for
+/// minutes without a hint. After twenty seconds of audio without speech
+/// dynamics the overlay says so.
+fn mic_seems_dead(stats: Option<&SpeechStats>, elapsed_s: f64) -> bool {
+    elapsed_s >= 20.0 && stats.is_some_and(|s| !has_speech_dynamics(s))
+}
+
+/// "Microphone (NVIDIA Broadcast)" → "NVIDIA Broadcast" for the pill.
+fn mic_label(device: &str) -> String {
+    let d = device.trim();
+    d.strip_prefix("Microphone (")
+        .or_else(|| d.strip_prefix("Microphone Array ("))
+        .and_then(|rest| rest.strip_suffix(')'))
+        .unwrap_or(d)
+        .to_string()
+}
+
+/// How many finished recordings stay on disk for a re-transcription.
+const KEEP_RECORDINGS: usize = 30;
+/// ...and how much space they may take (a minute is 1.9 MB).
+const KEEP_RECORDING_BYTES: u64 = 400 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpoolAction {
+    /// Leave `pending.pcm` for the crash recovery on the next start.
+    Keep,
+    /// The user discarded it or it was never a recording.
+    Remove,
+    /// Keep the audio in the recordings folder so the text can be redone.
+    Archive,
+}
+
+/// What happens to the spool of a finished recording.
+fn spool_action(outcome: &Outcome) -> SpoolAction {
+    match outcome {
+        Outcome::Failed => SpoolAction::Keep,
+        Outcome::TooShort | Outcome::Cancelled => SpoolAction::Remove,
+        Outcome::Pasted | Outcome::CopiedToClipboard { .. } | Outcome::NoSpeech => {
+            SpoolAction::Archive
+        }
+    }
 }
 
 /// A recording whose wall-clock duration exceeds its captured audio by more
@@ -650,8 +769,16 @@ fn sleep_gap_detected(wall_s: f64, audio_s: f64) -> bool {
 /// pill for a moment, tray back to idle, overlay hidden afterwards unless a
 /// new recording has started in the meantime.
 fn finish_pipeline(app: &tauri::AppHandle, outcome: Outcome) {
-    if !keeps_spool(&outcome) {
-        spool::remove_spool(&app.state::<AppConfig>().data_dir);
+    let data_dir = app.state::<AppConfig>().data_dir.clone();
+    match spool_action(&outcome) {
+        SpoolAction::Keep => {}
+        SpoolAction::Remove => spool::remove_spool(&data_dir),
+        SpoolAction::Archive => {
+            if let Some(path) = spool::archive_spool(&data_dir, outcome.label()) {
+                log::info!("Recording kept at {}", path.display());
+            }
+            spool::prune_recordings(&data_dir, KEEP_RECORDINGS, KEEP_RECORDING_BYTES);
+        }
     }
     let (message, tone, linger_ms) = outcome.overlay();
     if let Some(reason) = outcome.empty_reason() {
@@ -849,7 +976,10 @@ fn recover_spooled_recording(app: &tauri::AppHandle) {
         let mut eng = lock_or_recover(&engine);
         eng.transcribe(&samples, language, TranscribeOptions::final_pass())
     };
-    spool::remove_spool(&data_dir);
+    match spool::archive_spool(&data_dir, "recovered") {
+        Some(path) => log::info!("Recovered audio kept at {}", path.display()),
+        None => spool::remove_spool(&data_dir),
+    }
     let text = match result {
         Ok(r) => pipeline.finalize(&r.text),
         Err(e) => {
@@ -891,6 +1021,121 @@ fn recover_spooled_recording(app: &tauri::AppHandle) {
     notify_user_long(
         app,
         "Recovered the last dictation after a crash: it is in the clipboard and the history.",
+    );
+}
+
+/// Tray → "Re-transcribe last recording": run the final pass again on the
+/// newest kept recording; the text goes to the clipboard and the history.
+pub async fn retranscribe_latest(app: &tauri::AppHandle) {
+    let data_dir = app.state::<AppConfig>().data_dir.clone();
+    let Some(path) = spool::list_recordings(&data_dir).into_iter().next() else {
+        let message = "No kept recordings yet.";
+        let _ = app.emit(events::OPERATION_NOTICE, message);
+        notify_user(app, message);
+        return;
+    };
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    {
+        let state = app.state::<Mutex<AppState>>();
+        let mut s = lock_or_recover(&state);
+        if !matches!(s.status, AppStatus::Idle | AppStatus::Error { .. }) {
+            let message = "Busy with a recording; try again in a moment.";
+            drop(s);
+            let _ = app.emit(events::OPERATION_NOTICE, message);
+            return;
+        }
+        s.status = AppStatus::Transcribing;
+    }
+    emit_status(app, &AppStatus::Transcribing);
+    app.state::<TrayAnimator>().set_phase(TrayPhase::Processing);
+    show_overlay_if_enabled(app);
+    emit_overlay_state(app, "processing", "Re-transcribing", "");
+    log::info!("Re-transcribing {name}");
+
+    let (language, pipeline, history_limit) = {
+        let settings = app.state::<Mutex<Settings>>();
+        let guard = lock_or_recover(&settings);
+        (guard.language, guard.text_pipeline(), guard.history_limit)
+    };
+    let blocking_app = app.clone();
+    let file = path.clone();
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        let samples = spool::read_recording(&file)?;
+        let engine = blocking_app.state::<Mutex<WhisperEngine>>();
+        let mut eng = lock_or_recover(&engine);
+        eng.transcribe(&samples, language, TranscribeOptions::final_pass())
+            .map(|r| (r, samples.len()))
+    })
+    .await;
+    let (result, samples) = match outcome {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => {
+            log::error!("Re-transcription of {name} failed: {e}");
+            let message = format!("Re-transcription failed: {e}");
+            let _ = app.emit(events::OPERATION_NOTICE, &message);
+            notify_user(app, &message);
+            finish_pipeline(app, Outcome::Failed);
+            return;
+        }
+        Err(e) => {
+            log::error!("Re-transcription task failed: {e}");
+            finish_pipeline(app, Outcome::Failed);
+            return;
+        }
+    };
+    let audio_s = samples as f64 / 16000.0;
+    let text = pipeline.finalize(&result.text);
+    if text.is_empty() {
+        let message = format!(
+            "Still nothing recognizable in {name} ({}).",
+            result.empty_reason.unwrap_or("no speech")
+        );
+        log::warn!("{message}");
+        let _ = app.emit(events::OPERATION_NOTICE, &message);
+        notify_user(app, &message);
+        finish_pipeline(app, Outcome::NoSpeech);
+        return;
+    }
+    let copied = system::text_injection::copy_only(&text).is_ok();
+    let history = {
+        let state = app.state::<Mutex<AppState>>();
+        let mut s = lock_or_recover(&state);
+        s.last_transcription = text.clone();
+        s.push_history(
+            HistoryEntry {
+                text: text.clone(),
+                ts: HistoryEntry::now_ms(),
+                target: format!("re-transcribed {name}"),
+                lang: result.language.to_string(),
+                duration_s: audio_s as f32,
+                pasted: false,
+                hwnd: 0,
+            },
+            history_limit,
+        );
+        let _ = state::save_history(&data_dir, &s.history);
+        s.history.clone()
+    };
+    let _ = app.emit(events::HISTORY_CHANGED, &history);
+    let message = if copied {
+        format!(
+            "Re-transcribed {name}: {} characters copied to the clipboard.",
+            text.chars().count()
+        )
+    } else {
+        format!("Re-transcribed {name}: the text is in the history.")
+    };
+    log::info!("{message}");
+    let _ = app.emit(events::OPERATION_NOTICE, &message);
+    notify_user(app, &message);
+    finish_pipeline(
+        app,
+        Outcome::CopiedToClipboard {
+            in_clipboard: copied,
+        },
     );
 }
 
@@ -1091,8 +1336,41 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
         );
     }
 
+    if let Some(s) = result.stats.as_ref() {
+        log::info!(
+            "utt#{utterance}: audio floor={:.4} loud={:.4} active={:.2}",
+            s.floor,
+            s.loud,
+            s.active
+        );
+    }
     if result.text.is_empty() {
         guard.disarm();
+        if let Some(reason) = result.empty_reason.filter(|_| audio_s >= 4.0) {
+            let (device, fallback) = {
+                let s = lock_or_recover(&state);
+                (s.recording_device.clone(), s.recording_device_fallback)
+            };
+            let what = match reason {
+                "hallucination-loop" => "the model produced only noise text",
+                "no-dynamics" => "the microphone delivered a steady signal without speech",
+                _ => "the recording is silent",
+            };
+            let hint = if fallback {
+                format!("the selected microphone is unavailable and {device} was used instead")
+            } else {
+                format!("check that {device} is not muted")
+            };
+            let message = format!(
+                "Nothing recognizable in {}:{:02} of audio: {what}; {hint}. The audio is kept \
+                 (tray: Re-transcribe last recording).",
+                (audio_s as u64) / 60,
+                (audio_s as u64) % 60
+            );
+            log::warn!("utt#{utterance}: {message}");
+            let _ = app.emit(events::OPERATION_NOTICE, &message);
+            notify_user_long(app, &message);
+        }
         record_stat(
             app,
             &Outcome::NoSpeech,
@@ -1310,7 +1588,6 @@ pub async fn stop_and_transcribe_flow(app: &tauri::AppHandle) {
             "History could not be saved to disk",
         );
     }
-    spool::remove_spool(&data_dir);
     log::info!(
         "utt#{utterance} audio={audio_s:.1}s lock={lock_ms}ms detect={}ms transcribe={}ms (rtf {rtf:.2}) \
          format={format_ms}ms paste={paste_ms}ms backend={backend} lang={} chars={} segments={} dropped={} target={target_name} outcome={outcome:?}",
@@ -1341,18 +1618,52 @@ mod tests {
     use std::rc::Rc;
 
     #[test]
-    fn spool_is_kept_only_when_the_pipeline_failed() {
-        use super::keeps_spool;
-        assert!(keeps_spool(&Outcome::Failed));
+    fn a_recording_without_dynamics_is_flagged_after_twenty_seconds() {
+        use super::mic_seems_dead;
+        use crate::transcription::engine::SpeechStats;
+        let dead = SpeechStats {
+            floor: 0.006,
+            loud: 0.007,
+            active: 0.0,
+        };
+        let live = SpeechStats {
+            floor: 0.006,
+            loud: 0.05,
+            active: 0.3,
+        };
+        assert!(!mic_seems_dead(Some(&dead), 10.0), "too early to judge");
+        assert!(mic_seems_dead(Some(&dead), 20.0));
+        assert!(!mic_seems_dead(Some(&live), 60.0));
+        assert!(!mic_seems_dead(None, 60.0), "no statistics, no warning");
+    }
+
+    #[test]
+    fn spool_policy_keeps_failed_removes_discarded_and_archives_the_rest() {
+        use super::{spool_action, SpoolAction};
+        assert_eq!(spool_action(&Outcome::Failed), SpoolAction::Keep);
+        assert_eq!(spool_action(&Outcome::TooShort), SpoolAction::Remove);
+        assert_eq!(spool_action(&Outcome::Cancelled), SpoolAction::Remove);
         for outcome in [
             Outcome::Pasted,
             Outcome::CopiedToClipboard { in_clipboard: true },
-            Outcome::TooShort,
             Outcome::NoSpeech,
-            Outcome::Cancelled,
         ] {
-            assert!(!keeps_spool(&outcome), "{outcome:?}");
+            assert_eq!(spool_action(&outcome), SpoolAction::Archive, "{outcome:?}");
         }
+    }
+
+    #[test]
+    fn mic_label_strips_the_windows_wrapper() {
+        use super::mic_label;
+        assert_eq!(
+            mic_label("Microphone (NVIDIA Broadcast)"),
+            "NVIDIA Broadcast"
+        );
+        assert_eq!(
+            mic_label("Microphone (2- HyperX SoloCast)"),
+            "2- HyperX SoloCast"
+        );
+        assert_eq!(mic_label("Headset (Soundcore)"), "Headset (Soundcore)");
     }
 
     #[test]

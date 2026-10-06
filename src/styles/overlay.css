@@ -185,6 +185,17 @@ body,
   letter-spacing: 0.4px;
 }
 
+.overlay-note {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  color: rgba(251, 191, 36, 0.95);
+}
+
 .overlay-timer {
   flex: 0 0 auto;
   min-width: 30px;

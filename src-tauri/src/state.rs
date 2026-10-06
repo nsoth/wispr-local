@@ -188,6 +188,10 @@ pub struct AppState {
     /// Wall-clock start of the active recording; compared with the captured
     /// audio length at stop to notice a sleep (no samples while suspended).
     pub recording_started_wall: Option<std::time::SystemTime>,
+    /// Input device of the active (or last) recording, as Windows names it.
+    pub recording_device: String,
+    /// Whether that device was a fallback for an unavailable preferred one.
+    pub recording_device_fallback: bool,
 }
 
 impl Default for AppState {
@@ -212,6 +216,8 @@ impl Default for AppState {
             spool: None,
             tray_stop_pending: false,
             recording_started_wall: None,
+            recording_device: String::new(),
+            recording_device_fallback: false,
         }
     }
 }

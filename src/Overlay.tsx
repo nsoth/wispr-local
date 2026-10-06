@@ -165,6 +165,11 @@ export default function Overlay() {
       {phase === "recording" ? (
         <>
           <canvas ref={canvasRef} className="overlay-canvas" />
+          {overlay.message && (
+            <span className="overlay-note" title={overlay.message}>
+              {overlay.message}
+            </span>
+          )}
           {language && <span className="overlay-lang">{language}</span>}
           <span className="overlay-timer">{formatTimer(elapsed)}</span>
           <button
